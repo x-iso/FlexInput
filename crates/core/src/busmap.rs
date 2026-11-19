@@ -190,6 +190,12 @@ impl BusMap {
         self.bus_ids.get(dev).map(|&b| b as usize)
     }
 
+    /// How many buses have been numbered: every [`at`](Self::at) bus is below it.
+    #[inline]
+    pub fn bus_count(&self) -> usize {
+        self.buses.len()
+    }
+
     /// As [`view`](Self::view), by number, without borrowing past the call.
     #[inline]
     pub fn at(&self, bus: usize, ix: usize) -> Option<Signal> {

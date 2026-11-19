@@ -239,7 +239,7 @@ fn idle_reading(
     let Some((n, field)) = pin_id.strip_prefix("touch").and_then(|rest| rest.split_once('_')) else {
         return false;
     };
-    if !matches!(field, "x" | "y" | "pressure") {
+    if !matches!(field, "x" | "y" | "xy" | "pressure") {
         return false;
     }
     !matches!(
@@ -680,12 +680,6 @@ pub(crate) fn input_pin_glow(
 /// recovery scheme that eliminates the resulting drag lag.
 pub(crate) fn automap_label_abs_y_key(node: egui_snarl::NodeId) -> egui::Id {
     egui::Id::new(("device_sink_automap_label_abs_y_v2", node.0))
-}
-
-/// Companion of `automap_label_abs_y_key`: the AutoMap pin-row Y as seen
-/// by `show_input` this frame, stashed for next-frame delta calculation.
-pub(crate) fn automap_pin_row_y_key(node: egui_snarl::NodeId) -> egui::Id {
-    egui::Id::new(("device_sink_automap_pin_row_y", node.0))
 }
 
 #[cfg(test)]

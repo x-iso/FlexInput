@@ -1260,13 +1260,10 @@ pub(crate) fn show_twoway_response_curve_body(
                         gyp.iter().map(|&y| c2s(x_lo, y).y).zip(yl).collect());
                 }
 
-                // Inactive lane (dimmed)
-                for (inact_pts, inact_bias) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
-                if inact_pts.len() >= 2 {
-                    let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
-                    let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
-                    for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0_f32, ic)); pp = np; }
-                }
+                // The lane not being edited, faint in its colour.
+                let signal = MULTI_COLORS[0];
+                for (inact_pts, inact_bias, up) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
+                    paint_twoway_lane(&painter, inact_pts, inact_bias, twoway_lane_color(signal, up), false, &c2s, (x_lo, x_hi, y_lo, y_hi));
                 }
 
                 // Active lane (solid gray, same as float body)
@@ -1278,10 +1275,14 @@ pub(crate) fn show_twoway_response_curve_body(
                 } else {
                     (&mut new_pts_dn, &mut new_biases_dn, &mut pts_dn_changed, &mut bias_dn_changed)
                 };
-                // A one-dot Hyst graph draws as its flat band.
-                if !new_edit_pts.is_empty() {
+                // The lane being edited in its colour, half see-through so the trail riding it
+                // in the full colour stands out; the Hyst graph in grey (a one-dot one draws
+                // as its flat band).
+                if hyst_lane && !new_edit_pts.is_empty() {
                     let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(new_edit_pts, x, new_edit_biases).clamp(y_lo, y_hi)) }).collect();
-                    for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200))); }
+                    painter.add(egui::Shape::line(cp, egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200))));
+                } else if !hyst_lane {
+                    paint_twoway_lane(&painter, new_edit_pts, new_edit_biases, twoway_lane_color(signal, lane_up), true, &c2s, (x_lo, x_hi, y_lo, y_hi));
                 }
 
                 // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
@@ -1783,13 +1784,10 @@ pub(crate) fn paint_twoway_curve_graph(
             gyp.iter().map(|&y| c2s(x_lo, y).y).zip(yl).collect());
     }
 
-    // Inactive lane (dimmed)
-    for (inact_pts, inact_bias) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
-    if inact_pts.len() >= 2 {
-        let ic = Color32::from_rgba_unmultiplied(130, 130, 130, 70);
-        let mut pp = c2s(x_lo, sample_curve(inact_pts, x_lo, inact_bias).clamp(y_lo, y_hi));
-        for s in 1..=120usize { let t = s as f32/120.0; let ix = x_lo+t*x_range; let np = c2s(ix, sample_curve(inact_pts, ix, inact_bias).clamp(y_lo, y_hi)); painter.line_segment([pp, np], egui::Stroke::new(1.0_f32, ic)); pp = np; }
-    }
+    // The lane not being edited, faint in its colour.
+    let signal = graph_channel_color(graph_ov, 0);
+    for (inact_pts, inact_bias, up) in twoway_dim_curves(lane_up, hyst_lane, absolute_eff, (&pts_up, &biases_up), (&pts_dn, &biases_dn)) {
+        paint_twoway_lane(&painter, inact_pts, inact_bias, twoway_lane_color(signal, up), false, &c2s, (x_lo, x_hi, y_lo, y_hi));
     }
 
     // Active lane — mutable for editing
@@ -1801,10 +1799,13 @@ pub(crate) fn paint_twoway_curve_graph(
     let mut pts_changed = false;
     let mut bias_changed = false;
 
-    // A one-dot Hyst graph draws as its flat band.
-    if !new_edit_pts.is_empty() {
+    // The lane being edited in its colour, half see-through so the trail riding it in the
+    // full colour stands out; the Hyst graph in grey (a one-dot one draws as its flat band).
+    if hyst_lane && !new_edit_pts.is_empty() {
         let cp: Vec<egui::Pos2> = (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(&new_edit_pts, x, &new_edit_biases).clamp(y_lo, y_hi)) }).collect();
-        for w in cp.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200))); }
+        painter.add(egui::Shape::line(cp, egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200))));
+    } else if !hyst_lane {
+        paint_twoway_lane(&painter, &new_edit_pts, &new_edit_biases, twoway_lane_color(signal, lane_up), true, &c2s, (x_lo, x_hi, y_lo, y_hi));
     }
 
     // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
@@ -2065,9 +2066,50 @@ pub(crate) fn twoway_write_hyst_points(n: &mut NodeData, pts: &[[f32; 2]], biase
 fn twoway_dim_curves<'a>(
     lane_up: bool, hyst_lane: bool, absolute_eff: bool,
     up: (&'a [[f32; 2]], &'a [f32]), dn: (&'a [[f32; 2]], &'a [f32]),
-) -> Vec<(&'a [[f32; 2]], &'a [f32])> {
+) -> Vec<(&'a [[f32; 2]], &'a [f32], bool)> {
+    let (up, dn) = ((up.0, up.1, true), (dn.0, dn.1, false));
     if hyst_lane { if absolute_eff { vec![up, dn] } else { Vec::new() } }
     else if lane_up { vec![dn] } else { vec![up] }
+}
+
+/// The colour a two-way curve's lane is drawn in, and its trail: Up in the signal's
+/// colour, Down in its opposite - blue for the stock red, else the hue across the wheel.
+pub(crate) fn twoway_lane_color(signal: Color32, up: bool) -> Color32 {
+    if up {
+        return signal;
+    }
+    if signal == MULTI_COLORS[0] {
+        return MULTI_COLORS[2];
+    }
+    let mut hsva = egui::ecolor::Hsva::from(signal);
+    hsva.h = (hsva.h + 0.5).fract();
+    Color32::from(hsva)
+}
+
+/// One lane of a two-way curve across its graph (`(x_lo, x_hi, y_lo, y_hi)`, `c2s` its
+/// mapping to the screen) in its colour: half see-through and a little thicker while it is
+/// the lane being edited, fainter while it isn't, so the trail riding it in the full colour
+/// makes it whole where the signal has been.
+fn paint_twoway_lane(
+    painter: &egui::Painter,
+    pts: &[[f32; 2]],
+    biases: &[f32],
+    col: Color32,
+    edited: bool,
+    c2s: &impl Fn(f32, f32) -> egui::Pos2,
+    (x_lo, x_hi, y_lo, y_hi): (f32, f32, f32, f32),
+) {
+    if pts.len() < 2 {
+        return;
+    }
+    let (alpha, width): (f32, f32) = if edited { (0.5, 2.5) } else { (0.25, 2.0) };
+    let line: Vec<egui::Pos2> = (0..=120)
+        .map(|i| {
+            let x = x_lo + (x_hi - x_lo) * i as f32 / 120.0;
+            c2s(x, sample_curve(pts, x, biases).clamp(y_lo, y_hi))
+        })
+        .collect();
+    painter.add(egui::Shape::line(line, egui::Stroke::new(width, col.gamma_multiply(alpha))));
 }
 
 /// Where a two-way curve graph sits, for the live overlay.
@@ -2170,13 +2212,18 @@ pub(crate) fn paint_twoway_live(
     for ch in 0..n_channels {
         let Some(raw) = node.extra.last_signals.get(ch).and_then(|s| s.as_ref()).map(sig_f32) else { continue };
         has_active = true;
-        // The engine's tracker rides after the inputs as Vec2(held, lane).
-        let (held, lane_up) = match node.extra.last_signals.get(n_channels + ch) {
-            Some(Some(Signal::Vec2(v))) => (v.x, v.y >= 0.0),
-            _ => (if g.absolute_eff { raw.abs() } else { raw }, true),
+        // The engine's tracker rides after the inputs as Vec4(held, lane, crossover, shown
+        // y): the point the curves are read at, and where the output stands while it crosses
+        // over from one lane to the other.
+        let (held, lane_up, shown_y) = match node.extra.last_signals.get(n_channels + ch) {
+            Some(Some(Signal::Vec4(v))) => (v.x, v.y >= 0.0, (!v.w.is_nan()).then_some(v.w)),
+            Some(Some(Signal::Vec2(v))) => (v.x, v.y >= 0.0, None),
+            _ => (if g.absolute_eff { raw.abs() } else { raw }, true, None),
         };
         let (apts, abias) = if lane_up { up } else { dn };
-        let ch_col = color(ch);
+        let signal = color(ch);
+        // Everything drawn for the lane the engine is on, in that lane's colour.
+        let ch_col = twoway_lane_color(signal, lane_up);
 
         // Band: behind the held point, against the lane's direction.
         // Clamped to the input range: at rest on the Up lane there is no band
@@ -2198,40 +2245,68 @@ pub(crate) fn paint_twoway_live(
             painter.circle_filled(p, 4.0, Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), 230));
             continue;
         }
-        let graph_y = sample_curve(apts, graph_x, abias).clamp(g.y_lo, g.y_hi);
+        let on_lane_y = sample_curve(apts, graph_x, abias).clamp(g.y_lo, g.y_hi);
+        let graph_y = shown_y.map_or(on_lane_y, |y| y.clamp(g.y_lo, g.y_hi));
 
+        // A trail per lane, each fed while the engine is on it and fading on its own clock,
+        // so a lane switch doesn't wipe where the signal just was. Coming back to a lane, a
+        // break (`NaN`) goes in first: the trail doesn't join across what it skipped.
         let lane_id: u8 = if lane_up { 0 } else { 1 };
         type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
-        let tid  = ui.id().with((salt, node_id, ch as u32));
+        let tids = [0u8, 1].map(|l| ui.id().with((salt, node_id, ch as u32, l)));
         let tlid = ui.id().with((salt, "lane", node_id, ch as u32));
         let prev_lane_id = ui.data(|d| d.get_temp::<u8>(tlid)).unwrap_or(lane_id);
-        let mut tbuf: Trail = ui.data(|d| d.get_temp::<Trail>(tid).unwrap_or_default());
-        if prev_lane_id != lane_id { tbuf.clear(); }
+        let mut bufs: [Trail; 2] = tids.map(|id| ui.data(|d| d.get_temp::<Trail>(id).unwrap_or_default()));
         if trail_ms > 0 {
-            push_trail_sample(&mut tbuf, graph_x, now, trail_dur);
-            while tbuf.front().is_some_and(|&(_, t)| now.duration_since(t) > trail_dur) { tbuf.pop_front(); }
-        } else { tbuf.clear(); }
-        let tlist: Vec<(f32, std::time::Instant)> = tbuf.iter().cloned().collect();
-        ui.data_mut(|d| { d.insert_temp(tid, tbuf); d.insert_temp(tlid, lane_id); });
+            let cur = &mut bufs[lane_id as usize];
+            if prev_lane_id != lane_id && !cur.is_empty() {
+                cur.push_back((f32::NAN, now));
+                cur.push_back((graph_x, now));
+            } else {
+                push_trail_sample(cur, graph_x, now, trail_dur);
+            }
+            for b in &mut bufs {
+                while b.front().is_some_and(|&(_, t)| now.duration_since(t) > trail_dur) { b.pop_front(); }
+            }
+        } else {
+            bufs.iter_mut().for_each(|b| b.clear());
+        }
+        ui.data_mut(|d| {
+            for (id, b) in tids.iter().zip(&bufs) { d.insert_temp(*id, b.clone()); }
+            d.insert_temp(tlid, lane_id);
+        });
 
-        // Trail resamples the curve between x positions to follow its shape.
-        for w in tlist.windows(2) {
-            let (x0, _) = w[0]; let (x1, t1) = w[1];
-            let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
-            let alpha = ((1.0 - age.clamp(0.0, 1.0)) * 220.0) as u8;
-            let tc = Color32::from_rgba_unmultiplied(ch_col.r(), ch_col.g(), ch_col.b(), alpha);
-            let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
-            let mut pp = g.c2s(x0, sample_curve(apts, x0, abias).clamp(g.y_lo, g.y_hi));
-            for s in 1..=steps {
-                let ix = x0 + (x1 - x0) * s as f32 / steps as f32;
-                let np = g.c2s(ix, sample_curve(apts, ix, abias).clamp(g.y_lo, g.y_hi));
-                painter.line_segment([pp, np], egui::Stroke::new(1.5_f32, tc));
-                pp = np;
+        // Each trail on its own lane, in that lane's colour, resampling the curve between
+        // x positions to follow its shape.
+        for (l, buf) in bufs.iter().enumerate() {
+            let on_up = l == 0;
+            let (lpts, lbias) = if on_up { up } else { dn };
+            let lc = twoway_lane_color(signal, on_up);
+            let samples: Vec<(f32, std::time::Instant)> = buf.iter().copied().collect();
+            for w in samples.windows(2) {
+                let (x0, _) = w[0]; let (x1, t1) = w[1];
+                if x0.is_nan() || x1.is_nan() { continue; }
+                let age = now.duration_since(t1).as_secs_f32() / trail_dur.as_secs_f32().max(0.001);
+                let tc = lc.gamma_multiply(1.0 - age.clamp(0.0, 1.0));
+                let steps = (((x1 - x0).abs() / x_range * 80.0) as usize).max(1);
+                let line: Vec<egui::Pos2> = (0..=steps)
+                    .map(|s| {
+                        let ix = x0 + (x1 - x0) * s as f32 / steps as f32;
+                        g.c2s(ix, sample_curve(lpts, ix, lbias).clamp(g.y_lo, g.y_hi))
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(line, egui::Stroke::new(2.5_f32, tc)));
             }
         }
 
-        // Arrow along the curve, pointing the lane's way.
+        // Arrow along the curve, pointing the lane's way - between the lanes while the
+        // output crosses over after a switch, dashed on to where it is going.
         let head = g.c2s(graph_x, graph_y);
+        let lane_at = g.c2s(graph_x, on_lane_y);
+        if (head.y - lane_at.y).abs() > 1.5 {
+            painter.extend(egui::Shape::dashed_line(&[head, lane_at], egui::Stroke::new(1.5_f32, ch_col.gamma_multiply(0.7)), 3.0, 2.0));
+            painter.circle_stroke(lane_at, 3.0, egui::Stroke::new(1.0_f32, ch_col.gamma_multiply(0.7)));
+        }
         let eps = x_range * 0.015;
         let (x_a, x_b) = if lane_up {
             ((graph_x - eps).clamp(g.x_lo, g.x_hi), (graph_x + eps).clamp(g.x_lo, g.x_hi))
@@ -2324,5 +2399,115 @@ pub(crate) fn render_twoway_interp_row(
             if let Some(n) = Number::from_f64(ph_ms as f64) { node.params.insert("peak_hold_ms".into(), Value::Number(n)); }
             node.params.insert("peak_hold_dir".into(), Value::String(ph_dir));
         }
+    }
+}
+
+#[cfg(test)]
+mod twoway_tests {
+    use super::*;
+
+    // The Down lane wears the signal's opposite: blue for the stock red, the hue across
+    // the wheel for any other; the Up lane the signal itself.
+    #[test]
+    fn the_down_lane_is_the_signals_opposite() {
+        assert_eq!(twoway_lane_color(MULTI_COLORS[0], true), MULTI_COLORS[0]);
+        assert_eq!(twoway_lane_color(MULTI_COLORS[0], false), MULTI_COLORS[2]);
+        let green = egui::Color32::from_rgb(40, 200, 40);
+        let opp = twoway_lane_color(green, false);
+        assert!(opp.r() > 150 && opp.g() < 100 && opp.b() > 150, "green's opposite is magenta: {opp:?}");
+    }
+
+    // The trail of where the signal was on one lane stays, fading on its own clock, when
+    // the engine flips to the other lane - it used to vanish the instant the lane switched.
+    #[test]
+    fn a_lane_switch_keeps_the_trail() {
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.twoway_response_curve")
+            .expect("registered");
+        let mut node = NodeData::from(&desc);
+        node.params.insert("trail_ms".into(), serde_json::json!(1000));
+        let n = curve_channels(&node);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(200.0, 200.0));
+        let pts = [[0.0, 0.0], [1.0, 1.0]];
+        let mut ids: Option<(egui::Id, egui::Id)> = None;
+        // Up the Up lane, then over to Down partway.
+        for (k, (held, up)) in [(0.2, true), (0.4, true), (0.6, true), (0.5, false), (0.4, false)].into_iter().enumerate() {
+            node.extra.last_signals = vec![None; 2 * n];
+            node.extra.last_signals[0] = Some(Signal::Float(held));
+            node.extra.last_signals[n] = Some(Signal::Vec2(glam::Vec2::new(held, if up { 1.0 } else { -1.0 })));
+            let _ = ctx.run(egui::RawInput { time: Some(k as f64 * 0.02), ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let g = TwowayGeom::from_params(rect, &node);
+                    paint_twoway_live(ui, ui.painter(), &g, NodeId(7), &node, (&pts, &[]), (&pts, &[]), None, "tw_test", |_| MULTI_COLORS[0]);
+                    ids = Some((ui.id().with(("tw_test", NodeId(7), 0u32, 0u8)), ui.id().with(("tw_test", NodeId(7), 0u32, 1u8))));
+                });
+            });
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (up_id, dn_id) = ids.expect("drawn");
+        type Trail = std::collections::VecDeque<(f32, std::time::Instant)>;
+        let up: Trail = ctx.data(|d| d.get_temp(up_id)).unwrap_or_default();
+        let dn: Trail = ctx.data(|d| d.get_temp(dn_id)).unwrap_or_default();
+        assert!(up.iter().filter(|(x, _)| !x.is_nan()).count() >= 2, "the Up lane's trail is still there: {up:?}");
+        assert!(dn.iter().filter(|(x, _)| !x.is_nan()).count() >= 2, "and the Down lane has its own: {dn:?}");
+    }
+
+    // The Two-way graph mid-use, for looking at: up the Up lane, then back down the Down
+    // lane, the trail of both still showing - once editing Up, once editing Down.
+    #[test]
+    #[ignore = "writes a picture, asserts nothing"]
+    fn shoot_twoway_lanes() {
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.twoway_response_curve")
+            .expect("registered");
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut shot = crate::canvas::shot::Shot::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(560.0, 280.0));
+        let mut snarls: Vec<(Snarl<NodeData>, NodeId)> = ["up", "dn"].iter().map(|lane| {
+            let mut snarl: Snarl<NodeData> = Snarl::new();
+            let mut node = NodeData::from(&desc);
+            node.params.insert("trail_ms".into(), serde_json::json!(2000));
+            node.params.insert("active_lane".into(), serde_json::json!(lane));
+            node.params.insert("points".into(), serde_json::json!([[0.0, 0.0], [0.5, 0.75], [1.0, 1.0]]));
+            node.params.insert("points_dn".into(), serde_json::json!([[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]]));
+            let id = snarl.insert_node(egui::Pos2::ZERO, node);
+            (snarl, id)
+        }).collect();
+        let n = snarls[0].0.get_node(snarls[0].1).map(curve_channels).unwrap_or(1);
+        let path: Vec<(f32, bool)> = (0..=16).map(|k| (k as f32 / 16.0 * 0.85, true))
+            .chain((0..=10).map(|k| (0.85 - k as f32 / 10.0 * 0.45, false)))
+            .collect();
+        let mut shapes = Vec::new();
+        for (k, (held, up)) in path.iter().enumerate() {
+            for (snarl, id) in &mut snarls {
+                if let Some(node) = snarl.get_node_mut(*id) {
+                    node.extra.last_signals = vec![None; 2 * n];
+                    node.extra.last_signals[0] = Some(Signal::Float(*held));
+                    node.extra.last_signals[n] = Some(Signal::Vec2(glam::Vec2::new(*held, if *up { 1.0 } else { -1.0 })));
+                }
+            }
+            let input = egui::RawInput { screen_rect: Some(screen), time: Some(k as f64 * 0.03), ..Default::default() };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for (j, (snarl, id)) in snarls.iter_mut().enumerate() {
+                        let frame = egui::Rect::from_min_size(egui::pos2(16.0 + j as f32 * 272.0, 16.0), egui::vec2(256.0, 248.0));
+                        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(frame).id_salt(j));
+                        render_twoway_curve_only(*id, &mut c, snarl, frame.size(), None);
+                    }
+                });
+            });
+            shot.absorb(&out.textures_delta);
+            shapes = out.shapes;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots/twoway_lanes.png");
+        shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+        println!("{}", path.display());
     }
 }

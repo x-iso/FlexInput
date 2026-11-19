@@ -403,6 +403,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
                     color,
                     style: inner.wire_style.unwrap_or(egui_snarl::ui::WireStyle::Bezier5),
                     width_factor: inner.wire_width_factor.unwrap_or(1.0),
+                    activity: self.glow.map_or(0.0, |(_, t)| t),
                 };
             }
             use egui::epaint::{PathShape, PathStroke};
@@ -452,6 +453,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
                 color: inner.wire_color.unwrap_or(fill),
                 style: inner.wire_style.unwrap_or(egui_snarl::ui::WireStyle::Bezier5),
                 width_factor: inner.wire_width_factor.unwrap_or(1.0),
+                activity: self.glow.map_or(0.0, |(_, t)| t),
             };
             if let Some((_hot, intensity)) = self.glow {
                 wire_info.color = brighten_wire_color(wire_info.color, intensity);
@@ -462,6 +464,7 @@ impl egui_snarl::ui::SnarlPin for MaybeHeaderPin {
         let mut wire_info = PinInfo::draw(&inner, snarl_style, style, rect, painter);
         if let Some((_hot, intensity)) = self.glow {
             wire_info.color = brighten_wire_color(wire_info.color, intensity);
+            wire_info.activity = intensity;
         }
         wire_info
     }

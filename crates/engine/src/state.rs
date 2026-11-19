@@ -118,6 +118,12 @@ pub struct NodeState {
     pub twoway_last_out: Vec<f32>,
     /// Per-channel blended output frozen at the moment a lane switch begins.
     pub twoway_old_output: Vec<f32>,
+    /// Per-channel height the graph shows the output at, in the curves' own units: the
+    /// lane's curve at the held point, crossed over from where it stood at a switch as
+    /// the output is (NaN until the first sample). For the UI only.
+    pub twoway_shown_y: Vec<f32>,
+    /// Per-channel shown height a crossover started from.
+    pub twoway_shown_from: Vec<f32>,
     /// Per-channel Peak hold: the curve height being held (NaN = none), and
     /// how long it has been held, in seconds (bounded by the hold time).
     pub twoway_peak_y: Vec<f32>,

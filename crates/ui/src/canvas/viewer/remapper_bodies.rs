@@ -15,10 +15,38 @@ pub(crate) fn action_width(ui: &egui::Ui, row_w: f32, n: usize) -> f32 {
 }
 
 /// One of the action row's buttons (Learn, MIDI…, Choose…, Clear, Add).
-pub(crate) fn action_button(label: &str, w: f32) -> egui::Button<'static> {
-    // In the control font (Settings → Display), a point larger than the pills beside it.
-    let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
-    egui::Button::new(egui::RichText::new(label.to_owned()).font(font)).min_size(egui::vec2(w, ACTION_H))
+pub(crate) fn action_button(ui: &egui::Ui, label: &str, w: f32) -> egui::Button<'static> {
+    // Fitted against every action row's words too, so the separate buttons of one of the
+    // module rows (Learn, MIDI…, Choose…, Clear, Add) come out in one size.
+    let mut words = ACTION_WORDS.to_vec();
+    words.push(label);
+    action_button_font(label, w, action_font(ui, &words, w))
+}
+
+/// The action rows' words, whichever a row carries: what every action button at a width is
+/// fitted against, so a row's buttons come out in one size.
+const ACTION_WORDS: [&str; 5] = ["Learn", "MIDI…", "Choose…", "Clear", "Add"];
+
+/// The font of a row of action buttons `w` wide carrying `labels`: the control font a point
+/// larger than the pills beside them (Settings → Display), or as much smaller as the widest
+/// of them needs to fit a button. One size for the row: fitted button by button, "MIDI…"
+/// came out smaller than "Learn" beside it.
+pub(crate) fn action_font(ui: &egui::Ui, labels: &[&str], w: f32) -> egui::FontId {
+    let base = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
+    let room = w - 2.0 * ui.spacing().button_padding.x - 2.0;
+    let size = labels
+        .iter()
+        .map(|l| super::simple_bodies::fit_font(ui, l, base.clone(), room).size)
+        .fold(base.size, f32::min);
+    egui::FontId::new(size, base.family)
+}
+
+/// An action button in `font` ([`action_font`]), never on two lines: at 16 points and up
+/// "MIDI…" broke onto two, its dots under its letters.
+pub(crate) fn action_button_font(label: &str, w: f32, font: egui::FontId) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(label.to_owned()).font(font))
+        .wrap_mode(egui::TextWrapMode::Truncate)
+        .min_size(egui::vec2(w, ACTION_H))
 }
 
 pub(crate) fn show_remapper_body(
@@ -525,7 +553,7 @@ pub(crate) fn show_remapper_body(
             let learn_label = if in_learning { "Stop" } else { "Learn" };
             let learn_btn = ui.add_enabled(
                 true,
-                action_button(learn_label, btn_w),
+                action_button(ui, learn_label, btn_w),
             );
             learn_rect = learn_btn.rect;
             if learn_btn.clicked() || act_learn {
@@ -604,7 +632,7 @@ pub(crate) fn show_remapper_body(
             // left-to-right walk, and either drew behind the game when opened
             // from the config overlay.
             {
-                let midi_btn = ui.add(action_button("MIDI…", btn_w))
+                let midi_btn = ui.add(action_button(ui, "MIDI…", btn_w))
                     .on_hover_text("Add a MIDI message to this mapping by hand.");
                 midi_rect = midi_btn.rect;
                 if midi_btn.clicked() {
@@ -621,7 +649,7 @@ pub(crate) fn show_remapper_body(
             // or the pad's motion as the input; a key, mouse button, pad button
             // or macro as the output. West switches sides inside it.
             {
-                let choose_btn = ui.add(action_button("Choose…", btn_w))
+                let choose_btn = ui.add(action_button(ui, "Choose…", btn_w))
                     .on_hover_text("Pick the input or output from a board instead of pressing it — \
                                     including the pad's motion (gyro, accel, tilt) as an input.");
                 special_rect = choose_btn.rect;
@@ -639,7 +667,7 @@ pub(crate) fn show_remapper_body(
             // over (back to input capturing, drafts emptied). Shown whenever a
             // draft exists so a botched capture can be reset WITHOUT finishing.
             if has_draft {
-                let clear_btn = ui.add(action_button("Clear", btn_w));
+                let clear_btn = ui.add(action_button(ui, "Clear", btn_w));
                 clear_rect = clear_btn.rect;
                 if clear_btn.clicked() || act_clear {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -656,7 +684,7 @@ pub(crate) fn show_remapper_body(
             }
 
             // Add button — appends mapping and resets drafts.
-            let add_btn = ui.add_enabled(add_enabled, action_button("Add", btn_w));
+            let add_btn = ui.add_enabled(add_enabled, action_button(ui, "Add", btn_w));
             add_rect = add_btn.rect;
             if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1200,7 +1228,7 @@ pub(crate) fn show_map_action_body(
         let btn_w = action_width(ui, (BODY_W - 18.0).min(358.0), 3 + usize::from(has_draft));
         ui.horizontal(|ui| {
             let learn_btn = ui.add_enabled(wired,
-                action_button("Learn", btn_w));
+                action_button(ui, "Learn", btn_w));
             learn_rect = learn_btn.rect;
             if (learn_btn.clicked() || act_learn) && wired {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1214,7 +1242,7 @@ pub(crate) fn show_map_action_body(
             // Choose… — pick the input chord from the board instead of pressing
             // it (gamepad: the nav driver opens the same picker).
             let choose_btn = ui.add_enabled(wired,
-                action_button("Choose…", btn_w))
+                action_button(ui, "Choose…", btn_w))
                 .on_hover_text("Pick the input from a board instead of pressing it.");
             choose_rect = choose_btn.rect;
             if choose_btn.clicked() {
@@ -1223,7 +1251,7 @@ pub(crate) fn show_map_action_body(
                         node_id, crate::canvas::viewer::subpatch_path(automap_parent)));
             }
             if has_draft {
-                let clear_btn = ui.add(action_button("Clear", btn_w));
+                let clear_btn = ui.add(action_button(ui, "Clear", btn_w));
                 clear_rect = clear_btn.rect;
                 if clear_btn.clicked() || act_clear {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1236,7 +1264,7 @@ pub(crate) fn show_map_action_body(
                     }
                 }
             }
-            let add_btn = ui.add_enabled(add_enabled, action_button("Add", btn_w));
+            let add_btn = ui.add_enabled(add_enabled, action_button(ui, "Add", btn_w));
             add_rect = add_btn.rect;
             if (add_btn.clicked() || act_add) && add_enabled {
                 if let Some(node) = snarl.get_node_mut(node_id) {

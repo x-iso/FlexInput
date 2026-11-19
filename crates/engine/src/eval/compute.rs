@@ -1231,6 +1231,8 @@ pub(crate) fn compute_twoway_response_curve_as(
     while state.twoway_old_output.len() < n_ch { state.twoway_old_output.push(0.0); }
     while state.twoway_peak_y.len()     < n_ch { state.twoway_peak_y.push(f32::NAN); }
     while state.twoway_peak_age.len()   < n_ch { state.twoway_peak_age.push(0.0); }
+    while state.twoway_shown_y.len()    < n_ch { state.twoway_shown_y.push(f32::NAN); }
+    while state.twoway_shown_from.len() < n_ch { state.twoway_shown_from.push(f32::NAN); }
 
     // Shared params (applied to both curves).
     let in_max  = params.get("in_max") .and_then(|v| v.as_f64()).unwrap_or(1.0)  as f32;
@@ -1325,6 +1327,18 @@ pub(crate) fn compute_twoway_response_curve_as(
         };
 
         let mut output = blend * new_output + (1.0 - blend) * state.twoway_old_output[ch];
+
+        // Where the graph shows it: the lane's curve at the held point, crossed over from
+        // where the graph showed it at the switch, over the same time the output takes.
+        {
+            let (lp, lb) = if state.twoway_lane[ch] >= 0 { (&pts_up, &biases_up) } else { (&pts_dn, &biases_dn) };
+            let y = sample_curve(lp, hyst.graph_x(held), lb);
+            let shown = state.twoway_shown_y[ch];
+            if switched || state.twoway_shown_from[ch].is_nan() {
+                state.twoway_shown_from[ch] = if shown.is_nan() { y } else { shown };
+            }
+            state.twoway_shown_y[ch] = blend * y + (1.0 - blend) * state.twoway_shown_from[ch];
+        }
 
         // Peak hold. The device reports far slower than this ticks, so a fast
         // pull lands on either side of a narrow peak and never reads it — and
@@ -1503,14 +1517,19 @@ pub(crate) fn twoway_track(held: &mut f32, lane: &mut i8, x: f32, to_down: f32, 
 }
 
 /// What a two-way curve node shows the UI per tick: its inputs, then one
-/// `Vec2(held, lane)` per channel from the tracker, so the body can draw the
-/// point the curves are actually read at and the band around it.
+/// `Vec4(held, lane, crossover, shown y)` per channel from the tracker, so the body can
+/// draw the point the curves are actually read at, the band around it, and the output
+/// crossing from one lane to the other after a switch (`shown y` in the curves' units).
 pub(crate) fn twoway_live_inputs(inputs: &[Option<Signal>], state: Option<&NodeState>) -> Vec<Option<Signal>> {
     let mut out = inputs.to_vec();
     if let Some(st) = state {
         for ch in 0..inputs.len() {
             let track = match (st.twoway_held.get(ch), st.twoway_lane.get(ch)) {
-                (Some(&h), Some(&l)) if !h.is_nan() => Some(Signal::Vec2(glam::Vec2::new(h, l as f32))),
+                (Some(&h), Some(&l)) if !h.is_nan() => {
+                    let blend = st.twoway_blend.get(ch).copied().unwrap_or(1.0);
+                    let shown = st.twoway_shown_y.get(ch).copied().unwrap_or(f32::NAN);
+                    Some(Signal::Vec4(glam::Vec4::new(h, l as f32, blend, shown)))
+                }
                 _ => None,
             };
             out.push(track);

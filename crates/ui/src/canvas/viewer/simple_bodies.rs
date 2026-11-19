@@ -889,6 +889,7 @@ pub(crate) fn show_dropdown_body(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     view_salt: u64,
+    body_w: f32,
 ) {
     // Snapshot params up-front.
     let mut options = snarl.get_node(node_id).map(dropdown_read_options).unwrap_or_default();
@@ -917,18 +918,21 @@ pub(crate) fn show_dropdown_body(
     // 120 rather than the 140 the old `box_width` default gave it: an option's name is cut at
     // the column's edge and reads whole on hover and in the popup, so the column is sized to
     // the module's two blocks, not to the longest name someone might type.
+    // The column is as wide as the grip makes the module (`kit::uses_kit`), from that floor:
+    // an option's name is often more than the floor shows, and some lists need reading.
     const LIST_W: f32 = 120.0;
     const ROW: f32 = 4.0;
     const HANDLE_W: f32 = 18.0;
     const BTN_W: f32 = 24.0;
-    const READ_W: f32 = LIST_W;
-    let name_w = (LIST_W - HANDLE_W - BTN_W - 2.0 * ROW).max(40.0);
+    let list_w = body_w.max(LIST_W);
+    let read_w = list_w;
+    let name_w = (list_w - HANDLE_W - BTN_W - 2.0 * ROW).max(40.0);
     // The reading, and one row per option.
     let rows = options.len() + 1;
     let list_h = rows as f32 * PILL_H + (rows as f32 - 1.0) * ROW;
 
     // Reserved once, so none of the text in it can reach back into the frame's width.
-    ui.allocate_exact_size(egui::vec2(LIST_W, list_h), egui::Sense::hover());
+    ui.allocate_exact_size(egui::vec2(list_w, list_h), egui::Sense::hover());
     // Folded, the column is still reserved and nothing in it is drawn: a collapsed node's body
     // runs under the header's clip, and an option row painted itself across the word "Dropdown".
     if !node_open(snarl, node_id) {
@@ -942,7 +946,7 @@ pub(crate) fn show_dropdown_body(
     let top = kit::group_top(ui.max_rect(), list_h);
     let row_top = |row: usize| top + row as f32 * (PILL_H + ROW);
     let row_rect = |row: usize| {
-        egui::Rect::from_min_size(egui::pos2(cx - LIST_W * 0.5, row_top(row)), egui::vec2(LIST_W, PILL_H))
+        egui::Rect::from_min_size(egui::pos2(cx - list_w * 0.5, row_top(row)), egui::vec2(list_w, PILL_H))
     };
 
     // The `shift` pin, if anyone wired it: what it says is *added* to the option chosen here
@@ -972,12 +976,12 @@ pub(crate) fn show_dropdown_body(
             .min((ui.ctx().content_rect().bottom() - reading.bottom() - 16.0).max(80.0));
         egui::ComboBox::from_id_salt(("dropdown_combo_sel", node_id.0))
             .selected_text(if current.is_empty() { "—".to_string() } else { current })
-            .width(READ_W)
+            .width(read_w)
             .height(want)
             // The same ComboBox minimum as above: without a width the button is 150 points or
             // the length of the option's text, whichever is longer, so a long option widened the
             // module instead of being cut at its edge. The popup still sizes itself to its rows.
-            .width(READ_W)
+            .width(read_w)
             .truncate()
             .show_ui(&mut child, |ui| {
                 for (i, opt) in options.iter().enumerate() {

@@ -1,4 +1,6 @@
 pub(crate) mod area_body;
+pub(crate) mod arrange;
+pub(crate) mod merge;
 mod curve;
 pub mod header_controls;
 pub(crate) mod input_viewer;
@@ -1064,6 +1066,70 @@ mod migration_tests {
         assert!(!sync_device_node_pins(&mut snarl, &device), "nothing left to do");
     }
 
+    /// A pin a pad gained goes where the pad lists it - the touch fields as sticks after
+    /// the D-pad - and the wires of the pins after it stay on their own pins.
+    #[test]
+    fn a_saved_device_nodes_new_output_goes_where_the_pad_lists_it() {
+        let pin = |id: &str, ty| flexinput_devices::DevicePin { id: id.to_string(), display_name: id.to_string(), signal_type: ty };
+        let v = SignalType::Vec2;
+        let mut params = HashMap::new();
+        params.insert("device_id".to_string(), Value::from("sdl:ds:a"));
+        params.insert("output_pin_ids".to_string(), serde_json::json!(["left_stick", "dpad", "btn_south"]));
+        let pad = NodeData {
+            module_id: "device.source".to_string(),
+            display_name: "Pad".to_string(),
+            category: "Device".to_string(),
+            inputs: vec![],
+            outputs: vec![
+                PinDescriptor::new("left_stick", v),
+                PinDescriptor::new("dpad", v),
+                PinDescriptor::new("btn_south", SignalType::Bool),
+            ],
+            params,
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let sink = NodeData {
+            module_id: "math.add".to_string(),
+            display_name: "Add".to_string(),
+            category: "Math".to_string(),
+            inputs: vec![PinDescriptor::new("a", v), PinDescriptor::new("b", SignalType::Bool)],
+            outputs: vec![],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        };
+        let device = flexinput_devices::PhysicalDevice {
+            id: "sdl:ds:a".to_string(),
+            display_name: "Pad".to_string(),
+            kind: flexinput_devices::ControllerKind::Generic,
+            outputs: vec![
+                pin("left_stick", v),
+                pin("dpad", v),
+                pin("touch1_xy", v),
+                pin("touch2_xy", v),
+                pin("btn_south", SignalType::Bool),
+            ],
+            inputs: vec![],
+            instance_path: None,
+            vid: None,
+            pid: None,
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let p = snarl.insert_node(egui::Pos2::ZERO, pad);
+        let s = snarl.insert_node(egui::pos2(10.0, 0.0), sink);
+        snarl.connect(OutPinId { node: p, output: 1 }, InPinId { node: s, input: 0 });
+        snarl.connect(OutPinId { node: p, output: 2 }, InPinId { node: s, input: 1 });
+        assert!(sync_device_node_pins(&mut snarl, &device));
+        let n = snarl.get_node(p).unwrap();
+        assert_eq!(n.params["output_pin_ids"], serde_json::json!(["left_stick", "dpad", "touch1_xy", "touch2_xy", "btn_south"]));
+        assert_eq!(n.outputs.iter().map(|o| o.name.as_str()).collect::<Vec<_>>(), ["left_stick", "dpad", "touch1_xy", "touch2_xy", "btn_south"]);
+        let wires: Vec<(usize, usize)> = snarl.wires().map(|(o, i)| (o.output, i.input)).collect();
+        assert!(wires.contains(&(1, 0)), "the D-pad's wire stays on the D-pad: {wires:?}");
+        assert!(wires.contains(&(4, 1)), "South's wire moves with South: {wires:?}");
+        assert_eq!(wires.len(), 2);
+    }
+
     /// A Steam Controller's saved patch follows the pad from SDL's Misc slots to
     /// the names its own reader uses: the ports of its node and the cards of the
     /// nodes that read THAT pad — including inside a sub-patch the pad feeds —
@@ -1473,6 +1539,12 @@ pub struct Canvas {
     /// Open wire context menu (right click, or a finger held on the wire): (from, to,
     /// screen position).
     wire_ctx_menu: Option<(OutPinId, InPinId, egui::Pos2)>,
+    /// A wire dropped onto an input that already had one, waiting on what to do with the two
+    /// (`merge`): the new wire's output, the input, and where it was dropped.
+    merge_menu: Option<merge::PendingMerge>,
+    /// A merge picked for the wire on an input, from the menu of a new wire drawn out of it
+    /// (`viewer::FlexViewer::open_merge`), to put in after the frame.
+    open_merge: Option<(merge::MergeWay, OutPinId, InPinId)>,
     /// Active inline rename: (node id, edit buffer, popup position).
     rename_state: Option<(egui_snarl::NodeId, String, egui::Pos2)>,
     undo_stack: Vec<Snarl<NodeData>>,
@@ -1583,6 +1655,8 @@ impl Canvas {
             snarl: Snarl::new(),
             style,
             wire_ctx_menu: None,
+            merge_menu: None,
+            open_merge: None,
             rename_state: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -2135,8 +2209,11 @@ impl Canvas {
 
         // The layout grid, as the settings have it this frame (see `CANVAS_GRID_KEY`).
         self.style.grid = canvas_grid(ui.ctx());
-        // How much the hovered or selected module's wires stand out.
+        // How much the hovered or selected module's wires stand out, and how see-through
+        // the wires are.
         self.style.wire_focus = canvas_grid_settings(ui.ctx()).map(|g| g.focus);
+        self.style.wire_opacity = canvas_grid_settings(ui.ctx()).map(|g| g.wire_opacity);
+        self.style.wire_activity_reveals = canvas_grid_settings(ui.ctx()).map(|g| g.wire_activity_reveals);
         // The activity glow's range and Auto-Map rule (the Wires menu), and where
         // each reading rests for the "changes from rest" rule.
         if let Some(g) = canvas_grid_settings(ui.ctx()) {
@@ -2187,6 +2264,8 @@ impl Canvas {
             panic_shortcut,
             physical_devices,
             pending_wire_menu: None,
+            pending_merge: None,
+            open_merge: None,
             rename_request: None,
             replace_request: None,
             remove_request: None,
@@ -2343,7 +2422,9 @@ impl Canvas {
         draw_spawn_glow(ui, snarl_id, snarl_rect, &self.snarl, &mut self.spawn_glow);
 
         // ── Zoom-control overlay (lower-right corner) ────────────────────────
-        draw_zoom_controls(ui, snarl_id, snarl_rect, &self.snarl);
+        if draw_zoom_controls(ui, snarl_id, snarl_rect, &self.snarl) {
+            self.auto_arrange(ui.ctx(), snarl_id);
+        }
 
         // ── Detect structural mutations from viewer callbacks ─────────────────
         let post_counts = (
@@ -2377,6 +2458,13 @@ impl Canvas {
         let wire_menu_opening = viewer.pending_wire_menu.is_some();
         if let Some(pending) = viewer.pending_wire_menu {
             self.wire_ctx_menu = Some(pending);
+        }
+        let merge_menu_opening = viewer.pending_merge.is_some();
+        if let Some(pending) = viewer.pending_merge {
+            self.merge_menu = Some(pending);
+        }
+        if viewer.open_merge.is_some() {
+            self.open_merge = viewer.open_merge;
         }
 
         // ── Hot-swap: replace device node ─────────────────────────────────────
@@ -2542,6 +2630,96 @@ impl Canvas {
             }
         }
 
+        // ── A wire dropped onto an input that has one: leave it, replace, or merge ──
+        if let Some(merge::PendingMerge { new: new_out, target, pos, moved_from }) = self.merge_menu {
+            let out_type = |o: OutPinId| {
+                self.snarl.get_node(o.node).and_then(|n| n.outputs.get(o.output)).map(|p| p.signal_type)
+            };
+            let old = self.snarl.in_pin(target).remotes.first().copied().filter(|&o| o != new_out);
+            let in_type = self
+                .snarl
+                .get_node(target.node)
+                .and_then(|n| n.inputs.get(target.input))
+                .map_or(SignalType::Any, |p| p.signal_type);
+            let ways: Vec<(merge::MergeWay, usize)> = merge::merge_ways(in_type, old.and_then(out_type), out_type(new_out))
+                .iter()
+                .filter_map(|w| descriptors.iter().position(|d| d.id == w.module).map(|i| (*w, i)))
+                .collect();
+            let mut open = true;
+            let mut replace = false;
+            let mut chosen: Option<(merge::MergeWay, usize)> = None;
+            let (menu_id, for_touch) =
+                egui_snarl::ui::touch::menu_opening(ui.ctx(), egui::Id::new("wire_merge_menu"), merge_menu_opening);
+            egui::Popup::new(menu_id, ui.ctx().clone(), egui::PopupAnchor::Position(pos), ui.layer_id())
+                .kind(egui::PopupKind::Menu)
+                .layout(egui::Layout::top_down_justified(egui::Align::Min))
+                .style(egui_snarl::ui::touch::menu_style_of(for_touch))
+                .open_bool(&mut open)
+                .show(|ui| {
+                    crate::touch::menu_scroll(ui, for_touch, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.label(egui::RichText::new("This input has a wire already").small().weak());
+                        if ui.button("Cancel").clicked() {
+                            ui.close();
+                        }
+                        if ui.button("Replace the wire").on_hover_text("The new wire in, the old one out.").clicked() {
+                            replace = true;
+                            ui.close();
+                        }
+                        if old.is_some() && !ways.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Merge the two through…").small().weak());
+                            for (w, i) in &ways {
+                                if ui.button(w.label).on_hover_text(w.hover).clicked() {
+                                    chosen = Some((*w, *i));
+                                    ui.close();
+                                }
+                            }
+                        }
+                    })
+                });
+            if replace {
+                self.push_undo();
+                let existing: Vec<OutPinId> = self.snarl.in_pin(target).remotes.to_vec();
+                for o in existing {
+                    self.snarl.disconnect(o, target);
+                }
+                self.snarl.connect(new_out, target);
+                // A wire moved here leaves where it was.
+                if let Some(from) = moved_from {
+                    self.snarl.disconnect(new_out, from);
+                }
+                open = false;
+            }
+            if let (Some((way, i)), Some(old)) = (chosen, old) {
+                self.push_undo();
+                // The same per-canvas id the snarl was shown under (see the shortcuts below).
+                let snarl_id = ui.make_persistent_id(("flexinput_canvas", self.view_salt));
+                let at = self.merge_position(ui.ctx(), snarl_id, target, &way);
+                merge::merge_wires(&mut self.snarl, &descriptors[i], &way, old, Some(new_out), target, at);
+                if let Some(from) = moved_from {
+                    self.snarl.disconnect(new_out, from);
+                }
+                open = false;
+            }
+            if !open {
+                self.merge_menu = None;
+            }
+        }
+
+        // ── A merge picked for the wire on an input a new wire was drawn out of ──
+        // The module beside the input, the wire there into its first input, its other input
+        // left free for what comes next.
+        if let Some((way, old, target)) = self.open_merge.take() {
+            let desc = descriptors.iter().find(|d| d.id == way.module);
+            if let (Some(desc), true) = (desc, self.snarl.in_pin(target).remotes.contains(&old)) {
+                self.push_undo();
+                let snarl_id = ui.make_persistent_id(("flexinput_canvas", self.view_salt));
+                let at = self.merge_position(ui.ctx(), snarl_id, target, &way);
+                merge::merge_wires(&mut self.snarl, desc, &way, old, None, target, at);
+            }
+        }
+
         // ── Keyboard shortcuts and modifier tooltip ────────────────────────────
         // Get selected nodes from snarl's egui state. Must use the same
         // per-canvas salt as the `show` pass above so selection resolves
@@ -2562,7 +2740,8 @@ impl Canvas {
         // Use direct event matching with modifiers — more robust than key_pressed() + separate
         // modifier check, because Ctrl+V may arrive as Event::Paste on some platforms.
         let overlay_open = self.rename_state.is_some()
-            || self.wire_ctx_menu.is_some();
+            || self.wire_ctx_menu.is_some()
+            || self.merge_menu.is_some();
         if !overlay_open {
             let del      = ui.input(|i| i.key_pressed(egui::Key::Delete));
             // Ctrl+C may arrive as Event::Copy on Windows instead of Event::Key.
@@ -2684,6 +2863,82 @@ impl Canvas {
     /// margin, which grid snapping needs to put the frame on the grid.
     pub(crate) fn node_frame_offset(&self) -> egui::Vec2 {
         self.style.node_frame.map_or(egui::Vec2::ZERO, |f| f.total_margin().left_top())
+    }
+
+    /// Where a module merging two wires into `target` goes (a node position): beside the
+    /// input, in room no other module is in (`merge::merge_spot`), from the frames and pins as
+    /// last drawn.
+    fn merge_position(&self, ctx: &egui::Context, snarl_id: egui::Id, target: InPinId, way: &merge::MergeWay) -> egui::Pos2 {
+        let offset = self.node_frame_offset();
+        let rects: viewer::NodeRectMap =
+            ctx.data(|d| d.get_temp(viewer::node_rects_id(self.view_salt))).unwrap_or_default();
+        let rect = |r: &[f32; 4]| egui::Rect::from_min_size(egui::pos2(r[0], r[1]), egui::vec2(r[2], r[3]));
+        let node_pos = self.snarl.get_node_info(target.node).map_or(egui::Pos2::ZERO, |i| i.pos);
+        let frame = rects.get(&target.node.0).map(rect).unwrap_or_else(|| egui::Rect::from_min_size(node_pos - offset, egui::vec2(112.0, 84.0)));
+        let pin_y = egui_snarl::ui::pin_heights(ctx, snarl_id)
+            .and_then(|h| h.inputs.get(&target).copied())
+            .map_or(frame.top() + 40.0, |h| node_pos.y + h);
+        let block = canvas_grid(ctx).map_or(28.0, |g| g.block);
+        let others: Vec<egui::Rect> = rects.iter().filter(|(k, _)| **k != target.node.0).map(|(_, r)| rect(r)).collect();
+        let size = merge::merge_size_guess(way.module, block);
+        merge::merge_spot(frame, pin_y, size, &others, block) + offset
+    }
+
+    /// Lay the whole patch out along its signal path (see [`arrange`]): each node's frame as
+    /// it was last drawn, each wire by the heights its pins were last drawn at. One undo step;
+    /// the view then frames the result.
+    pub(crate) fn auto_arrange(&mut self, ctx: &egui::Context, snarl_id: egui::Id) {
+        use egui_snarl::ui::NodeState;
+        let margin = self.style.node_frame.map_or(egui::epaint::MarginF32::ZERO, |f| f.total_margin());
+        let offset = margin.left_top();
+        let grid = canvas_grid(ctx).filter(|g| g.snap);
+        let style = ctx.style();
+        let heights = egui_snarl::ui::pin_heights(ctx, snarl_id).unwrap_or_default();
+        let nodes: Vec<arrange::ArrangeNode> = self
+            .snarl
+            .nodes_ids_data()
+            .map(|(id, info)| {
+                let ns = NodeState::load(ctx, snarl_id.with(("snarl-node", id)), &style.spacing);
+                let mut frame = ns.node_rect(info.pos, if info.open { 1.0 } else { 0.0 }) + margin;
+                if let Some(g) = grid {
+                    frame = egui::Rect::from_min_size(frame.min, egui::vec2(g.snap_len(frame.width()), g.snap_len(frame.height())));
+                }
+                let module = info.value.module_id.as_str();
+                arrange::ArrangeNode {
+                    id,
+                    frame,
+                    entry: matches!(module, "device.source" | "subpatch.inlet"),
+                    exit: matches!(module, "device.sink" | "subpatch.outlet"),
+                }
+            })
+            .collect();
+        // A pin not drawn yet (a folded node's, say) sits a header and a row in.
+        let guess = |index: usize| 28.0 + 24.0 * (index as f32 + 0.5);
+        let wires: Vec<arrange::ArrangeWire> = self
+            .snarl
+            .wires()
+            .map(|(out, inp)| arrange::ArrangeWire {
+                from: out.node,
+                from_y: heights.outputs.get(&out).map_or_else(|| guess(out.output), |h| h + offset.y),
+                to: inp.node,
+                to_y: heights.inputs.get(&inp).map_or_else(|| guess(inp.input), |h| h + offset.y),
+            })
+            .collect();
+        let block = grid.map(|g| g.block);
+        let b = block.unwrap_or(28.0);
+        let spacing = arrange::Spacing { column: 4.0 * b, row: 2.0 * b, group: 4.0 * b, block };
+        let placed = arrange::arrange(&nodes, &wires, &spacing);
+        let moves = nodes.iter().any(|nd| placed.get(&nd.id).is_some_and(|p| p.distance(nd.frame.min) > 0.5));
+        if !moves {
+            return;
+        }
+        self.push_undo();
+        for (id, frame_min) in placed {
+            if let Some(info) = self.snarl.get_node_info_mut(id) {
+                info.pos = frame_min + offset;
+            }
+        }
+        self.pending_view_action = Some(PendingViewAction::ZoomToFit);
     }
 
     /// Return a sensible canvas-space spawn position for a new node:
@@ -3244,26 +3499,29 @@ fn extend_feedback_control_inlets(node: &mut NodeData) {
 
 /// A device.source's pins are frozen when the node is created, so a saved node
 /// doesn't have the pins its pad gained since (feedback inputs, a Steam
-/// Controller's trackpad press), or what its pad's outputs are called now. Add
-/// the new pins after the ones it has, so that its wires stay where they are, and
-/// rename the outputs in place. A MIDI port's or a raw pad's outputs are their
-/// own business and get no new ones. Recurses into sub-patches.
-/// True if anything changed.
+/// Controller's trackpad press, its touch fields as sticks), or what its pad's
+/// outputs are called now. A new output goes where the pad lists it - after the
+/// nearest pin before it that the node has, its wires and those after it moved
+/// along with their pins - and a new input after the ones it has; the outputs are
+/// renamed in place. A MIDI port's or a raw pad's outputs are their own business
+/// and get no new ones. Recurses into sub-patches. True if anything changed.
 pub fn sync_device_node_pins(
     snarl: &mut Snarl<NodeData>,
     device: &flexinput_devices::PhysicalDevice,
 ) -> bool {
     let mut changed = false;
-    for (_, node) in snarl.nodes_ids_data_mut() {
-        let node = &mut node.value;
-        if let Some(sp) = node.subpatch.as_mut() {
+    let node_ids: Vec<NodeId> = snarl.nodes_ids_data().map(|(id, _)| id).collect();
+    for node_id in node_ids {
+        if let Some(sp) = snarl.get_node_mut(node_id).and_then(|n| n.subpatch.as_mut()) {
             changed |= sync_device_node_pins(&mut sp.snarl, device);
         }
+        let Some(node) = snarl.get_node_mut(node_id) else { continue };
         if node.module_id != "device.source"
             || node.params.get("device_id").and_then(|v| v.as_str()) != Some(device.id.as_str())
         {
             continue;
         }
+        let mut new_outputs = false;
         if let Some(Value::Array(ids)) = node.params.get_mut("output_pin_ids") {
             for (id, out) in ids.iter().zip(node.outputs.iter_mut()) {
                 let pin = device.outputs.iter().find(|p| Some(p.id.as_str()) == id.as_str());
@@ -3273,16 +3531,28 @@ pub fn sync_device_node_pins(
                 }
             }
             let own_outputs = device.id.starts_with("midi_in:") || flexinput_core::raw_pad::is_raw_device_id(&device.id);
-            if !own_outputs && ids.len() == node.outputs.len() {
-                for pin in &device.outputs {
-                    if !ids.iter().any(|id| id.as_str() == Some(pin.id.as_str())) {
-                        ids.push(Value::String(pin.id.clone()));
-                        node.outputs.push(PinDescriptor::new(&pin.display_name, pin.signal_type));
-                        changed = true;
-                    }
+            new_outputs = !own_outputs && ids.len() == node.outputs.len();
+        }
+        if new_outputs {
+            for (k, pin) in device.outputs.iter().enumerate() {
+                let ids: Vec<String> = snarl
+                    .get_node(node_id)
+                    .and_then(|n| n.params.get("output_pin_ids").and_then(|v| v.as_array()))
+                    .map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
+                    .unwrap_or_default();
+                if ids.iter().any(|id| *id == pin.id) {
+                    continue;
                 }
+                let at = device.outputs[..k]
+                    .iter()
+                    .rev()
+                    .find_map(|p| ids.iter().position(|id| *id == p.id))
+                    .map_or(ids.len(), |i| i + 1);
+                insert_device_output(snarl, node_id, at, pin);
+                changed = true;
             }
         }
+        let Some(node) = snarl.get_node_mut(node_id) else { continue };
         let Some(Value::Array(ids)) = node.params.get_mut("input_pin_ids") else { continue };
         // Pins and ids run in parallel; a node where they don't isn't this shape.
         if ids.len() != node.inputs.len() { continue; }
@@ -3295,6 +3565,25 @@ pub fn sync_device_node_pins(
         }
     }
     changed
+}
+
+/// Put `pin` in as a device.source's output `at`: the wires of the outputs from there on
+/// move along one with them, so each stays on its own pin.
+fn insert_device_output(snarl: &mut Snarl<NodeData>, node: NodeId, at: usize, pin: &flexinput_devices::DevicePin) {
+    let moved: Vec<(OutPinId, InPinId)> = snarl.wires().filter(|(o, _)| o.node == node && o.output >= at).collect();
+    for (o, i) in &moved {
+        snarl.disconnect(*o, *i);
+    }
+    if let Some(n) = snarl.get_node_mut(node) {
+        let at = at.min(n.outputs.len());
+        n.outputs.insert(at, PinDescriptor::new(&pin.display_name, pin.signal_type));
+        if let Some(Value::Array(ids)) = n.params.get_mut("output_pin_ids") {
+            ids.insert(at.min(ids.len()), Value::String(pin.id.clone()));
+        }
+    }
+    for (o, i) in moved {
+        snarl.connect(OutPinId { node, output: o.output + 1 }, i);
+    }
 }
 
 /// Swap a device.source or device.sink node to a different physical device, preserving
@@ -3529,15 +3818,16 @@ pub fn canvas_grid(ctx: &egui::Context) -> Option<egui_snarl::ui::GridLayout> {
 pub const SEE_THROUGH_ALPHA_KEY: &str = "flexinput::see_through_alpha";
 
 /// Lower-right overlay with canvas zoom controls.
-/// Layout (left → right): [👁] [−] [100%] [+] [fit].
+/// Layout (left → right): [grid] [wires] [arrange] [−] [100%] [+] [fit].
 /// Painted in a foreground egui Area so the strip sits visually above
-/// and interactively above the snarl node layer.
+/// and interactively above the snarl node layer. Returns whether Arrange was clicked: the
+/// caller has the patch to move and the undo stack to remember it on.
 fn draw_zoom_controls(
     ui: &mut egui::Ui,
     snarl_id: egui::Id,
     snarl_rect: egui::Rect,
     snarl: &Snarl<NodeData>,
-) {
+) -> bool {
     use egui_snarl::ui::SnarlState;
 
     const MIN_SCALE: f32 = 0.2;
@@ -3548,9 +3838,9 @@ fn draw_zoom_controls(
     let pct = (cur_scale * 100.0).round() as i32;
 
     // Pre-measure the strip so we can compute a bottom-right placement.
-    // Layout: [grid] [-] [zoom%] [+] [fit] ≈ 24 + 24 + 48 + 24 + 24 + paddings
+    // Layout: [grid] [wires] [arrange] [-] [zoom%] [+] [fit] ≈ 24 × 6 + 48 + paddings
     let margin = 10.0_f32;
-    let est_w  = 224.0_f32;
+    let est_w  = 252.0_f32;
     let est_h  = 36.0_f32;
     let anchor = egui::pos2(
         snarl_rect.right()  - est_w - margin,
@@ -3569,6 +3859,7 @@ fn draw_zoom_controls(
     let mut clicked_reset  = false;
     let mut clicked_plus   = false;
     let mut clicked_fit    = false;
+    let mut clicked_arrange = false;
 
     area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
@@ -3588,6 +3879,15 @@ fn draw_zoom_controls(
 
                 grid_menu(ui);
                 wires_menu(ui);
+                const ARRANGE_SVG: &[u8] = include_bytes!("../../../../app/assets/arrange.svg");
+                clicked_arrange = ui
+                    .add(toolbar_icon_button(ui, ARRANGE_SVG, "⇶"))
+                    .on_hover_text(concat!(
+                        "Arrange the patch: modules in columns along the signal's path, inputs on ",
+                        "the left and outputs on the right, each at the height its wires come in at. ",
+                        "Undo puts them back.",
+                    ))
+                    .clicked();
 
                 clicked_minus = ui.add(egui::Button::new(
                     egui::RichText::new("−").monospace())
@@ -3649,6 +3949,7 @@ fn draw_zoom_controls(
     }
 
     state.store(snarl, ui.ctx());
+    clicked_arrange
 }
 
 /// The zoom toolbar's grid menu: the layout grid's settings, edited in their
@@ -3701,6 +4002,17 @@ fn grid_menu(ui: &mut egui::Ui) {
                     "one added on top of them.",
                 ));
             });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Transitions").small().weak());
+                ui.add(egui::Slider::new(&mut grid.transition_ms, 0.0..=400.0).max_decimals(0).custom_formatter(|v, _| {
+                    if v <= 0.0 { "Off".into() } else { format!("{v:.0} ms") }
+                }))
+                .on_hover_text(concat!(
+                    "How long a module takes to glide to where it moved - a step along the grid ",
+                    "as it's dragged, one pushed aside, an arrange, an undo - and its wires to their ",
+                    "new routes. Off jumps.",
+                ));
+            });
         })
         .0;
     resp.on_hover_text("Layout grid");
@@ -3743,6 +4055,21 @@ fn wires_menu(ui: &mut egui::Ui) {
                         .on_hover_text("How wide a berth wires give the modules they go round.");
                 });
             }
+            ui.horizontal(|ui| {
+                ui.label(small("Opacity"));
+                ui.add(egui::Slider::new(&mut grid.wire_opacity, 0.0..=1.0).custom_formatter(|v, _| {
+                    if v <= 0.0 { "Hidden".into() } else { format!("{:.0}%", v * 100.0) }
+                }))
+                .on_hover_text(concat!(
+                    "How see-through the wires are, from hidden to solid. A hovered or selected ",
+                    "module's wires show whole whatever this is.",
+                ));
+            });
+            ui.add_enabled_ui(grid.wire_opacity < 1.0, |ui| {
+                ui.checkbox(&mut grid.wire_activity_reveals, "Activity shows wires").on_hover_text(
+                    "A see-through wire shows more of itself the more its signal is doing.",
+                );
+            });
             ui.horizontal(|ui| {
                 ui.label(small("Highlight"));
                 ui.add(egui::Slider::new(&mut grid.focus, 0.0..=1.0).custom_formatter(|v, _| {

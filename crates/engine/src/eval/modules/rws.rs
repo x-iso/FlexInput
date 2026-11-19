@@ -27,7 +27,13 @@ pub(crate) const GYRO_REF_DPS: f32 = 2000.0;
 /// - `off`      — no block (plain passthrough).
 /// - `full`     — block whenever flick or stick-aim is enabled.
 /// - `deadzone` — block only while the stick is past the flick deadzone, so small
-///   movements inside the deadzone still reach the default mapping (flick only).
+///   movements inside the deadzone still reach the default mapping (flick only);
+///   not while a slow push has the flick zone shut (`flick_slow_lock`), as the
+///   stick isn't flicking then and may be meant for something else.
+///
+/// The Flick input can be a stick, the D-pad or a trackpad's `touchN_xy`; a
+/// trackpad is blocked as its whole touch field, and read from its Vec2 alone,
+/// since its x and y hold where the last touch was.
 ///
 /// A calibration sweep blocks the stick whatever the mode: the sweep drives the
 /// game from this module alone (the 360° also counts the stick circled round its
@@ -62,18 +68,22 @@ pub(crate) fn eval_rws_node(
         .map(|s| s.unblocked_src.clone())
         .unwrap_or_default();
     let sig_f32 = |s: &Signal| if let Signal::Float(f) = s { Some(*f) } else { None };
-    let flick_snapshot = if can_suppress {
+    let touch = flexinput_core::automap::TOUCH_VECTOR_PINS.iter().find(|p| p[0] == stick);
+    let vec_of = |pin: &str| match unblocked.get_pin(&dev_id, &pin) {
+        Some(Signal::Vec2(v)) => Some(*v),
+        _ => None,
+    };
+    let flick_snapshot = if !can_suppress {
+        None
+    } else if touch.is_some() {
+        vec_of(&stick)
+    } else {
         let x = unblocked.get_pin(&dev_id, &format!("{stick}_x")).and_then(sig_f32);
         let y = unblocked.get_pin(&dev_id, &format!("{stick}_y")).and_then(sig_f32);
         match (x, y) {
             (Some(x), Some(y)) => Some(glam::Vec2::new(x, y)),
-            _ => match unblocked.get_pin(&dev_id, &stick) {
-                Some(Signal::Vec2(v)) => Some(*v),
-                _ => None,
-            },
+            _ => vec_of(&stick),
         }
-    } else {
-        None
     };
 
     // Corrected inputs: override the Flick input (1) with the unblocked stick.
@@ -103,23 +113,37 @@ pub(crate) fn eval_rws_node(
         let past = mag >= deadzone.max(0.05);
         let do_block = measuring
             || sup_mode == "full"
-            || (sup_mode == "deadzone" && flick_on && past);
+            || (sup_mode == "deadzone" && flick_on && past && !rws_flick_zone_shut(state.get(&uid), &snap.params));
         if do_block {
             let bk = format!("{SRC_BLOCK_PREFIX}{dev_id}");
-            for p in [
-                stick.clone(),
-                format!("{stick}_x"),
-                format!("{stick}_y"),
-                format!("{stick}_up"),
-                format!("{stick}_down"),
-                format!("{stick}_left"),
-                format!("{stick}_right"),
-            ] {
-                collector_sigs.set_pin(&bk, &p, Signal::Bool(true));
+            if let Some(field) = touch {
+                for p in field {
+                    collector_sigs.set_pin(&bk, p, Signal::Bool(true));
+                }
+            } else {
+                for p in [
+                    stick.clone(),
+                    format!("{stick}_x"),
+                    format!("{stick}_y"),
+                    format!("{stick}_up"),
+                    format!("{stick}_down"),
+                    format!("{stick}_left"),
+                    format!("{stick}_right"),
+                ] {
+                    collector_sigs.set_pin(&bk, &p, Signal::Bool(true));
+                }
             }
         }
     }
     out
+}
+
+/// Whether a slow push has the flick zone shut this tick: the speed gate is on with
+/// `flick_slow_lock`, and the push in hand was too slow to flick.
+fn rws_flick_zone_shut(state: Option<&NodeState>, params: &HashMap<String, Value>) -> bool {
+    let lock = params.get("flick_slow_lock").and_then(|v| v.as_bool()).unwrap_or(false);
+    let gated = params.get("flick_speed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0) > 0.0;
+    lock && gated && state.and_then(|s| s.aux_f32.get(GST)).copied() == Some(GST_STEERING)
 }
 
 /// One turn a card asked for (see `flexinput_core::flick`), still paying out.
@@ -291,10 +315,18 @@ const GST_DECIDING: f32 = 1.0;
 const GST_STEERING: f32 = 2.0;
 const GST_FLICKED: f32 = 3.0;
 /// Out past this a gesture starts; back inside it, the gesture is over.
-const GESTURE_OUT: f32 = 0.1;
+const GESTURE_OUT: f32 = RWS_GESTURE_OUT;
+/// Where a push of the flick stick starts, for the speed gate: the flick circle draws it.
+pub const RWS_GESTURE_OUT: f32 = 0.1;
 //   [19] bound turn (deg) still owed to a stick output — what a full-deflection
 //        tick couldn't carry, paid out on the ticks after
 const TURN_STICK_CARRY: usize = 19;
+// For the body's flick circle only (see `RwsFlickView`):
+//   [20] how far this flick has turned the aim since it engaged (deg): the snap
+//        plus the tracking, kept after it lets go until the next one
+//   [21] 1 when this flick engaged inside the forward deadzone, so didn't snap
+const FLK_TURNED: usize = 20;
+const FLK_NO_SNAP: usize = 21;
 
 /// Where RWS Aim's display-only measured angle lands in `last_out`: right after
 /// the node's pins. Nodes saved before the Flick pin have two pins, before the
@@ -306,6 +338,140 @@ pub fn rws_cal_deg_out(n_outputs: usize) -> usize {
 /// Where the sweep's peak unclamped stick deflection lands: after the angle.
 pub fn rws_cal_peak_out(n_outputs: usize) -> usize {
     rws_cal_deg_out(n_outputs) + 1
+}
+/// The release floor of a flick engaged at `deadzone`: once out, it keeps tracking
+/// the stick down to here, and lets go only after the stick has stayed under it
+/// for a moment (a Bluetooth gap reads as a dip, not a release).
+pub fn rws_flick_release_floor(deadzone: f32) -> f32 {
+    (deadzone.clamp(0.05, 0.99) * 0.5).clamp(0.15, 0.7)
+}
+/// Where the flick circle's live state starts in `last_out`: two display-only
+/// `Vec4`s after the peak deflection. Read them with [`rws_flick_view`].
+pub fn rws_flick_view_out(n_outputs: usize) -> usize {
+    rws_cal_peak_out(n_outputs) + 1
+}
+
+/// Where a push of the flick stick is in the speed gate (`flick_speed_ms`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RwsGesture {
+    /// At the centre, or the gate is off.
+    #[default]
+    Neutral,
+    /// Out of the centre, the clock running: a flick if it reaches the flick zone in time.
+    Deciding,
+    /// Too slow to flick: steering (with `flick_slow_lock`, the flick zone is shut).
+    Steering,
+    /// It flicked: Stick aim stays off until the stick is back at the centre.
+    Flicked,
+}
+
+/// What the flick stick is doing this tick, for the body's flick circle.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RwsFlickView {
+    /// The stick on the Flick input, as the module reads it (up = +y).
+    pub stick: glam::Vec2,
+    /// A flick is engaged: the stick is out and the aim follows it round.
+    pub engaged: bool,
+    /// The stick's heading while engaged, degrees clockwise from straight up. Held
+    /// through a dip below the release floor.
+    pub heading_deg: f32,
+    /// How far this flick has turned the aim (deg): the snap plus the tracking.
+    pub turned_deg: f32,
+    /// Of `turned_deg`, what the outputs haven't turned yet: the snap still being
+    /// smoothed in, tracking held back by the stabiliser.
+    pub owed_deg: f32,
+    /// This flick engaged inside the forward deadzone, so it didn't snap.
+    pub no_snap: bool,
+    /// The stick has dipped below the release floor; the flick lets go if it stays.
+    pub dipping: bool,
+    /// The flick reaches something and the Flick On input has it on.
+    pub flick_on: bool,
+    /// Stick aim is on (and the Flick On input has it on).
+    pub aim_on: bool,
+    /// A calibration sweep has the stick.
+    pub measuring: bool,
+    pub gesture: RwsGesture,
+    /// Seconds since the stick left the centre, while deciding.
+    pub gate_s: f32,
+}
+
+/// The flick circle's live state from a node's `last_out` (see [`rws_flick_view_out`]).
+pub fn rws_flick_view(out: &[Option<Signal>], n_outputs: usize) -> Option<RwsFlickView> {
+    let at = rws_flick_view_out(n_outputs);
+    let (Some(Signal::Vec4(a)), Some(Signal::Vec4(b))) = (out.get(at).copied().flatten(), out.get(at + 1).copied().flatten()) else {
+        return None;
+    };
+    let flags = b.x as u32;
+    Some(RwsFlickView {
+        stick: glam::Vec2::new(a.x, a.y),
+        heading_deg: a.z,
+        turned_deg: a.w,
+        engaged: flags & 1 != 0,
+        flick_on: flags & 2 != 0,
+        aim_on: flags & 4 != 0,
+        measuring: flags & 8 != 0,
+        no_snap: flags & 16 != 0,
+        dipping: flags & 32 != 0,
+        gesture: match b.y as u32 {
+            1 => RwsGesture::Deciding,
+            2 => RwsGesture::Steering,
+            3 => RwsGesture::Flicked,
+            _ => RwsGesture::Neutral,
+        },
+        gate_s: b.z,
+        owed_deg: b.w,
+    })
+}
+
+impl RwsFlickView {
+    /// The two `Vec4`s [`rws_flick_view`] reads back.
+    pub fn encode(&self) -> [Signal; 2] {
+        let flags = u32::from(self.engaged)
+            | u32::from(self.flick_on) << 1
+            | u32::from(self.aim_on) << 2
+            | u32::from(self.measuring) << 3
+            | u32::from(self.no_snap) << 4
+            | u32::from(self.dipping) << 5;
+        let gesture = match self.gesture {
+            RwsGesture::Neutral => 0.0,
+            RwsGesture::Deciding => 1.0,
+            RwsGesture::Steering => 2.0,
+            RwsGesture::Flicked => 3.0,
+        };
+        [
+            Signal::Vec4(glam::Vec4::new(self.stick.x, self.stick.y, self.heading_deg, self.turned_deg)),
+            Signal::Vec4(glam::Vec4::new(flags as f32, gesture, self.gate_s, self.owed_deg)),
+        ]
+    }
+}
+
+/// The flick circle's state this tick. `stick_only` is a flick that goes out as stick
+/// deflection alone, whose turn waits on the stick's top speed; merged into the outputs too,
+/// the mouse has already turned it.
+fn flick_view_now(state: &NodeState, stick: glam::Vec2, flick_on: bool, aim_on: bool, measuring: bool, stick_only: bool) -> RwsFlickView {
+    let s = &state.aux_f32;
+    let engaged = s[FLK_ENGAGED] > 0.5;
+    let carry = if stick_only { s[FLK_STICK_CARRY] } else { 0.0 };
+    let gesture = match s[GST] {
+        g if g == GST_DECIDING => RwsGesture::Deciding,
+        g if g == GST_STEERING => RwsGesture::Steering,
+        g if g == GST_FLICKED => RwsGesture::Flicked,
+        _ => RwsGesture::Neutral,
+    };
+    RwsFlickView {
+        stick,
+        engaged,
+        heading_deg: s[FLK_PREV_ANGLE].to_degrees(),
+        turned_deg: s[FLK_TURNED],
+        owed_deg: s[FLK_PENDING_DEG] + s[FLK_TRACK_PENDING] + (s[FLK_STAB_RAW] - s[FLK_STAB_OUT]).to_degrees() + carry,
+        no_snap: s[FLK_NO_SNAP] > 0.5,
+        dipping: engaged && s[FLK_BELOW_S] > 0.0,
+        flick_on,
+        aim_on,
+        measuring,
+        gate_s: if gesture == RwsGesture::Deciding { s[GST_T] } else { 0.0 },
+        gesture,
+    }
 }
 
 /// The gains the Map output puts on the Device bus's gyro axes: `(roll and yaw, pitch)`.
@@ -363,12 +529,12 @@ pub(crate) fn rws_fit_outputs(mut out: Vec<Option<Signal>>, n_outputs: usize) ->
 /// Outputs: [Mouse Vec2 (per-tick displacement), Stick Vec2 (right-stick
 /// deflection, unit range), Flick Vec2 (the flick alone, when `flick_output`
 /// sends it there — mouse counts or stick deflection), the Map slot (an AutoMap
-/// pin: its bus rides in `collector_sigs`, see [`publish_native_gyro`]), then two
-/// DISPLAY-ONLY
-/// trailing entries no wire reads (wiring indexes by pin): measured calibration
-/// degrees (Float), and the sweep's peak unclamped stick deflection (Float). The
-/// UI reads them from `last_out` (same pattern as the Virtual Menu's open/hover
-/// entries) at [`rws_cal_deg_out`] / [`rws_cal_peak_out`].
+/// pin: its bus rides in `collector_sigs`, see [`publish_native_gyro`]), then
+/// DISPLAY-ONLY trailing entries no wire reads (wiring indexes by pin): measured
+/// calibration degrees (Float), the sweep's peak unclamped stick deflection
+/// (Float), and the flick circle's two Vec4s. The UI reads them from `last_out`
+/// (same pattern as the Virtual Menu's open/hover entries) at
+/// [`rws_cal_deg_out`] / [`rws_cal_peak_out`] / [`rws_flick_view`].
 pub(crate) fn compute_rws(
     inputs: &[Option<Signal>],
     state: &mut NodeState,
@@ -453,7 +619,7 @@ pub(crate) fn compute_rws(
     // Integrate the measured axis. Signed, so turning back (repositioning, or
     // correcting an overshoot) subtracts. Restart whenever the sweep (re)starts or
     // switches axis; hold the value while off so a Finish read lands intact.
-    while state.aux_f32.len() <= TURN_STICK_CARRY {
+    while state.aux_f32.len() <= FLK_NO_SNAP {
         state.aux_f32.push(0.0);
     }
     let axis_code = match cal_measure.as_str() {
@@ -647,6 +813,7 @@ pub(crate) fn compute_rws(
         }
     }
 
+    let [view_a, view_b] = flick_view_now(state, flick_stick, flick_on, stick_aim, measuring, flick_output == "stick").encode();
     vec![
         Some(Signal::Vec2(glam::Vec2::new(dx, dy))),
         Some(Signal::Vec2(glam::Vec2::new(sx, sy))),
@@ -656,6 +823,8 @@ pub(crate) fn compute_rws(
         // Display-only (not a pin): see the doc comment above.
         Some(Signal::Float(state.aux_f32[MEAS_DEG])),
         Some(Signal::Float(state.aux_f32[MEAS_PEAK_DEFL])),
+        Some(view_a),
+        Some(view_b),
     ]
 }
 
@@ -688,7 +857,7 @@ fn compute_flick(
     allow_engage: bool,
     dt: f32,
 ) -> f32 {
-    while state.aux_f32.len() <= FLK_STAB_OUT {
+    while state.aux_f32.len() <= FLK_NO_SNAP {
         state.aux_f32.push(0.0);
     }
     let stick = match inputs.get(1).and_then(|s| *s) {
@@ -707,7 +876,7 @@ fn compute_flick(
     //  • Disengage requires a SUSTAINED release (`FLK_DISENGAGE_HOLD_S`), so a
     //    brief Bluetooth input gap doesn't drop the flick and re-fire it.
     let engage_dz = deadzone.clamp(0.05, 0.99);
-    let release_dz = (engage_dz * 0.5).clamp(0.15, 0.7);
+    let release_dz = rws_flick_release_floor(deadzone);
     let reliable = mag >= release_dz;
 
     if reliable {
@@ -738,6 +907,7 @@ fn compute_flick(
             } else {
                 state.aux_f32[FLK_TRACK_PENDING] += d.to_degrees();
             }
+            state.aux_f32[FLK_TURNED] += d.to_degrees();
             state.aux_f32[FLK_PREV_ANGLE] = angle;
         } else if mag >= engage_dz && allow_engage {
             // Engage: flick to the stick's heading from forward (up), clockwise
@@ -749,7 +919,10 @@ fn compute_flick(
             state.rws_flick_stab = None;
             let flick_deg = angle.to_degrees();
             // Inside the forward deadzone: engaged and tracking, but no snap.
-            let flick_deg = if flick_deg.abs() <= fwd_dz_deg { 0.0 } else { flick_deg };
+            let no_snap = flick_deg.abs() <= fwd_dz_deg;
+            let flick_deg = if no_snap { 0.0 } else { flick_deg };
+            state.aux_f32[FLK_TURNED] = flick_deg;
+            state.aux_f32[FLK_NO_SNAP] = f32::from(u8::from(no_snap));
             if smooth_ms > 0.5 {
                 state.aux_f32[FLK_PENDING_DEG] = flick_deg;
                 state.aux_f32[FLK_PAYOUT_S] = smooth_ms / 1000.0;
@@ -884,7 +1057,7 @@ fn gesture_catch_up(state: &mut NodeState, dt: f32) -> glam::Vec2 {
 fn reset_flick(state: &mut NodeState) {
     for &i in &[
         FLK_ENGAGED, FLK_PENDING_DEG, FLK_PAYOUT_S, FLK_BELOW_S, FLK_TRACK_PENDING, FLK_STICK_CARRY,
-        FLK_STAB_RAW, FLK_STAB_OUT,
+        FLK_STAB_RAW, FLK_STAB_OUT, FLK_TURNED, FLK_NO_SNAP,
     ] {
         if let Some(v) = state.aux_f32.get_mut(i) {
             *v = 0.0;

@@ -115,6 +115,12 @@ arc-swap     = "1"
 # See the FLEXINPUT PATCH comment in vendor/btleplug/src/winrtble/ble/device.rs.
 btleplug = { path = "vendor/btleplug" }
 egui-snarl = { path = "vendor/egui-snarl" }
+# Vendored for one line in its tooltips: a big tooltip that covers its own widget is kept
+# open while the pointer is on the widget, but egui compares the screen-space pointer with
+# the widget's rect in its own layer's space - so on the canvas (a zoomed, panned layer) such
+# a tooltip closed and reopened every other frame: it blinked in any window too small to
+# show it beside its widget. See the FLEXINPUT PATCH in vendor/egui/src/containers/tooltip.rs.
+egui = { path = "vendor/egui" }
 # Vendored to fix the one unrecoverable GPU panic we hit: when a fullscreen
 # game resets the graphics device, egui-wgpu's `update_buffers` panics because
 # `queue.write_buffer_with` returns `None`. The vendored copy turns that panic

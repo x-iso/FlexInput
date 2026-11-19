@@ -639,7 +639,8 @@ impl Module for Gyro3DOFModule {
 // Scales a rotation-rate Vec2 (gyro axes or a stick) into per-tick MOUSE
 // DISPLACEMENT, so a physical rotation maps 1:1 to in-game camera rotation once
 // the `scale` (counts-per-degree) is calibrated; `rws` is the user multiplier on
-// that ground truth. A second Vec2 input drives flick-stick (stick angle → yaw).
+// that ground truth. A second Vec2 input drives flick-stick (stick angle → yaw):
+// a stick, the D-pad, or a trackpad as a stick (`touch1_xy` / `touch2_xy`).
 //
 // The "Mouse Move (XY)" output is meant to be wired to the KB/M `mouse_move` sink pin: that
 // pin is applied once per tick (displacement, not integrated) and is NOT scaled

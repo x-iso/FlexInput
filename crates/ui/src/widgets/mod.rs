@@ -657,3 +657,37 @@ mod tests {
         assert!(offset <= 100.0 && offset + 300.0 >= 390.0, "{offset}");
     }
 }
+
+#[cfg(test)]
+mod big_tooltip_tests {
+    // A tooltip too big to fit beside its widget is pushed back over it, and then the widget
+    // isn't hovered any more: egui keeps such a tooltip open while the pointer is on the
+    // widget. On the canvas the widget is in a zoomed, panned layer, and egui used to compare
+    // the screen-space pointer with the widget's rect in its layer's space: the tooltip closed
+    // and opened every other frame (the vendored egui's FLEXINPUT PATCH). Once shown, it stays.
+    #[test]
+    fn a_big_tooltip_over_its_widget_on_a_zoomed_layer_stays_open() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 180.0));
+        let long: String = (0..40).map(|i| format!("line {i} of a long tooltip that wraps a bit
+")).collect();
+        let mut shown = Vec::new();
+        for frame in 0..80 {
+            let mut input = egui::RawInput { screen_rect: Some(screen), time: Some(frame as f64 / 60.0), ..Default::default() };
+            if frame == 0 {
+                input.events.push(egui::Event::PointerMoved(egui::pos2(30.0, 126.0)));
+            }
+            let _ = ctx.run(input, |ctx| {
+                let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("zoomed"));
+                ctx.set_transform_layer(layer, egui::emath::TSTransform::new(egui::vec2(10.0, 20.0), 1.5));
+                egui::Area::new(egui::Id::new("zoomed")).order(egui::Order::Middle).fixed_pos(egui::pos2(0.0, 0.0)).show(ctx, |ui| {
+                    ui.add_space(60.0);
+                    ui.button("hover me").on_hover_text(long.as_str());
+                });
+            });
+            shown.push(ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|l| l.order == egui::Order::Tooltip)));
+        }
+        let first = shown.iter().position(|s| *s).expect("the tooltip shows once the pointer rests");
+        assert!(shown[first..].iter().all(|s| *s), "it blinked: {shown:?}");
+    }
+}

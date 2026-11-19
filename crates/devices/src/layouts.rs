@@ -205,6 +205,10 @@ fn ds4_outputs() -> Vec<DevicePin> {
         f2("left_stick",    "Left Stick",        SignalType::Vec2),
         f2("right_stick",   "Right Stick",       SignalType::Vec2),
         f2("dpad",          "D-Pad",             SignalType::Vec2),
+        // Each finger as a stick, with the other Vec2s: the engine makes these from the
+        // touch pins below.
+        f2("touch1_xy",     "Touch 1 XY",        SignalType::Vec2),
+        f2("touch2_xy",     "Touch 2 XY",        SignalType::Vec2),
         fl("left_stick_x",  "L.Stick X"),
         fl("left_stick_y",  "L.Stick Y"),
         fl("right_stick_x", "R.Stick X"),
@@ -498,6 +502,13 @@ fn joycon2_inputs() -> Vec<DevicePin> {
 fn generic_outputs() -> Vec<DevicePin> {
     // Base generic list (sticks/buttons/dpad) shared with the gilrs path.
     let mut pins = crate::gamepad::standard_outputs();
+    // Each touch field as a stick, with the other Vec2s after the D-pad: the engine makes
+    // these from the touch pins below.
+    let at = pins.iter().position(|p| p.id == "dpad").map_or(pins.len(), |i| i + 1);
+    pins.splice(at..at, [
+        f2("touch1_xy",     "Touch 1 XY",   SignalType::Vec2),
+        f2("touch2_xy",     "Touch 2 XY",   SignalType::Vec2),
+    ]);
     // Extended capabilities the SDL backend relays for pads FlexInput doesn't
     // parse natively (Steam Controller, third-party): gyro/accel (SDL sensor
     // API), touchpad fingers (raw SDL_GetGamepadTouchpadFinger), and the extra

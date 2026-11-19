@@ -492,6 +492,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         let st = carry.trackpad_touches.get_or_insert_with(Default::default);
         filter_trackpads(graph, &mut dev_sigs_owned, st);
     }
+    // Each trackpad as a stick, from the calibrated touch.
+    touch_vectors(&mut dev_sigs_owned);
     // Apply the Virtual Menu SOURCE-BLOCK (one tick stale): zero every pointer
     // pin an open menu asked to block last tick, so those analog inputs reach
     // ONLY the menu's navigation — not a mouse mapping, another module, or a

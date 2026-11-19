@@ -511,13 +511,15 @@ pub(crate) fn splitter_pin_label(pin_id: &str, neutral: &str, family: Option<&st
 pub(crate) fn automap_action_row(ui: &mut egui::Ui, left: f32, w: f32, actions: &[(&str, bool, bool, &str)]) -> Option<usize> {
     let gap = ui.spacing().item_spacing.x;
     let bw = super::remapper_bodies::action_width(ui, w, actions.len());
+    let labels: Vec<&str> = actions.iter().map(|(l, ..)| *l).collect();
+    let font = super::remapper_bodies::action_font(ui, &labels, bw);
     let (row, _) = ui.allocate_exact_size(egui::vec2(w, super::remapper_bodies::ACTION_H), egui::Sense::hover());
     let mut clicked = None;
     for (k, (label, enabled, on, hover)) in actions.iter().enumerate() {
         let r = egui::Rect::from_min_size(egui::pos2(left + k as f32 * (bw + gap), row.top()), egui::vec2(bw, row.height()));
         let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(r).id_salt(("am_action", k)));
         let resp = cell
-            .add_enabled(*enabled, super::remapper_bodies::action_button(label, bw).selected(*on))
+            .add_enabled(*enabled, super::remapper_bodies::action_button_font(label, bw, font.clone()).selected(*on))
             .on_hover_text(*hover)
             .on_disabled_hover_text(*hover);
         if resp.clicked() {
@@ -538,12 +540,14 @@ pub(crate) fn automap_action_column(ui: &mut egui::Ui, actions: &[(&str, bool, b
         .fold(0.0f32, f32::max)
         + 2.0 * ui.spacing().button_padding.x
         + 16.0;
+    let labels: Vec<&str> = actions.iter().map(|(l, ..)| *l).collect();
+    let font = super::remapper_bodies::action_font(ui, &labels, w);
     let mut clicked = None;
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
         for (k, (label, enabled, on, hover)) in actions.iter().enumerate() {
             let resp = ui
-                .add_enabled(*enabled, super::remapper_bodies::action_button(label, w).selected(*on))
+                .add_enabled(*enabled, super::remapper_bodies::action_button_font(label, w, font.clone()).selected(*on))
                 .on_hover_text(*hover)
                 .on_disabled_hover_text(*hover);
             if resp.clicked() {
@@ -599,12 +603,13 @@ pub(crate) fn automap_curve_pin_picker(
     let carried = |pin: &str| devs.iter().any(|d| live_signals.contains_key(&(d.clone(), pin.to_string())));
     let shapeable = |t: SignalType| matches!(t, SignalType::Float | SignalType::Vec2);
 
-    let mut options: Vec<String> = am_canon::ALL_PINS.iter()
+    // In the order lists show the bus in, not the order it was added to in.
+    let mut options: Vec<String> = am_canon::pins_in_display_order().iter()
         .filter(|p| shapeable(p.signal_type) && carried(p.id))
         .map(|p| p.id.to_string())
         .collect();
     if options.is_empty() {
-        options = am_canon::ALL_PINS.iter()
+        options = am_canon::pins_in_display_order().iter()
             .filter(|p| shapeable(p.signal_type))
             .map(|p| p.id.to_string())
             .collect();
@@ -893,7 +898,7 @@ pub(crate) fn show_automap_split_body(
         // dropdown is a popup, so it can be as wide as the names need without the module
         // paying for it.
         let mut adds: Vec<(String, String, String, SignalType)> = Vec::new();
-        for ap in am_canon::ALL_PINS {
+        for ap in am_canon::pins_in_display_order().iter().copied() {
             if current_ids.iter().any(|id| id == ap.id) { continue; }
             adds.push((ap.id.to_string(), splitter_pin_label(ap.id, ap.display_name, family_ref), ap.display_name.to_string(), ap.signal_type));
         }
@@ -1041,8 +1046,9 @@ pub(crate) fn show_automap_collect_body(
         }
 
         // ── `add pin`: one input per canonical pin, as on the Splitter ─────────
-        let adds: Vec<&am_canon::AutoMapPin> = am_canon::ALL_PINS
+        let adds: Vec<&am_canon::AutoMapPin> = am_canon::pins_in_display_order()
             .iter()
+            .copied()
             .filter(|ap| !current_ids.iter().any(|id| id == ap.id))
             .collect();
         let labels: Vec<String> = adds.iter().map(|ap| splitter_pin_label(ap.id, ap.display_name, family_ref)).collect();
@@ -1789,11 +1795,11 @@ pub(crate) fn show_automap_combiner_body(
                 _ => "Other",
             }
         }
-        // Bucket pins by category, preserving ALL_PINS order within each bucket.
+        // Bucket pins by category, in the order lists show the bus in within each bucket.
         let categories: &[&str] = &["Sticks", "Triggers", "D-Pad", "Buttons", "Motion", "KB/M", "Other"];
         let mut by_cat: std::collections::HashMap<&'static str, Vec<&'static str>> = std::collections::HashMap::new();
         let mut tracked_ordered: Vec<&'static str> = tracked.keys().copied().collect();
-        tracked_ordered.sort_by_key(|p| am_canon::ALL_PINS.iter()
+        tracked_ordered.sort_by_key(|p| am_canon::pins_in_display_order().iter()
             .position(|ap| ap.id == *p).unwrap_or(usize::MAX));
         for pin_id in tracked_ordered {
             by_cat.entry(pin_category(pin_id)).or_default().push(pin_id);

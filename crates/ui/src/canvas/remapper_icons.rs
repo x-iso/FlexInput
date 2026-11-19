@@ -313,6 +313,7 @@ fn steam_pin_svg(pin_id: &str) -> Option<&'static [u8]> {
         "touch_swipe_x" => PS4_SWIPE_H,
         "touch_swipe_y" => PS4_SWIPE_V,
         "touch1_active" | "touch2_active" | "touch1_pressure" | "touch2_pressure" => PS4_TP_SURFACE,
+        "touch1_xy" | "touch2_xy" => PS4_TP_SURFACE,
         "touch_left" | "touchpad_left" => PS4_TP_LEFT,
         "touch_center" | "touchpad_center" => PS4_TP_CENTER,
         "touch_right" | "touchpad_right" => PS4_TP_RIGHT,
@@ -825,6 +826,8 @@ pub fn pin_svg(skin: Skin, pin_id: &str) -> Option<&'static [u8]> {
         "touch_right"  | "touchpad_right"  => return Some(PS_TP_RIGHT),
         "btn_touchpad" | "touchpad_any"    => return Some(PS_TP_CLICK),
         "touch1_pressure" | "touch2_pressure" => return Some(PS4_TP_SURFACE),
+        // A touch field as a stick: the pad's surface.
+        "touch1_xy" | "touch2_xy" => return Some(PS4_TP_SURFACE),
         "btn_mute"                         => return Some(PS_MUTE),
         // Extra rear paddles (family-neutral generic glyph; left vs right by side).
         // Both paddle rows on a side share one glyph — the label overlay tells
@@ -1079,10 +1082,10 @@ pub fn extra_button_label(skin: Skin, pin_id: &str) -> Option<&'static str> {
         (_, "btn_paddle_r1") => Some("PR1"),
         (_, "btn_paddle_l2") => Some("PL2"),
         (_, "btn_paddle_r2") => Some("PR2"),
-        (Skin::Steam, "btn_touchpad" | "touch1_active" | "touch1_pressure") => Some("L"),
-        (Skin::Steam, "btn_touchpad2" | "btn_misc2" | "touch2_active" | "touch2_pressure") => Some("R"),
-        (_, "touch1_pressure") => Some("1"),
-        (_, "touch2_pressure") => Some("2"),
+        (Skin::Steam, "btn_touchpad" | "touch1_active" | "touch1_pressure" | "touch1_xy") => Some("L"),
+        (Skin::Steam, "btn_touchpad2" | "btn_misc2" | "touch2_active" | "touch2_pressure" | "touch2_xy") => Some("R"),
+        (_, "touch1_pressure" | "touch1_xy") => Some("1"),
+        (_, "touch2_pressure" | "touch2_xy") => Some("2"),
         _ => None,
     }
 }

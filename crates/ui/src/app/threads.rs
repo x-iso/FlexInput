@@ -512,6 +512,8 @@ pub(crate) fn spawn_io_thread(
                             signals.insert(k.clone(), *v);
                         }
                     }
+                    // Each trackpad as a stick, as the pad reports it.
+                    flexinput_core::automap::add_touch_vectors(&mut signals);
                     last_signal_count = signals.len();
                     // ArcSwap publish — consumers (proc thread, UI) read
                     // via `load_full()`, a refcount bump rather than a

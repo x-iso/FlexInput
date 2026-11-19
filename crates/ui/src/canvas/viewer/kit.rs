@@ -217,7 +217,8 @@ pub(crate) fn mark_body(module_id: &str) -> bool {
 /// on them were the whole reason a Delay was 252 points wide for one number. They are pills
 /// now, sized by a constant box like the other small bodies, so they size themselves.
 pub(crate) fn uses_kit(module_id: &str) -> bool {
-    matches!(module_id, "logic.counter")
+    // The Dropdown: its column of options as wide as the grip makes it, its height its rows'.
+    matches!(module_id, "logic.counter" | "module.dropdown")
 }
 
 /// The modules whose channels are their content: a matched In/Out pin pair each, added and
@@ -384,6 +385,10 @@ pub(crate) fn pin_label(module_id: &str, name: &str) -> (String, bool) {
             ("Out", true) => return (format!("o{n}"), true),
             _ => {}
         }
+    }
+    // The 3D viewer's one input: "Orientation" was most of the module's width.
+    if module_id == "display.controller3d" && name == "Orientation" {
+        return ("Orient".to_string(), true);
     }
     if pin_abbreviates(module_id) {
         pin_short(name)
@@ -950,6 +955,16 @@ pub(crate) fn svg_header_w(ui: &egui::Ui) -> f32 {
     svg_swatch_w(ui) + 2.0 * stepper_h(ui) + 3.0 * CURVE_HEADER_GAP + 4.0
 }
 
+/// RWS Aim's unit switch (dots per degree / per 360°), and the width its first half takes.
+pub(crate) const RWS_UNIT_W: f32 = 104.0;
+pub(crate) const RWS_UNIT_FIRST_W: f32 = 46.0;
+
+/// RWS Aim's header controls, left to right at the header's right edge: Save, Load and the
+/// Mouse Scale unit. The room comes off the name, as the SVG module's does.
+pub(crate) fn rws_header_w(ui: &egui::Ui) -> f32 {
+    RWS_UNIT_W + 2.0 * stepper_h(ui) + 3.0 * CURVE_HEADER_GAP + 4.0
+}
+
 pub(crate) fn curve_header_w(ui: &egui::Ui) -> f32 {
     CURVE_TOGGLE_W.iter().sum::<f32>() + 3.0 * stepper_h(ui) + 5.0 * CURVE_HEADER_GAP + 4.0
 }
@@ -961,9 +976,10 @@ pub(crate) fn curve_header_w(ui: &egui::Ui) -> f32 {
 /// grey, beside pills and strips a size up.
 pub(crate) fn body_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
-    let text_w = ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER).size().x;
+    let text_w = ui.painter().layout_no_wrap(label.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x;
     let w = (text_w + 2.0 * ui.spacing().button_padding.x + 12.0).max(44.0);
-    ui.add(super::remapper_bodies::action_button(label, w).selected(selected))
+    // Sized to its own word, so in its own font, not fitted against the action rows' words.
+    ui.add(super::remapper_bodies::action_button_font(label, w, font).selected(selected))
 }
 
 pub(crate) fn header_plus_button(ui: &mut egui::Ui, hover: &str, row: egui::Rect, right: f32) -> bool {

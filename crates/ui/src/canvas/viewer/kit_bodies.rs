@@ -59,6 +59,8 @@ pub(crate) fn kit_min_width(module_id: &str) -> f32 {
         // cell, a control and a value box, and the labels ("Output", "Step", "Range") were most
         // of it.
         "logic.counter" => 116.0,
+        // Its option column at the two blocks it has always had; the grip widens it.
+        "module.dropdown" => 120.0,
         _ => kit::MIN_W,
     }
 }

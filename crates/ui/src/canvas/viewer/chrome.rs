@@ -11,6 +11,9 @@ pub(crate) enum WireDir<'a> {
     FromInput  { dsts: &'a [InPinId],  to_type:   SignalType, moved_from: Option<OutPinId> },
 }
 
+/// The Add-module menu: a module picked goes in at `pos`, and takes the wires `wire` carries.
+/// Returns what to ask when the new module's output would go into an input that already has
+/// a wire (see `canvas::merge`).
 pub(crate) fn show_module_menu(
     pos: egui::Pos2,
     ui: &mut egui::Ui,
@@ -18,7 +21,8 @@ pub(crate) fn show_module_menu(
     descriptors: &[ModuleDescriptor],
     wire: Option<WireDir>,
     is_inner_canvas: bool,
-) {
+) -> Option<crate::canvas::merge::PendingMerge> {
+    let mut ask = None;
     let mut categories: Vec<&str> = vec![];
     for d in descriptors {
         // Inlet/Outlet nodes (category "SubPatch") are only available inside sub-patch editors.
@@ -56,7 +60,8 @@ pub(crate) fn show_module_menu(
                     if ui.button(desc.display_name).clicked() {
                         let node_id = snarl.insert_node_placed(pos, NodeData::from(desc));
                         if let Some(wire) = &wire {
-                            connect_dropped_wires(snarl, wire, desc, node_id);
+                            let at = ui.ctx().input(|i| i.pointer.latest_pos().or_else(|| i.pointer.interact_pos()));
+                            ask = connect_dropped_wires(snarl, wire, desc, node_id, at.unwrap_or_default());
                         }
                         ui.close();
                     }
@@ -64,6 +69,7 @@ pub(crate) fn show_module_menu(
             });
         });
     }
+    ask
 }
 
 /// Delete the wires a move was carrying, which are still connected at `from`.
@@ -84,13 +90,19 @@ pub(crate) fn delete_moved_wires(snarl: &mut Snarl<NodeData>, carried: &AnyPins,
 }
 
 /// Connect wires dropped on empty space to the new module just made for them. Each takes
-/// the first of its pins that accepts it; a wire none accepts stays where it was.
+/// the first of its pins that accepts it; a wire none accepts stays where it was. A wire drawn
+/// out of an input that has one doesn't stack a second wire on it (the engine reads only the
+/// first) or, on an Auto-Map port, drop the old one: it's left to ask what to do with the two,
+/// and that's returned, with `at` (screen) where to ask it.
 fn connect_dropped_wires(
     snarl: &mut Snarl<NodeData>,
     wire: &WireDir,
     desc: &ModuleDescriptor,
     node_id: NodeId,
-) {
+    at: egui::Pos2,
+) -> Option<crate::canvas::merge::PendingMerge> {
+    use crate::canvas::merge::{on_drop, Drop, PendingMerge};
+    let mut ask = None;
     match wire {
         WireDir::FromOutput { srcs, moved_from, .. } => {
             for &src in *srcs {
@@ -115,17 +127,24 @@ fn connect_dropped_wires(
                 let found = desc.outputs.iter().enumerate()
                     .find(|(_, p)| to_type.accepts(p.signal_type));
                 if let Some((output, _)) = found {
-                    if to_type == SignalType::AutoMap {
-                        snarl.drop_inputs(dst);
-                    }
-                    snarl.connect(OutPinId { node: node_id, output }, dst);
-                    if let Some(from) = moved_from {
-                        snarl.disconnect(*from, dst);
+                    let out = OutPinId { node: node_id, output };
+                    match on_drop(snarl, out, dst, *moved_from) {
+                        Drop::Connect => {
+                            snarl.connect(out, dst);
+                            if let Some(from) = moved_from {
+                                snarl.disconnect(*from, dst);
+                            }
+                        }
+                        Drop::Ask => {
+                            ask.get_or_insert(PendingMerge { new: out, target: dst, pos: at, moved_from: None });
+                        }
+                        Drop::Nothing => {}
                     }
                 }
             }
         }
     }
+    ask
 }
 
 // ── Pin label color helpers ───────────────────────────────────────────────────
@@ -266,7 +285,7 @@ mod dropped_wire_tests {
         let new = add(&mut snarl, &module);
         let srcs = [o1, o2];
         let wire = WireDir::FromOutput { srcs: &srcs, from_type: Float, moved_from: Some(from) };
-        connect_dropped_wires(&mut snarl, &wire, &module, new);
+        let _ = connect_dropped_wires(&mut snarl, &wire, &module, new, egui::Pos2::ZERO);
 
         let to = InPinId { node: new, input: 0 };
         assert_eq!(wires(&snarl), [(o1, to), (o2, to)]);
@@ -286,7 +305,7 @@ mod dropped_wire_tests {
         let new = add(&mut snarl, &module);
         let srcs = [src];
         let wire = WireDir::FromOutput { srcs: &srcs, from_type: Float, moved_from: None };
-        connect_dropped_wires(&mut snarl, &wire, &module, new);
+        let _ = connect_dropped_wires(&mut snarl, &wire, &module, new, egui::Pos2::ZERO);
 
         assert_eq!(wires(&snarl), [(src, kept), (src, InPinId { node: new, input: 0 })]);
     }
@@ -309,7 +328,7 @@ mod dropped_wire_tests {
         let new = add(&mut snarl, &module);
         let srcs = [o1, o2];
         let wire = WireDir::FromOutput { srcs: &srcs, from_type: AutoMap, moved_from: Some(from) };
-        connect_dropped_wires(&mut snarl, &wire, &module, new);
+        let _ = connect_dropped_wires(&mut snarl, &wire, &module, new, egui::Pos2::ZERO);
 
         assert_eq!(wires(&snarl), [(o1, InPinId { node: new, input: 0 }), (o2, from)]);
     }
@@ -331,10 +350,33 @@ mod dropped_wire_tests {
         let new = add(&mut snarl, &module);
         let dsts = [i1, i2];
         let wire = WireDir::FromInput { dsts: &dsts, to_type: Float, moved_from: Some(from) };
-        connect_dropped_wires(&mut snarl, &wire, &module, new);
+        let _ = connect_dropped_wires(&mut snarl, &wire, &module, new, egui::Pos2::ZERO);
 
         let out = OutPinId { node: new, output: 0 };
         assert_eq!(wires(&snarl), [(out, i1), (out, i2)]);
+    }
+
+    /// A wire drawn out of an input that has one leaves it alone and asks: the new module's
+    /// output doesn't stack a second wire on the input, nor (on an Auto-Map port) drop the old.
+    #[test]
+    fn a_wire_drawn_out_of_a_taken_input_asks() {
+        for ty in [SignalType::Float, SignalType::AutoMap] {
+            let mut snarl = Snarl::new();
+            let s = add(&mut snarl, &desc(&[], &[ty]));
+            let sink = add(&mut snarl, &desc(&[ty], &[]));
+            let (old, dst) = (OutPinId { node: s, output: 0 }, InPinId { node: sink, input: 0 });
+            snarl.connect(old, dst);
+
+            let module = desc(&[], &[ty]);
+            let new = add(&mut snarl, &module);
+            let dsts = [dst];
+            let wire = WireDir::FromInput { dsts: &dsts, to_type: ty, moved_from: None };
+            let at = egui::pos2(5.0, 6.0);
+            let ask = connect_dropped_wires(&mut snarl, &wire, &module, new, at).expect("it asks");
+
+            assert_eq!(wires(&snarl), [(old, dst)], "{ty:?}: the input keeps its wire while it asks");
+            assert_eq!((ask.new, ask.target, ask.pos), (OutPinId { node: new, output: 0 }, dst, at), "{ty:?}");
+        }
     }
 
     /// Deleting takes the wires being carried, and only those.

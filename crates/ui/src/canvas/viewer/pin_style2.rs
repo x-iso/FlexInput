@@ -180,7 +180,10 @@ fn render_fields(inner_id: NodeId, module_id: &str, element: &str, ui: &mut egui
         for (k, (f, cell)) in chunk.iter().zip(cells.iter().copied()).enumerate() {
             let i = first + k;
             let label = f.label.to_lowercase();
-            let salt = ("ps2_field", inner_id.0, i);
+            // The element in it: two rows of one module pinned side by side (3DOF's Pointer and
+            // Steering, one field each) had the same ids, and a click went to whichever row was
+            // drawn last - the one on top of the layout - however far it was from the other.
+            let salt = ("ps2_field", inner_id.0, element, i);
             // What the field does, as its tooltip: the module's own words for it, where the
             // field table has them (`field_hint`). It was the label again - "interp ms".
             let key = match &f.field {
@@ -269,6 +272,7 @@ fn first_guess(element: &str) -> f32 {
         "range_row" => 320.0,
         "style" => 400.0,
         "flick" | "flick_opts" => 430.0,
+        "flick_route" => 360.0,
         _ => 220.0,
     }
 }

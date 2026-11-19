@@ -742,6 +742,9 @@ impl FlexInputApp {
             | ("processing.rws", "field") | ("processing.rws", "style")
             | ("processing.rws", "flick") | ("processing.rws", "suppress")
             | ("processing.rws", "flick_opts") | ("processing.rws", "flick_speed")
+            | ("processing.rws", "flick_zone") | ("processing.rws", "flick_aim")
+            | ("processing.rws", "flick_feel") | ("processing.rws", "flick_route")
+            | ("processing.rws", "flick_view")
             | ("module.stick_rotation", "options") | ("module.stick_rotation", "sens")
             | ("module.stick_rotation", "deadzone") | ("module.stick_rotation", "stabilise")
             | ("module.stick_rotation", "hold") | ("module.stick_rotation", "takeover")
@@ -2512,11 +2515,42 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
                 f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
             ],
             ("processing.rws", "flick_speed") => vec![
+                f!("Flick speed gate", Toggle{key:"flick_slow_lock"}),
                 f!("Flick within ms", v("flick_speed_ms",0.0,300.0,0.0,Fixed(10.0))),
-                f!("Slow = aim only", Toggle{key:"flick_slow_lock"}),
             ],
             ("processing.rws", "suppress") => vec![
                 f!("Suppress", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
+            ],
+            // The rows round the flick circle, in the order they publish their rects.
+            ("processing.rws", "flick_zone") => vec![
+                f!("Flick zone", v("flick_deadzone",0.1,0.99,0.85,Fixed(0.1))),
+                f!("Fwd ±° no snap", v("flick_fwd_dz_deg",0.0,90.0,0.0,Fixed(5.0))),
+            ],
+            ("processing.rws", "flick_aim") => vec![
+                f!("Stick aim", Toggle{key:"stick_aim_enabled"}),
+                f!("Aim ×", v("stick_aim_rws",0.01,50.0,1.0,Fixed(0.1))),
+            ],
+            ("processing.rws", "flick_feel") => vec![
+                f!("Snap ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
+                f!("Stabilise ms", v("flick_stabilise_ms",0.0,300.0,0.0,Fixed(10.0))),
+            ],
+            ("processing.rws", "flick_route") => vec![
+                f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
+                f!("Block stick", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
+            ],
+            // The pinned flick circle carries every flick setting, so the flick can be
+            // tuned from the pad with only the circle pinned.
+            ("processing.rws", "flick_view") => vec![
+                f!("Flick zone", v("flick_deadzone",0.1,0.99,0.85,Fixed(0.1))),
+                f!("Fwd ±° no snap", v("flick_fwd_dz_deg",0.0,90.0,0.0,Fixed(5.0))),
+                f!("Snap ms", v("flick_smooth_ms",0.0,500.0,100.0,Fixed(10.0))),
+                f!("Stabilise ms", v("flick_stabilise_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Stick aim", Toggle{key:"stick_aim_enabled"}),
+                f!("Aim ×", v("stick_aim_rws",0.01,50.0,1.0,Fixed(0.1))),
+                f!("Flick speed gate", Toggle{key:"flick_slow_lock"}),
+                f!("Flick within ms", v("flick_speed_ms",0.0,300.0,0.0,Fixed(10.0))),
+                f!("Flick out", Enum{key:"flick_output",opts:&["mouse","stick","both"]}),
+                f!("Block stick", Enum{key:"suppress_source",opts:&["off","full","deadzone"]}),
             ],
             // ── Gyro to Stick Rotation ──
             // Each option lists its default first, so an untouched node shows it.

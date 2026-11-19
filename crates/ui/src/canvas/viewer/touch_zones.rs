@@ -3019,7 +3019,7 @@ pub(crate) fn render_touch_zone_cards(
         _ => 5,
     };
     let bw = super::remapper_bodies::action_width(ui, TZ_CARD_W - reserved, buttons.max(3));
-    let action = |label: &str| super::remapper_bodies::action_button(label, bw);
+    let action = |ui: &egui::Ui, label: &str| super::remapper_bodies::action_button(ui, label, bw);
     ui.allocate_ui_with_layout(
         egui::vec2(TZ_CARD_W, 26.0),
         egui::Layout::left_to_right(egui::Align::Center),
@@ -3029,7 +3029,7 @@ pub(crate) fn render_touch_zone_cards(
             "idle" if implicit_trig => {
                 // Menu: the trigger is this zone's selection — go straight to
                 // picking the DESTINATION (gamepad learn or the picker).
-                let b = ui.add(action("Learn"))
+                let b = ui.add(action(ui, "Learn"))
                     .on_hover_text("Learn a gamepad button or keyboard key as this zone's output — press one.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3040,7 +3040,7 @@ pub(crate) fn render_touch_zone_cards(
                         for k in ["_tz_draft_out", "_tz_draft_out_gap", "_tz_draft_out_dur", "_tz_gp_base", "_tz_gp_seen"] { node.params.remove(k); }
                     }
                 }
-                let b = ui.add(action("Choose…"))
+                let b = ui.add(action(ui, "Choose…"))
                     .on_hover_text("Choose keyboard / mouse / gamepad / stick / macro outputs for this zone. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3060,7 +3060,7 @@ pub(crate) fn render_touch_zone_cards(
                         ..Default::default()
                     });
                 }
-                let b = ui.add(action("MIDI…"))
+                let b = ui.add(action(ui, "MIDI…"))
                     .on_hover_text("Build a MIDI message for this zone to play.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3074,7 +3074,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             "idle" => {
-                let b = ui.add(action("Learn"))
+                let b = ui.add(action(ui, "Learn"))
                     .on_hover_text("Demonstrate a touch, click, or swipe on a zone, then assign an output.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3087,7 +3087,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             "learning" => {
-                let b = ui.add(action("Cancel"));
+                let b = ui.add(action(ui, "Cancel"));
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {
@@ -3096,7 +3096,7 @@ pub(crate) fn render_touch_zone_cards(
                 }
             }
             _ => { // captured
-                let b = ui.add(action("Choose…"))
+                let b = ui.add(action(ui, "Choose…"))
                     .on_hover_text("Choose keyboard / mouse / mouse-delta / gamepad / stick outputs. Pick several for a chord, then Add.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3110,14 +3110,14 @@ pub(crate) fn render_touch_zone_cards(
                         ..Default::default()
                     });
                 }
-                let b = ui.add(action("MIDI…"))
+                let b = ui.add(action(ui, "MIDI…"))
                     .on_hover_text("Build a MIDI message for this zone to play.");
                 act_rects.push(b.rect);
                 if b.clicked() {
                     tz_request_midi(ui.ctx(), node_id, automap_parent);
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
-                let b = ui.add(action(if armed { "🎮…" } else { "🎮" }).selected(armed))
+                let b = ui.add(action(ui, if armed { "🎮…" } else { "🎮" }).selected(armed))
                     .on_hover_text("Learn a gamepad button or keyboard key as the output — press one now.");
                 act_rects.push(b.rect);
                 if b.clicked() {
@@ -3127,12 +3127,12 @@ pub(crate) fn render_touch_zone_cards(
                         node.params.remove("_tz_gp_seen");
                     }
                 }
-                let add = ui.add_enabled(!draft_out.is_empty(), action("Add"));
+                let add = ui.add_enabled(!draft_out.is_empty(), action(ui, "Add"));
                 act_rects.push(add.rect);
                 if add.on_hover_text("Add this zone mapping").clicked() && !draft_out.is_empty() {
                     tz_commit_card(snarl, node_id, sel_f, sel_z, &trigger, &draft_out);
                 }
-                let b = ui.add(action("Cancel"));
+                let b = ui.add(action(ui, "Cancel"));
                 act_rects.push(b.rect);
                 if b.clicked() {
                     if let Some(node) = snarl.get_node_mut(node_id) {

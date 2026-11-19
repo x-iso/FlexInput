@@ -258,6 +258,85 @@ pub const CAPACITIVE_LEARN_MUTE_PIN: &str = "__capacitive_learn_mute";
 /// like [`CAPACITIVE_MASK_PIN`], and no real pin.
 pub const TOUCH_PADS_PIN: &str = "__touch_pads";
 
+/// [`ALL_PINS`] in the order a list shows them: grouped by what they are - the pad's
+/// sticks as Vec2s, its axes, its buttons, its touch, its motion, a mouse sensor, then the
+/// keyboard and mouse outputs - where `ALL_PINS` has to keep each new pin at its tail.
+/// Every pin of the bus is here once (`the_display_order_has_every_pin_once`).
+const DISPLAY_ORDER: &[&str] = &[
+    // Sticks, as one signal each.
+    "left_stick", "right_stick", "dpad", "touch1_xy", "touch2_xy",
+    // Axes.
+    "left_stick_x", "left_stick_y", "right_stick_x", "right_stick_y",
+    "left_trigger", "right_trigger", "dpad_x", "dpad_y",
+    // Buttons.
+    "btn_south", "btn_east", "btn_west", "btn_north", "btn_lb", "btn_rb",
+    "btn_lt_dig", "btn_rt_dig", "btn_ls", "btn_rs", "btn_start", "btn_back", "btn_guide",
+    "btn_capture", "btn_mute", "dpad_up", "dpad_down", "dpad_left", "dpad_right", "btn_c",
+    "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2",
+    "btn_misc1", "btn_misc2", "btn_misc3", "btn_misc4", "btn_misc5", "btn_misc6",
+    "btn_cap_l", "btn_cap_r", "btn_grip_l", "btn_grip_r",
+    // Touch.
+    "btn_touchpad", "btn_touchpad2",
+    "touch1_x", "touch1_y", "touch1_active", "touch1_pressure",
+    "touch2_x", "touch2_y", "touch2_active", "touch2_pressure",
+    // Motion.
+    "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z", "orientation",
+    // A mouse sensor on the pad.
+    "optical_motion", "optical_x", "optical_y", "optical_contact", "optical_distance",
+    // Keyboard.
+    "key_escape", "key_shift", "key_ctrl", "key_alt", "key_win",
+    // Mouse.
+    "mouse_left", "mouse_right", "mouse_middle", "mouse_back", "mouse_forward",
+    "mouse", "mouse_x", "mouse_y", "mouse_move", "mouse_move_x", "mouse_move_y",
+    "scroll_up", "scroll_down", "scroll_left", "scroll_right", "scroll_y", "scroll_x",
+    "scroll_move_y", "scroll_move_x", "trackpad_scroll_y", "trackpad_scroll_x",
+];
+
+/// [`ALL_PINS`] as a list shows them (see [`DISPLAY_ORDER`]); a pin missing from that
+/// order goes last rather than nowhere.
+pub fn pins_in_display_order() -> &'static [&'static AutoMapPin] {
+    static ORDER: std::sync::OnceLock<Vec<&'static AutoMapPin>> = std::sync::OnceLock::new();
+    ORDER.get_or_init(|| {
+        let mut pins: Vec<&'static AutoMapPin> = ALL_PINS.iter().collect();
+        pins.sort_by_key(|p| DISPLAY_ORDER.iter().position(|id| *id == p.id).unwrap_or(usize::MAX));
+        pins
+    })
+}
+
+/// Each touch field as a stick (see `ALL_PINS`): the Vec2 pin, then the x, y and
+/// contact pins it is made of. Left pad then right on a Steam Controller, first
+/// finger then second on a DualSense or DS4.
+pub const TOUCH_VECTOR_PINS: [[&str; 4]; 2] = [
+    ["touch1_xy", "touch1_x", "touch1_y", "touch1_active"],
+    ["touch2_xy", "touch2_x", "touch2_y", "touch2_active"],
+];
+
+/// Each touch field of each device in a poll's `sigs` as a stick ([`TOUCH_VECTOR_PINS`]):
+/// where the touch is while there is one, the middle while there isn't. As the device
+/// reports it, for the UI's live values and Learn; the engine makes it again from the
+/// calibrated touch.
+pub fn add_touch_vectors<S: std::hash::BuildHasher>(
+    sigs: &mut std::collections::HashMap<(String, String), crate::Signal, S>,
+) {
+    use crate::pinkey::PinMapExt;
+    use crate::Signal;
+    let found: Vec<(String, &'static str, glam::Vec2)> = sigs
+        .iter()
+        .filter_map(|((dev, pin), sig)| {
+            let [xy, x, y, _] = *TOUCH_VECTOR_PINS.iter().find(|f| f[3] == pin.as_str())?;
+            let Signal::Bool(on) = *sig else { return None };
+            let v = match (on, sigs.get_pin(dev, x), sigs.get_pin(dev, y)) {
+                (true, Some(Signal::Float(x)), Some(Signal::Float(y))) => glam::Vec2::new(*x, *y),
+                _ => glam::Vec2::ZERO,
+            };
+            Some((dev.clone(), xy, v))
+        })
+        .collect();
+    for (dev, xy, v) in found {
+        sigs.insert((dev, xy.to_string()), Signal::Vec2(v));
+    }
+}
+
 /// A trackpad's press, left then right on a Steam Controller: 0 untouched, 1 at
 /// the force it clicks at (the set click force, else its own click's, once seen),
 /// and held there past it. Real pins, on the bus like a trigger.
@@ -353,6 +432,8 @@ pub fn steam_controller_pin_names(pin: &str) -> Option<(&'static str, &'static s
         "btn_grip_r" | "btn_misc6" => Some(("Grip sens R", "Grip R")),
         "touch1_active" => Some(("Pad touch L", "Touch L")),
         "touch2_active" => Some(("Pad touch R", "Touch R")),
+        "touch1_xy" => Some(("Pad L XY", "Pad L XY")),
+        "touch2_xy" => Some(("Pad R XY", "Pad R XY")),
         "touch1_pressure" => Some(("Pad press L", "Press L")),
         "touch2_pressure" => Some(("Pad press R", "Press R")),
         // Each pad's own swipe, in the picker's short form for its cell.
@@ -914,6 +995,15 @@ pub const ALL_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "btn_cap_r",     display_name: "Cap Sense R",        signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_grip_l",    display_name: "Grip Sense L",       signal_type: SignalType::Bool },
     AutoMapPin { id: "btn_grip_r",    display_name: "Grip Sense R",       signal_type: SignalType::Bool },
+    // ── Trackpads as sticks ──────────────────────────────────────────────────
+    // Each touch field as one Vec2 (`TOUCH_VECTOR_PINS`): where the touch is,
+    // ±1 from the middle with +Y up, while it counts, and the middle while
+    // nothing touches - a stick's shape, so a trackpad (or a DualSense finger)
+    // can drive what a stick does: a flick stick, a stick on a virtual pad. Made
+    // by the engine from `touchN_x` / `_y` / `_active` once the pad's
+    // calibration has had them.
+    AutoMapPin { id: "touch1_xy",     display_name: "Touch 1 XY",         signal_type: SignalType::Vec2 },
+    AutoMapPin { id: "touch2_xy",     display_name: "Touch 2 XY",         signal_type: SignalType::Vec2 },
 ];
 
 /// Whether `id` is one of [`ALL_PINS`]. A set lookup: the engine asks this per
@@ -1374,5 +1464,43 @@ mod tests {
         m.sort();
         m.dedup();
         assert_eq!(m.len(), n, "duplicate pairs in resolve_mapping output");
+    }
+
+    // The lists' order names every pin of the bus once, so a pin added to the bus can't
+    // go missing from them or end up after the keyboard and mouse.
+    #[test]
+    fn the_display_order_has_every_pin_once() {
+        let mut seen = std::collections::HashSet::new();
+        for id in DISPLAY_ORDER {
+            assert!(seen.insert(*id), "{id} twice");
+            assert!(ALL_PINS.iter().any(|p| p.id == *id), "{id} isn't on the bus");
+        }
+        for p in ALL_PINS {
+            assert!(seen.contains(p.id), "{} has no place in DISPLAY_ORDER", p.id);
+        }
+        let order: Vec<&str> = pins_in_display_order().iter().map(|p| p.id).collect();
+        assert_eq!(order[..5], ["left_stick", "right_stick", "dpad", "touch1_xy", "touch2_xy"]);
+    }
+
+    // A poll's touch fields read as sticks: the touch where there is one, the middle
+    // where it lifted (its x and y still say where it was), nothing where there's no
+    // field at all.
+    #[test]
+    fn a_polls_touch_fields_read_as_sticks() {
+        use crate::Signal;
+        let mut sigs: std::collections::HashMap<(String, String), Signal> = std::collections::HashMap::new();
+        let mut put = |dev: &str, pin: &str, v: Signal| { sigs.insert((dev.into(), pin.into()), v); };
+        put("pad", "touch1_active", Signal::Bool(true));
+        put("pad", "touch1_x", Signal::Float(-0.5));
+        put("pad", "touch1_y", Signal::Float(0.75));
+        put("pad", "touch2_active", Signal::Bool(false));
+        put("pad", "touch2_x", Signal::Float(1.0));
+        put("stick", "right_stick", Signal::Vec2(glam::Vec2::X));
+        add_touch_vectors(&mut sigs);
+        let at = |dev: &str, pin: &str| sigs.get(&(dev.to_string(), pin.to_string())).copied();
+        assert_eq!(at("pad", "touch1_xy"), Some(Signal::Vec2(glam::Vec2::new(-0.5, 0.75))));
+        assert_eq!(at("pad", "touch2_xy"), Some(Signal::Vec2(glam::Vec2::ZERO)));
+        assert_eq!(at("stick", "touch1_xy"), None);
+        assert!(ALL_PINS.iter().any(|p| p.id == "touch1_xy" && p.signal_type == SignalType::Vec2));
     }
 }

@@ -788,6 +788,28 @@ pub(crate) fn filter_trackpads(graph: &ProcessingGraph, sigs: &mut BusMap, st: &
     }
 }
 
+/// Each touch field as a stick (`TOUCH_VECTOR_PINS`), on every device that has the
+/// field: where the touch is while it counts, the middle while nothing touches. Run
+/// after [`filter_trackpads`], so a touch the calibration doesn't count reads as
+/// none, and before the source block, so a module that blocks it still reads it.
+pub(crate) fn touch_vectors(sigs: &mut BusMap) {
+    use flexinput_core::automap::{known_index, TOUCH_VECTOR_PINS};
+    static SLOTS: std::sync::OnceLock<[[usize; 4]; 2]> = std::sync::OnceLock::new();
+    let slots = SLOTS.get_or_init(|| {
+        TOUCH_VECTOR_PINS.map(|pins| pins.map(|p| known_index(p).expect("a touch pin is on the bus")))
+    });
+    for bus in 0..sigs.bus_count() {
+        for &[xy, x, y, active] in slots {
+            let Some(Signal::Bool(on)) = sigs.at(bus, active) else { continue };
+            let v = match (on, sigs.at(bus, x), sigs.at(bus, y)) {
+                (true, Some(Signal::Float(x)), Some(Signal::Float(y))) => Vec2::new(x, y),
+                _ => Vec2::ZERO,
+            };
+            sigs.set_at(bus, xy, Signal::Vec2(v));
+        }
+    }
+}
+
 #[cfg(test)]
 mod trackpad_tests {
     use super::*;

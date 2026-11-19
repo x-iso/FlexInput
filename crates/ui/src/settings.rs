@@ -880,6 +880,13 @@ pub struct CanvasGrid {
     pub glow_max: f32,
     /// What makes an Auto-Map bus glow.
     pub automap_glow: AutomapGlow,
+    /// How long a module takes to ease to where it moved (a grid step while dragged, a
+    /// push, an arrange), and a wire to its new route, in milliseconds. 0 jumps.
+    pub transition_ms: f32,
+    /// How opaque wires are drawn (0 to 1): 0 hides them but for the ones in focus.
+    pub wire_opacity: f32,
+    /// A see-through wire shows more of itself the more its signal is doing.
+    pub wire_activity_reveals: bool,
 }
 
 /// What makes an Auto-Map bus (and its wires) glow: which of the source
@@ -907,11 +914,14 @@ impl Default for CanvasGrid {
             snap: true,
             push: true,
             wires: egui_snarl::ui::WireRouting::Around,
-            focus: 0.5,
+            focus: 0.6,
             clearance: 12.0,
             glow_min: 0.0,
-            glow_max: 1.0,
+            glow_max: 0.7,
             automap_glow: AutomapGlow::Live,
+            transition_ms: 200.0,
+            wire_opacity: 0.4,
+            wire_activity_reveals: true,
         }
     }
 }
@@ -951,6 +961,7 @@ impl CanvasGrid {
             push: self.push && self.snap,
             wires: self.wires,
             clearance: self.clearance.max(0.0),
+            ease: (self.transition_ms / 1000.0).clamp(0.0, 1.0),
         })
     }
 }

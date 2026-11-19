@@ -798,6 +798,10 @@ const CORNER_CLEARANCE: f32 = 10.0;
 /// way.
 const AROUND_REACH: f32 = 200.0;
 
+/// The longest a taut wire's stub out of (or into) a pin is, before the shortest way round
+/// takes over (never inside the pin's own node's wall).
+const STUB_REACH: f32 = 24.0;
+
 /// A routed wire pulled taut into a flowing curve, for wires that should go around
 /// nodes without keeping to the grid's lines. `route` is the wire's route spread into
 /// its lane (pins at the ends, the stubs out of and into them next), `ends` the
@@ -831,10 +835,42 @@ pub fn taut(
     let (p, q) = (route[0], route[n - 1]);
     let (s, e) = (route[1], route[n - 2]);
     let region = Rect::from_points(route).expand(clearance.max(0.0) + AROUND_REACH);
+    let berth_of = |i: usize| berth.get(i).copied().unwrap_or(0.0);
+
+    // FLEXINPUT PATCH (2026-11-19): a route's stubs can be the whole of its first and last
+    // runs - a route that keeps to its pin's row until it turns - and only what lies between
+    // them is pulled taut, so such a wire stayed square: level, a hard corner, straight up, a
+    // hard corner. Pulled back to a lead's length out of the pin (outside the node's own
+    // wall), they leave the rest to the shortest way round.
+    let s = if (s.y - p.y).abs() < EPS && s.x > p.x {
+        let floor = walls.get(ends.0).map_or(p.x, |w| w.max.x + 2.0 * EPS);
+        pos2(s.x.min((p.x + STUB_REACH).max(floor)), s.y)
+    } else {
+        s
+    };
+    let e = if (e.y - q.y).abs() < EPS && e.x < q.x {
+        let ceil = walls.get(ends.1).map_or(q.x, |w| w.min.x - 2.0 * EPS);
+        pos2(e.x.max((q.x - STUB_REACH).min(ceil)), e.y)
+    } else {
+        e
+    };
 
     // What the wire goes round: the walls near it, held off by the clearance and by
-    // the wires already round them. Its own two nodes keep only their walls (its stubs
-    // start at them), and a wall grown over one of its ends isn't gone round at all.
+    // the wires already round them. Its own two nodes are held off only by the wires
+    // already round them - wires that loop back round the node they leave, or the one
+    // they reach, go round it side by side too, where they used to lie on top of each
+    // other - and the wire's stubs reach out past that, so it never starts inside its own
+    // node's berth. A wall grown over one of its ends isn't gone round at all.
+    // FLEXINPUT PATCH (2026-11-19): the ends' berth.
+    let grown = |i: usize| walls.get(i).filter(|_| berth_of(i) > 0.0).map(|w| w.expand(berth_of(i)));
+    let s = match (ends.0 != usize::MAX).then(|| grown(ends.0)).flatten() {
+        Some(w) if s.y > w.min.y && s.y < w.max.y => pos2(s.x.max(w.max.x + 2.0 * EPS), s.y),
+        _ => s,
+    };
+    let e = match (ends.1 != usize::MAX).then(|| grown(ends.1)).flatten() {
+        Some(w) if e.y > w.min.y && e.y < w.max.y => pos2(e.x.min(w.min.x - 2.0 * EPS), e.y),
+        _ => e,
+    };
     let inside = |r: &Rect, at: Pos2| {
         at.x > r.min.x + EPS && at.x < r.max.x - EPS && at.y > r.min.y + EPS && at.y < r.max.y - EPS
     };
@@ -843,11 +879,7 @@ pub fn taut(
         .enumerate()
         .filter(|(_, w)| w.intersects(region))
         .map(|(i, w)| {
-            let grow = if i == ends.0 || i == ends.1 {
-                0.0
-            } else {
-                clearance.max(0.0) + berth.get(i).copied().unwrap_or(0.0)
-            };
+            let grow = if i == ends.0 || i == ends.1 { berth_of(i) } else { clearance.max(0.0) + berth_of(i) };
             (i, w.expand(grow))
         })
         .filter(|(_, o)| !inside(o, s) && !inside(o, e))
@@ -856,10 +888,8 @@ pub fn taut(
 
     let (path, gone_round) = shortest(s, e, &obstacles).unwrap_or_else(|| (vec![s, e], Vec::new()));
     for i in gone_round {
-        if i != ends.0 && i != ends.1 {
-            if let Some(b) = berth.get_mut(i) {
-                *b += pitch;
-            }
+        if let Some(b) = berth.get_mut(i) {
+            *b += pitch;
         }
     }
 

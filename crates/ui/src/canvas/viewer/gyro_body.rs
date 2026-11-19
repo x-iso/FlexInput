@@ -1431,7 +1431,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         let learn_label = if in_learning { "Stop" } else { "Learn" };
         let learn_resp = ui.add_enabled(
             wired || in_learning,
-            super::remapper_bodies::action_button(learn_label, btn_w),
+            super::remapper_bodies::action_button(ui, learn_label, btn_w),
         ).on_hover_text(if wired {
             "Capture a gamepad / keyboard chord to fire when leaning this direction"
         } else {
@@ -1468,7 +1468,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         // this section's `_lean_<side>_draft`. Lean inputs are always analog (the
         // lean gesture), so the swipe bindings are always available here.
         {
-            let special_btn = ui.add(super::remapper_bodies::action_button("Choose…", btn_w))
+            let special_btn = ui.add(super::remapper_bodies::action_button(ui, "Choose…", btn_w))
                 .on_hover_text("Pick the output from a board instead of pressing it.");
             special_rect = special_btn.rect;
             if special_btn.clicked() || act_special {
@@ -1487,7 +1487,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
 
         // MIDI… — build a message for this lean to play, in the MIDI editor.
         {
-            let midi_btn = ui.add(super::remapper_bodies::action_button("MIDI…", btn_w))
+            let midi_btn = ui.add(super::remapper_bodies::action_button(ui, "MIDI…", btn_w))
                 .on_hover_text("Build a MIDI message for this lean to play.");
             midi_rect = midi_btn.rect;
             if midi_btn.clicked() {
@@ -1506,7 +1506,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         // (back to idle, draft emptied, capture disarmed). Shown whenever a draft
         // exists so a botched capture/pick can be reset WITHOUT finishing.
         if has_draft {
-            let clear_btn = ui.add(super::remapper_bodies::action_button("Clear", btn_w));
+            let clear_btn = ui.add(super::remapper_bodies::action_button(ui, "Clear", btn_w));
             clear_rect = clear_btn.rect;
             if clear_btn.clicked() || act_clear {
                 if let Some(node) = snarl.get_node_mut(node_id) {
@@ -1525,7 +1525,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         let add_enabled = !new_draft.is_empty()
             && (new_phase == "learning" || new_phase == "ready");
         let add_resp = ui.add_enabled(add_enabled,
-            super::remapper_bodies::action_button("Add", btn_w));
+            super::remapper_bodies::action_button(ui, "Add", btn_w));
         add_rect = add_resp.rect;
         if (add_resp.clicked() || act_add) && add_enabled {
             if let Some(node) = snarl.get_node_mut(node_id) {

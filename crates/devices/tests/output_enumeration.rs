@@ -285,6 +285,7 @@ fn generic_outputs_expose_sdl_relayed_pins() {
         "gyro_x", "gyro_y", "gyro_z", "accel_x", "accel_y", "accel_z",
         "touch1_x", "touch1_y", "touch1_active",
         "touch2_x", "touch2_y", "touch2_active", "btn_touchpad",
+        "touch1_xy", "touch2_xy",
         "btn_paddle_l1", "btn_paddle_r1", "btn_paddle_l2", "btn_paddle_r2",
         "btn_misc1", "btn_misc2",
     ] {

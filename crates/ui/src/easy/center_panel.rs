@@ -2166,7 +2166,7 @@ mod nav_scroll_tests {
                 // Where the Down cell is, on screen.
                 let at = if style == 2 {
                     let r = ctx
-                        .read_response(egui::Id::new(("segmented", ("ps2_field", inner.0, 0usize), 1usize)))
+                        .read_response(egui::Id::new(("segmented", ("ps2_field", inner.0, "lane_toggle", 0usize), 1usize)))
                         .unwrap_or_else(|| panic!("{module} style {style}: no lane toggle"));
                     ctx.layer_transform_to_global(r.layer_id).unwrap_or_default() * r.rect.center()
                 } else {

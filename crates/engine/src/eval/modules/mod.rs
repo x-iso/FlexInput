@@ -56,7 +56,10 @@ pub(crate) use remapper_hold_back::*;
 pub use remapper_hold_back::in_order_applies;
 pub(crate) use rws::*;
 // Where the calibration readouts land, read by the UI's measure widget.
-pub use rws::{rws_cal_deg_out, rws_cal_peak_out, rws_flick_mode};
+pub use rws::{
+    rws_cal_deg_out, rws_cal_peak_out, rws_flick_mode, rws_flick_release_floor, rws_flick_view, rws_flick_view_out,
+    RwsFlickView, RwsGesture, RWS_GESTURE_OUT,
+};
 // The param names and live-output slots are read by the UI too; the JSM module
 // shares the rotation itself.
 pub use stick_rotation::*;

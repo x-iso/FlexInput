@@ -35,6 +35,10 @@ pub struct PinWireInfo {
     /// Width multiplier for the wire (1.0 = default). The larger of the two
     /// connected pins' multipliers is used when drawing.
     pub width_factor: f32,
+
+    /// FLEXINPUT PATCH: how active the signal on the pin is (0 to 1), for a wire drawn
+    /// see-through to show more of itself while it carries something.
+    pub activity: f32,
 }
 
 /// Uses `Painter` to draw a pin.
@@ -234,6 +238,7 @@ impl PinInfo {
                 .wire_style
                 .unwrap_or_else(|| snarl_style.get_wire_style()),
             width_factor: self.wire_width_factor.unwrap_or(1.0),
+            activity: 0.0,
         }
     }
 }

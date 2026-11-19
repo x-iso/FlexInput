@@ -145,6 +145,15 @@ pub struct FlexViewer<'a> {
     /// Set by the `disconnect` override when the user right-clicks a wire.
     /// Canvas::show() reads this after snarl.show() and renders the context menu.
     pub pending_wire_menu: Option<(OutPinId, InPinId, egui::Pos2)>,
+    /// Set by `connect` when a wire is dropped onto an input that already has one, with
+    /// where it was dropped: the canvas asks what to do with the two (see `canvas::merge`).
+    /// Also set when a module picked from the menu of a wire dropped on empty space would
+    /// take an input that has one.
+    pub pending_merge: Option<super::merge::PendingMerge>,
+    /// A merge picked from the menu of a wire drawn out of an input that has one, and dropped
+    /// on empty space: the way, the wire already on the input (its output), and the input.
+    /// The canvas puts the module in beside the input (see `canvas::merge`).
+    pub open_merge: Option<(super::merge::MergeWay, OutPinId, InPinId)>,
     /// The wire whose context menu is open, drawn thicker so it's clear which it is.
     pub highlighted_wire: Option<(OutPinId, InPinId)>,
     /// Set by show_node_menu when the user clicks "Rename…".
@@ -254,9 +263,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         snarl: &mut Snarl<NodeData>,
     ) {
         // Where the header's first row is, laid out rather than clipped, for the sockets
-        // drawn on it (`header_row_y`).
+        // drawn on it (`header_row_y`): as a distance from the node's top, which folding the
+        // node or a category in its body never changes. The top it's drawn at: on its way
+        // there while it eases to where it moved.
+        let node_top = snarl.get_node_info(node).map(|i| i.pos.y + egui_snarl::ui::drawn_offset(ui.ctx(), node).y);
         let header_mid = ui.max_rect().top() + ui.spacing().icon_width * 0.5;
-        ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), header_mid));
+        if let Some(top) = node_top {
+            ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), header_mid - top));
+        }
         // Extract what we need before any UI calls so the borrow of snarl is released.
         let data = &snarl[node];
         let title = data.display_name.clone();
@@ -526,6 +540,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                         kit::header_toggles_w(ui)
                     } else if is_svg {
                         kit::svg_header_w(ui)
+                    } else if is_rws {
+                        kit::rws_header_w(ui)
                     } else if is_label {
                         // The font size and colour at the right edge, as wide as they were
                         // drawn last frame.
@@ -539,7 +555,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // are the header's content, and the module is as wide as they are. Every
                     // other header paints its name in the room the frame leaves, so a name
                     // can never be what makes a small module wide.
-                    let name_in_flow = is_subpatch || is_rws || is_remapper || is_map_action || is_input_viewer;
+                    let name_in_flow = is_subpatch || is_remapper || is_map_action || is_input_viewer;
                     // What the row has already taken - the fold chevron, a status dot - is
                     // off the room too: the name has to fit what's left, not what the frame
                     // is, or it gets painted under the control at the right edge. A folded
@@ -988,9 +1004,24 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 if is_rws {
                     // Save / load the RWS feel set (calibration + sensitivity + flick/aim) as
                     // a portable .fxrws preset - e.g. one per game - as the drawings the
-                    // curves' file buttons wear, and the Mouse Scale unit as one pill of two.
+                    // curves' file buttons wear, and the Mouse Scale unit as one pill of two:
+                    // one row against the header's right edge, as every module's controls are.
                     let h = kit::stepper_h(ui);
-                    let (save_r, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
+                    let gap = kit::CURVE_HEADER_GAP;
+                    let (row, _) = ui.allocate_exact_size(
+                        egui::vec2(kit::rws_header_w(ui) - ui.spacing().item_spacing.x, h),
+                        egui::Sense::hover(),
+                    );
+                    let mut right = ui.max_rect().right();
+                    let mut take = |w: f32| {
+                        let r = egui::Rect::from_min_max(egui::pos2(right - w, row.top()), egui::pos2(right, row.bottom()));
+                        right -= w + gap;
+                        r
+                    };
+                    let unit_r = take(kit::RWS_UNIT_W);
+                    let load_r = take(h);
+                    let save_r = take(h);
+                    simple_bodies::trace_rect(ui, node, "header_ctrl", egui::Rect::from_min_max(save_r.min, unit_r.max));
                     if kit::header_icon_button(ui, glyphs::Glyph::Save, "Save this RWS calibration + feel set to a .fxrws preset", save_r, ("rws_save", node)) {
                         if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                             rfd::FileDialog::new()
@@ -1001,7 +1032,6 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                             let _ = rws_save_preset(snarl, node, &path);
                         }
                     }
-                    let (load_r, _) = ui.allocate_exact_size(egui::vec2(h, h), egui::Sense::hover());
                     if kit::header_icon_button(ui, glyphs::Glyph::Load, "Load RWS settings from a .fxrws preset", load_r, ("rws_load", node)) {
                         if let Some(path) = crate::overlay::with_overlay_not_topmost(|| {
                             rfd::FileDialog::new()
@@ -1015,11 +1045,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // patches and presets are unaffected.
                     let per_360 = RwsScaleUnit::of(snarl, node).per_360();
                     let tip = "Mouse Scale unit: mouse dots per degree of turn, or per full 360° turn\n(as Steam Input and sensitivity databases list it). Display only — the\nstored value and .fxrws presets don't change.";
-                    let (unit_r, _) = ui.allocate_exact_size(egui::vec2(104.0, h), egui::Sense::hover());
                     let (deg, full) = kit::header_toggle_pair(
                         ui,
                         unit_r,
-                        46.0,
+                        kit::RWS_UNIT_FIRST_W,
                         ("dots/°", !per_360, tip),
                         ("dots/360°", per_360, tip),
                         ("rws_unit", node),
@@ -1338,7 +1367,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let spacer = (target_x - ui.cursor().min.x).max(16.0);
                     ui.add_space(spacer);
                     let resp = ui.label(egui::RichText::new(text).small().weak());
-                    ui.ctx().data_mut(|d| d.insert_temp(automap_label_abs_y_key(node), resp.rect.center().y));
+                    if let Some(top) = node_top {
+                        ui.ctx().data_mut(|d| d.insert_temp(automap_label_abs_y_key(node), resp.rect.center().y - top));
+                    }
                 }
             });
 
@@ -1443,7 +1474,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 // Reserve vertical space so following header rows advance past.
                 ui.allocate_exact_size(egui::vec2(0.0, row_h), egui::Sense::hover());
                 let center_y = row_y0 + row_h * 0.5;
-                ui.ctx().data_mut(|d| d.insert_temp(automap_label_abs_y_key(node), center_y));
+                if let Some(top) = node_top {
+                    ui.ctx().data_mut(|d| d.insert_temp(automap_label_abs_y_key(node), center_y - top));
+                }
             }
 
             // A physical pad's per-device rows: Deadzone / Gyro ×, digital
@@ -1770,31 +1803,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             simple_bodies::trace_rect(ui, pin.id.node, &format!("pin_row_in_{}", pin.id.input), row);
         }
         let header_y = if is_relocated_automap {
-            // Dual-stash delta recovery. Snarl runs show_input BEFORE
-            // show_header in the same frame, so this frame's label Y
-            // isn't available here — but last frame's label_y AND last
-            // frame's pin_row_y both are. Their delta is purely
-            // layout-derived (constant under drag, pan, and scroll —
-            // none of those change the spacing of rows inside the
-            // node). Read the stale pair FIRST, derive the layout
-            // delta, then overwrite pin_row_y with this frame's value
-            // for the next frame's read.
-            let cur_pin_y = ui.max_rect().top();
-            let (prev_label, prev_pin) = ui.ctx().data(|d| (
-                d.get_temp::<f32>(automap_label_abs_y_key(pin.id.node)),
-                d.get_temp::<f32>(automap_pin_row_y_key(pin.id.node)),
-            ));
-            let delta = match (prev_label, prev_pin) {
-                (Some(l), Some(p)) => l - p,
-                _ => 0.0,
-            };
-            ui.ctx().data_mut(|d| d.insert_temp(
-                automap_pin_row_y_key(pin.id.node), cur_pin_y));
-            Some(cur_pin_y + delta)
+            // On the header's Auto-Map label. Snarl runs show_input BEFORE show_header, so
+            // the label's place is last frame's - as a distance from the node's top, which
+            // this frame's top turns back into a place (`header_anchor_y`).
+            header_anchor_y(ui, snarl, pin.id.node, automap_label_abs_y_key(pin.id.node))
         } else if kit::bus_pin_on_header(&node.module_id, strip_pin, desc.signal_type, node.inputs.iter().map(|p| p.signal_type)) {
             // An unlabelled bus socket sits on the header row, where it is when the module
             // is folded - so folding doesn't move it, and the two sides' sockets line up.
-            header_row_y(ui, pin.id.node, ("in", pin.id.input))
+            header_row_y(ui, snarl, pin.id.node)
         } else {
             None
         };
@@ -1869,20 +1885,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             }
         }
         let header_y = if is_relocated_automap {
-            let cur_pin_y = ui.max_rect().top();
-            let (prev_label, prev_pin) = ui.ctx().data(|d| (
-                d.get_temp::<f32>(automap_label_abs_y_key(pin.id.node)),
-                d.get_temp::<f32>(automap_pin_row_y_key(pin.id.node)),
-            ));
-            let delta = match (prev_label, prev_pin) {
-                (Some(l), Some(p)) => l - p,
-                _ => 0.0,
-            };
-            ui.ctx().data_mut(|d| d.insert_temp(
-                automap_pin_row_y_key(pin.id.node), cur_pin_y));
-            Some(cur_pin_y + delta)
+            header_anchor_y(ui, snarl, pin.id.node, automap_label_abs_y_key(pin.id.node))
         } else if kit::bus_pin_on_header(&node.module_id, strip_pin, desc.signal_type, node.outputs.iter().map(|p| p.signal_type)) {
-            header_row_y(ui, pin.id.node, ("out", pin.id.output))
+            header_row_y(ui, snarl, pin.id.node)
         } else {
             None
         };
@@ -1901,17 +1906,30 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         let from_type = snarl[from.id.node].outputs[from.id.output].signal_type;
         let to_type = snarl[to.id.node].inputs[to.id.input].signal_type;
         if !to_type.accepts(from_type) { return; }
-        // AutoMap input pins accept exactly ONE upstream wire. Multiple wires
-        // route ambiguously (only `pin.remotes.first()` is honored by eval and
-        // graph-build), so silently dropping later wires confuses users. Drop
-        // the existing wire(s) so the new connection visibly replaces them.
-        if to_type == SignalType::AutoMap {
-            let existing: Vec<OutPinId> = snarl.in_pin(to.id).remotes.iter().copied().collect();
-            for src in existing {
-                snarl.disconnect(src, to.id);
+        // An input takes one wire: the engine and the graph build only read the first, so a
+        // second one used to sit there doing nothing (and an Auto-Map port quietly dropped
+        // its old wire for the new). Ask instead - leave it, replace the old wire, or merge
+        // the two through a module that combines them (`canvas::merge`).
+        use egui_snarl::ui::AnyPin;
+        let moved = egui_snarl::ui::wire_moved_from(&self.ctx);
+        let moving = match moved {
+            Some(AnyPin::Out(o)) => Some(o),
+            _ => None,
+        };
+        match super::merge::on_drop(snarl, from.id, to.id, moving) {
+            super::merge::Drop::Connect => {
+                snarl.connect(from.id, to.id);
             }
+            super::merge::Drop::Ask => {
+                let pos = self.ctx.input(|i| i.pointer.latest_pos()).unwrap_or_default();
+                let moved_from = match moved {
+                    Some(AnyPin::In(i)) if i != to.id => Some(i),
+                    _ => None,
+                };
+                self.pending_merge = Some(super::merge::PendingMerge { new: from.id, target: to.id, pos, moved_from });
+            }
+            super::merge::Drop::Nothing => {}
         }
-        snarl.connect(from.id, to.id);
     }
 
     fn disconnect(&mut self, from: &OutPin, to: &InPin, _snarl: &mut Snarl<NodeData>) {
@@ -2235,7 +2253,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, self.view_salt),
             "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
             "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
-            "module.dropdown" => show_dropdown_body(node_id, inputs, ui, snarl, self.view_salt),
+            "module.dropdown" => show_dropdown_body(node_id, inputs, ui, snarl, self.view_salt, kit_w),
             "module.macro"    => show_macro_body(node_id, outputs, ui, snarl, self.view_salt),
             "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
             "module.svg"      => show_svg_body(node_id, ui, snarl, body_w, body_h),
@@ -2407,7 +2425,8 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     ) {
         ui.label("Add module");
         ui.separator();
-        show_module_menu(pos, ui, snarl, self.descriptors, None, self.is_inner_canvas);
+        // No wire, so nothing to ask about.
+        let _ = show_module_menu(pos, ui, snarl, self.descriptors, None, self.is_inner_canvas);
     }
 
     // ── Drop-wire menu ───────────────────────────────────────────────────────
@@ -2441,6 +2460,33 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         }
         ui.separator();
 
+        // A new wire drawn out of an input that has one: the wire there can be merged with
+        // what comes next, through a module put in beside the input with its other input
+        // left free for it (`canvas::merge`).
+        let taken = match &src_pins {
+            AnyPins::In([dst]) if moved_from.is_none() => snarl.in_pin(*dst).remotes.first().map(|&old| (old, *dst)),
+            _ => None,
+        };
+        if let Some((old, dst)) = taken {
+            let in_type = snarl[dst.node].inputs[dst.input].signal_type;
+            let old_type = snarl.get_node(old.node).and_then(|n| n.outputs.get(old.output)).map(|p| p.signal_type);
+            let ways: Vec<&super::merge::MergeWay> = super::merge::merge_ways(in_type, old_type, None)
+                .iter()
+                .filter(|w| self.descriptors.iter().any(|d| d.id == w.module))
+                .collect();
+            if !ways.is_empty() {
+                ui.label(egui::RichText::new("Merge its wire with another through…").small().weak());
+                for w in ways {
+                    let hover = format!("{} The wire there goes into the first input; the other is left free.", w.hover);
+                    if ui.button(w.label).on_hover_text(hover).clicked() {
+                        self.open_merge = Some((*w, old, dst));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+            }
+        }
+
         let wire = match src_pins {
             AnyPins::Out(srcs) => srcs.first().map(|&src| WireDir::FromOutput {
                 srcs,
@@ -2455,11 +2501,14 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         };
         let Some(wire) = wire else { return };
         let (descriptors, is_inner) = (self.descriptors, self.is_inner_canvas);
+        // A module whose output would go into an input that has a wire asks, as a wire
+        // dropped onto that input does.
+        let mut ask = None;
         if crate::touch::is_active(ui.ctx()) {
             // A level of its own, or the categories push the choices above off a small screen.
             ui.menu_button("Add module", |ui| {
                 crate::touch::menu_list_scroll(ui, |ui| {
-                    show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
+                    ask = show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
                 });
             });
         } else {
@@ -2468,7 +2517,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 WireDir::FromInput { .. } => "Connect to output of…",
             });
             ui.separator();
-            show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
+            ask = show_module_menu(pos, ui, snarl, descriptors, Some(wire), is_inner);
+        }
+        if ask.is_some() {
+            self.pending_merge = ask;
         }
     }
 
@@ -2646,42 +2698,54 @@ fn header_mid_y_key(node: NodeId) -> egui::Id {
     egui::Id::new(("fxi_header_mid_y", node.0))
 }
 
-/// The y of the header's first row for a socket in `pin_ui`, from layout rather than from
-/// the clip. A node partly off the canvas has its clip cut to the canvas, so a position read
-/// off the clip pinned its sockets - and their wires - to the canvas edge. `show_header` runs
-/// after the pins in a frame, so its row is last frame's; the gap between it and this pin's
-/// row (also last frame's) is fixed by the layout, so adding it to this frame's row follows
-/// a dragged node without a frame of lag. `None` until both are known: the row's own centre.
-fn header_row_y(pin_ui: &egui::Ui, node: NodeId, pin: (&'static str, usize)) -> Option<f32> {
-    let row_key = egui::Id::new(("fxi_header_pin_row_y", node.0, pin));
-    let row = pin_ui.max_rect().top();
-    let (header, prev_row) = pin_ui.ctx().data(|d| (d.get_temp::<f32>(header_mid_y_key(node)), d.get_temp::<f32>(row_key)));
-    pin_ui.ctx().data_mut(|d| d.insert_temp(row_key, row));
-    Some(row + (header? - prev_row?))
+/// The y of the header's first row for a socket, from layout rather than from the clip: a
+/// node partly off the canvas has its clip cut to the canvas, so a position read off the clip
+/// pinned its sockets - and their wires - to the canvas edge. See [`header_anchor_y`].
+fn header_row_y(ui: &egui::Ui, snarl: &Snarl<NodeData>, node: NodeId) -> Option<f32> {
+    header_anchor_y(ui, snarl, node, header_mid_y_key(node))
+}
+
+/// Where something `show_header` recorded under `key` is this frame: `show_header` runs after
+/// the pins, so what it recorded is last frame's - kept as a distance from the node's top,
+/// which nothing but the header's own layout changes, and added to the node's top now. The
+/// node's top follows a drag the same frame. It used to be kept as a distance from the pin
+/// row, which folding the node (or a category in its body) moves: the sockets and their
+/// wires jumped for a frame or two until the stale distance caught up. `None` until it is
+/// known: the row's own centre. The top is where the node is drawn: easing to where it moved,
+/// it's short of its `pos`, and a distance from `pos` put the sockets where it was going a
+/// frame before the node got there (they shook with every grid step of a drag).
+fn header_anchor_y(ui: &egui::Ui, snarl: &Snarl<NodeData>, node: NodeId, key: egui::Id) -> Option<f32> {
+    let top = snarl.get_node_info(node)?.pos.y + egui_snarl::ui::drawn_offset(ui.ctx(), node).y;
+    let offset = ui.ctx().data(|d| d.get_temp::<f32>(key))?;
+    Some(top + offset)
 }
 
 #[cfg(test)]
 mod header_socket_tests {
-    use super::{header_mid_y_key, header_row_y};
-    use egui_snarl::NodeId;
+    use super::{header_mid_y_key, header_row_y, NodeData};
+    use egui_snarl::Snarl;
 
     // A bus socket on the header follows where the header is laid out, not where the canvas
     // clips it: a node dragged above the top of the canvas has its sockets above it too, not
-    // stuck on the edge with their wires.
+    // stuck on the edge with their wires. And folding the node, which moves its pin column,
+    // doesn't move them: they hang off the node's top.
     #[test]
-    fn a_header_socket_follows_the_layout_not_the_clip() {
+    fn a_header_socket_follows_the_node_not_the_clip_or_the_pins() {
         let ctx = egui::Context::default();
-        let node = NodeId(9);
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == "math.add").expect("registered");
+        let node = snarl.insert_node(egui::pos2(40.0, -410.0), NodeData::from(&desc));
         let mut got = Vec::new();
-        for frame in 0..3 {
+        for (frame, row_top) in [-360.0_f32, -360.0, -480.0, -360.0].into_iter().enumerate() {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    // The header's row, laid out 400 points above the visible canvas.
-                    ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), -400.0_f32));
-                    let row = egui::Rect::from_min_size(egui::pos2(0.0, -360.0), egui::vec2(100.0, 20.0));
+                    // The pin column wherever folding puts it, clipped to the visible canvas.
+                    let row = egui::Rect::from_min_size(egui::pos2(0.0, row_top), egui::vec2(100.0, 20.0));
                     let mut pin_ui = ui.new_child(egui::UiBuilder::new().max_rect(row));
                     pin_ui.set_clip_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0)));
-                    got.push((frame, header_row_y(&pin_ui, node, ("in", 0))));
+                    got.push((frame, header_row_y(&pin_ui, &snarl, node)));
+                    // The header's row, 10 points below the node's top, recorded after the pins.
+                    ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), 10.0_f32));
                 });
             });
         }

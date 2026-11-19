@@ -4591,6 +4591,28 @@ fn shoot_modules() {
                     ];
                 }
             }
+            // An RWS Aim's flick circle mid-flick: the stick out at 120°, the snap still
+            // turning in.
+            if id == "processing.rws" {
+                if let Some(n) = rig.canvas.snarl.get_node_mut(ids[0]) {
+                    let view = flexinput_engine::eval::RwsFlickView {
+                        stick: glam::Vec2::new(0.87, -0.5),
+                        engaged: true,
+                        heading_deg: 120.0,
+                        turned_deg: 120.0,
+                        owed_deg: 40.0,
+                        flick_on: true,
+                        aim_on: true,
+                        gesture: flexinput_engine::eval::RwsGesture::Flicked,
+                        ..Default::default()
+                    };
+                    let at = flexinput_engine::eval::rws_flick_view_out(n.outputs.len());
+                    n.extra.last_out = vec![None; at + 2];
+                    let [a, b] = view.encode();
+                    n.extra.last_out[at] = Some(a);
+                    n.extra.last_out[at + 1] = Some(b);
+                }
+            }
             rig.idle(8);
             if fold {
                 rig.canvas.snarl.open_node(ids[0], false);
@@ -4784,7 +4806,7 @@ fn a_two_way_curves_pinned_rows_answer_on_a_sub_patch_layout() {
             };
             let target = if style == 2 {
                 rig.ctx
-                    .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, 0usize), 1usize)))
+                    .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, "lane_toggle", 0usize), 1usize)))
                     .map(|r| r.rect.center())
             } else {
                 rig.painted_text("↓ Down").map(|(_, r)| r.center())
@@ -5037,4 +5059,382 @@ fn a_lean_lists_cards_scroll_in_their_own_window() {
         (heights[0].0 - heights[1].0).abs() < 0.5 && (heights[0].1 - heights[1].1).abs() < 0.5,
         "more cards in Lean Left moved the module or Lean Right: {heights:?}",
     );
+}
+
+// 3DOF to 2D's Pointer and Steering rows pinned side by side on a layout, in Style 2: a click
+// on either row sets that row's mode. Their cells had the same ids (one field each, the same
+// node), so only the row drawn last - the top of the layout's order - took clicks.
+#[test]
+fn both_pinned_3dof_mode_rows_answer_the_mouse() {
+    let (mut rig, ids) = Rig::with_pins("subpatch", &[], &[], &[egui::pos2(100.0, 120.0)]);
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    let host = ids[0];
+    let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == "processing.gyro_3dof").expect("registered");
+    let mut inner: Snarl<NodeData> = Snarl::new();
+    let inner_id = inner.insert_node(egui::Pos2::ZERO, NodeData::from(&desc));
+    let mut sp = crate::canvas::node::UiSubPatch::default();
+    sp.snarl = Box::new(inner);
+    for (el, y) in [("pointer_mode", 8), ("steering_mode", 48)] {
+        let pin: crate::canvas::node::ExposedModule = serde_json::from_str(&format!(
+            r#"{{"inner_node_id":{},"element_id":"{el}","pos":[8,{y}],"size":[420,30],"pin_style":2}}"#,
+            inner_id.0
+        ))
+        .expect("a pin");
+        sp.items.push(crate::canvas::node::LayoutItem::Module(pin));
+    }
+    rig.canvas.snarl.get_node_mut(host).expect("host").subpatch = Some(Box::new(sp));
+    rig.idle(10);
+    let mode = |rig: &Rig| {
+        let n = rig.canvas.snarl.get_node(host).and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner_id)).unwrap();
+        let s = |k: &str| n.params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (s("family"), s("axis"))
+    };
+    // World (the fourth choice) on the Pointer row, then Orient (the fifth) on the Steering row.
+    for (el, cell, want) in [("pointer_mode", 3usize, ("pointer", "world")), ("steering_mode", 4usize, ("steering", "orient"))] {
+        let r = rig
+            .ctx
+            .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, el, 0usize), cell)))
+            .unwrap_or_else(|| panic!("{el}'s cell {cell} wasn't drawn"));
+        let at = r.rect.center();
+        rig.click(at);
+        assert_eq!(mode(&rig), (want.0.to_string(), want.1.to_string()), "a click on {el} at {at:?} didn't land");
+    }
+    let clashes = rig.painted_all("🔥");
+    assert!(clashes.is_empty(), "widgets share ids: {clashes:?}");
+}
+
+/// Arrange lays a real patch out along its signal: a curve and the knob on the gain it
+/// feeds in the first column, the gain, then the readout off it - each at the height its
+/// wires come in at, nothing overlapping - and Undo puts it back as it was. Pictures before
+/// and after in `target/module_shots/arrange_{before,after}.png`.
+#[test]
+fn arrange_lays_a_patch_out_along_its_signal() {
+    let find = |id: &str| {
+        flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == id).expect("registered")
+    };
+    let (mut rig, ids) = Rig::real("math.multiply", &[egui::pos2(60.0, 40.0)]);
+    let gain = ids[0];
+    let add = |rig: &mut Rig, id: &'static str, at: egui::Pos2| {
+        let desc = find(id);
+        let n = rig.canvas.snarl.insert_node(at, NodeData::from(&desc));
+        rig.descriptors.push(desc);
+        n
+    };
+    let curve = add(&mut rig, "module.response_curve", egui::pos2(380.0, 260.0));
+    let knob = add(&mut rig, "module.knob", egui::pos2(400.0, 20.0));
+    let readout = add(&mut rig, "display.readout", egui::pos2(20.0, 300.0));
+    rig.canvas.snarl.connect(egui_snarl::OutPinId { node: curve, output: 0 }, egui_snarl::InPinId { node: gain, input: 0 });
+    rig.canvas.snarl.connect(egui_snarl::OutPinId { node: knob, output: 0 }, egui_snarl::InPinId { node: gain, input: 1 });
+    rig.canvas.snarl.connect(egui_snarl::OutPinId { node: gain, output: 0 }, egui_snarl::InPinId { node: readout, input: 0 });
+    rig.idle(10);
+    let all = [gain, curve, knob, readout];
+    let picture = |rig: &Rig, name: &str| {
+        let area = all.iter().fold(egui::Rect::NOTHING, |a, &n| a.union(rig.frame_rect(n))).expand(30.0);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, rig.screen);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/module_shots/{name}.png"));
+        rig.shot.save(&rig.ctx, &rig.shapes, (rig.to_global * area).intersect(screen), 1.0, &path).expect("saves");
+    };
+    picture(&rig, "arrange_before");
+    let before: Vec<egui::Pos2> = all.iter().map(|&n| rig.canvas.snarl.get_node_info(n).unwrap().pos).collect();
+
+    rig.canvas.auto_arrange(&rig.ctx.clone(), rig.snarl_id);
+    rig.idle(10);
+    picture(&rig, "arrange_after");
+    let r = |n| rig.frame_rect(n);
+    assert!(r(curve).left() < r(gain).left() && r(gain).left() < r(readout).left(), "left to right: {:?}", all.map(r));
+    assert_eq!(r(knob).left(), r(curve).left(), "the knob in the column before the gain");
+    for (i, &a) in all.iter().enumerate() {
+        for &b in &all[i + 1..] {
+            assert!(!r(a).shrink(1.0).intersects(r(b).shrink(1.0)), "{a:?} and {b:?} overlap: {:?} {:?}", r(a), r(b));
+        }
+    }
+    for &n in &all {
+        let f = r(n);
+        let on_centre = |v: f32| (((v / B - 0.5).round() + 0.5) * B - v).abs() < 0.6;
+        assert!(on_centre(f.left()) && on_centre(f.top()), "{n:?} off the grid: {f:?}");
+    }
+
+    rig.canvas.undo();
+    rig.idle(2);
+    let after_undo: Vec<egui::Pos2> = all.iter().map(|&n| rig.canvas.snarl.get_node_info(n).unwrap().pos).collect();
+    assert_eq!(before, after_undo, "undo puts it back");
+}
+
+/// Pictures of Around wires in the cases that go wrong most easily, one sheet each, for
+/// looking at: `target/module_shots/around_<case>.png`.
+#[test]
+#[ignore = "writes pictures, asserts nothing"]
+fn shoot_around_wires() {
+    // (name, node positions, wires as (from node, out pin, to node, in pin))
+    type Case = (&'static str, Vec<egui::Pos2>, Vec<(usize, usize, usize, usize)>);
+    let p = egui::pos2;
+    let cases: Vec<Case> = vec![
+        ("backward", vec![p(60.0, 60.0), p(420.0, 200.0)], vec![(1, 0, 0, 0), (1, 1, 0, 1)]),
+        (
+            "fan_out_past_one",
+            vec![p(40.0, 160.0), p(300.0, 160.0), p(560.0, 20.0), p(560.0, 140.0), p(560.0, 260.0), p(560.0, 380.0)],
+            vec![(0, 0, 2, 0), (0, 0, 3, 0), (0, 1, 4, 0), (0, 1, 5, 0), (0, 0, 1, 0)],
+        ),
+        ("narrow_gap", vec![p(40.0, 160.0), p(300.0, 60.0), p(300.0, 228.0), p(600.0, 160.0)], vec![(0, 0, 3, 0), (0, 1, 3, 1), (1, 0, 3, 1)]),
+        ("stacked", vec![p(200.0, 40.0), p(200.0, 260.0), p(520.0, 150.0)], vec![(0, 0, 1, 0), (1, 0, 0, 1), (0, 1, 2, 0)]),
+        (
+            "crowd",
+            vec![p(20.0, 40.0), p(20.0, 200.0), p(20.0, 360.0), p(300.0, 120.0), p(300.0, 300.0), p(580.0, 40.0), p(580.0, 220.0), p(580.0, 380.0)],
+            vec![(0, 0, 6, 0), (1, 0, 5, 1), (2, 0, 5, 0), (2, 1, 7, 1), (0, 1, 7, 0), (1, 1, 6, 1), (3, 0, 4, 0), (4, 1, 3, 1)],
+        ),
+    ];
+    for (name, at, wires) in cases {
+        let (mut rig, ids) = Rig::with_pins("test.module", &["a", "b"], &["x", "y"], &at);
+        rig.grid.wires = WireRouting::Around;
+        for (a, o, b, i) in wires {
+            rig.canvas.snarl.connect(egui_snarl::OutPinId { node: ids[a], output: o }, egui_snarl::InPinId { node: ids[b], input: i });
+        }
+        rig.idle(12);
+        let area = ids.iter().fold(egui::Rect::NOTHING, |a, &n| a.union(rig.frame_rect(n))).expand(70.0);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, rig.screen);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/module_shots/around_{name}.png"));
+        rig.shot.save(&rig.ctx, &rig.shapes, (rig.to_global * area).intersect(screen), 0.5, &path).expect("saves");
+        println!("{}", path.display());
+    }
+}
+
+/// A wire dragged onto an input that has one asks what to do, rather than stacking a second
+/// wire the engine never reads; merging through Add puts an Add beside the input with the old
+/// wire in `a`, the new in `b` and its output on the input, in room nothing else is in, and one
+/// Undo takes it all back.
+#[test]
+fn a_wire_onto_a_taken_input_offers_to_merge() {
+    let find = |id: &str| {
+        flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == id).expect("registered")
+    };
+    let (mut rig, ids) = Rig::real("module.knob", &[egui::pos2(20.0, 20.0), egui::pos2(20.0, 260.0)]);
+    let (k1, k2) = (ids[0], ids[1]);
+    for id in ["display.readout", "math.add"] {
+        rig.descriptors.push(find(id));
+    }
+    let readout = rig.canvas.snarl.insert_node(egui::pos2(420.0, 140.0), NodeData::from(&find("display.readout")));
+    let spare = rig.canvas.snarl.insert_node(egui::pos2(420.0, 360.0), NodeData::from(&find("display.readout")));
+    let k1_out = egui_snarl::OutPinId { node: k1, output: 0 };
+    let k2_out = egui_snarl::OutPinId { node: k2, output: 0 };
+    let target = egui_snarl::InPinId { node: readout, input: 0 };
+    let spare_in = egui_snarl::InPinId { node: spare, input: 0 };
+    rig.canvas.snarl.connect(k1_out, target);
+    rig.canvas.snarl.connect(k2_out, spare_in);
+    rig.idle(10);
+    rig.canvas.snarl.disconnect(k2_out, spare_in);
+    rig.idle(4);
+    // Dropped where the input's wire is (`merge::on_drop` asks, tested on its own: a pin drag
+    // isn't something this rig can make).
+    let at = rig.to_global * rig.frame_rect(readout).left_center();
+    rig.canvas.merge_menu = Some(super::merge::PendingMerge { new: k2_out, target, pos: at, moved_from: None });
+    rig.idle(3);
+    assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![k1_out], "no second wire while it asks");
+    let before = rig.canvas.snarl.wires().count();
+
+    let (_, add) = rig.painted_all("Add").into_iter().last().expect("the menu offers Add");
+    rig.click(add.center());
+    rig.idle(6);
+    assert!(rig.canvas.merge_menu.is_none(), "the menu closed");
+    let add_node = rig
+        .canvas
+        .snarl
+        .nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "math.add")
+        .map(|(id, _)| id)
+        .expect("an Add was put in");
+    let into_add = |input: usize| rig.canvas.snarl.in_pin(egui_snarl::InPinId { node: add_node, input }).remotes.clone();
+    assert_eq!(into_add(0), vec![k1_out], "the old wire into a");
+    assert_eq!(into_add(1), vec![k2_out], "the new wire into b");
+    assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![egui_snarl::OutPinId { node: add_node, output: 0 }]);
+    let r = |n| rig.frame_rect(n);
+    assert!(r(add_node).right() <= r(readout).left(), "beside the input: {:?} {:?}", r(add_node), r(readout));
+    for n in [k1, k2, readout, spare] {
+        assert!(!r(add_node).shrink(1.0).intersects(r(n).shrink(1.0)), "on top of {n:?}: {:?} {:?}", r(add_node), r(n));
+    }
+
+    rig.canvas.undo();
+    rig.idle(2);
+    assert_eq!(rig.canvas.snarl.wires().count(), before);
+    assert!(rig.canvas.snarl.nodes_ids_data().all(|(_, n)| n.value.module_id != "math.add"), "undo took the Add back out");
+    assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![k1_out]);
+}
+
+/// With a transition time, a module moved a long way - pushed, arranged, undone - glides
+/// there: part of the way after a frame, all of it once the time is up; a small move (dragged
+/// freely) is drawn at once, so it doesn't trail the pointer.
+#[test]
+fn a_moved_module_glides_into_place() {
+    let (mut rig, ids) = Rig::new(&[egui::pos2(40.0, 40.0), egui::pos2(400.0, 40.0)]);
+    let n = ids[0];
+    rig.grid.ease = 0.3;
+    rig.idle(4);
+    let start = rig.frame_rect(n).min;
+    let to = rig.canvas.snarl.get_node_info(n).unwrap().pos + egui::vec2(0.0, 8.0 * B);
+    rig.canvas.snarl.get_node_info_mut(n).unwrap().pos = to;
+    rig.idle(1);
+    let part = rig.frame_rect(n).min;
+    assert!(part.y > start.y + 1.0 && part.y < start.y + 8.0 * B - 1.0, "on its way: {start:?} → {part:?}");
+    rig.idle(15);
+    assert!((rig.frame_rect(n).min.y - (start.y + 8.0 * B)).abs() < 0.6, "there: {:?}", rig.frame_rect(n).min);
+    // A nudge is drawn where it is at once.
+    let at = rig.frame_rect(n).min;
+    rig.canvas.snarl.get_node_info_mut(n).unwrap().pos += egui::vec2(3.0, 0.0);
+    rig.idle(1);
+    assert!((rig.frame_rect(n).min.x - (at.x + 3.0)).abs() < 0.6, "a nudge follows at once: {at:?} → {:?}", rig.frame_rect(n).min);
+}
+
+/// The alpha of the routed wires painted last frame: of each wire's two strokes (its dark
+/// underlay and itself), the narrower.
+fn wire_alphas(rig: &Rig) -> Vec<u8> {
+    fn walk(s: &egui::Shape, out: &mut Vec<(f32, egui::Color32)>) {
+        match s {
+            // A wire: long; a pin's outline is a dozen points.
+            egui::Shape::Path(p) if !p.closed && p.points.len() >= 20 => {
+                if let egui::epaint::ColorMode::Solid(c) = p.stroke.color {
+                    out.push((p.stroke.width, c));
+                }
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut strokes = Vec::new();
+    rig.shapes.iter().for_each(|c| walk(&c.shape, &mut strokes));
+    let thinnest = strokes.iter().map(|(w, _)| *w).fold(f32::INFINITY, f32::min);
+    strokes.iter().filter(|(w, _)| (*w - thinnest).abs() < 0.5).map(|(_, c)| c.a()).collect()
+}
+
+/// See-through wires are drawn see-through, and a hovered module's show whole.
+#[test]
+fn see_through_wires_show_whole_in_focus() {
+    let (mut rig, ids) = Rig::new(&[egui::pos2(40.0, 40.0), egui::pos2(400.0, 160.0), egui::pos2(40.0, 400.0)]);
+    rig.canvas.snarl.connect(egui_snarl::OutPinId { node: ids[0], output: 0 }, egui_snarl::InPinId { node: ids[1], input: 0 });
+    rig.idle(6);
+    let solid = wire_alphas(&rig);
+    assert!(!solid.is_empty() && solid.iter().all(|&a| a > 200), "solid by default: {solid:?}");
+
+    let mut g = crate::settings::CanvasGrid::default();
+    g.wire_opacity = 0.2;
+    g.wire_activity_reveals = true;
+    g.focus = 0.0; // the highlight off: focus still shows the wires
+    super::set_canvas_grid_settings(&rig.ctx, g);
+    rig.idle(4);
+    let faint = wire_alphas(&rig);
+    assert!(!faint.is_empty() && faint.iter().all(|&a| a < 80), "see-through: {faint:?}");
+
+    // Over the module at one end of it.
+    let over = rig.to_global * rig.frame_rect(ids[0]).center();
+    rig.frame(vec![egui::Event::PointerMoved(over)]);
+    rig.idle(10);
+    let shown = wire_alphas(&rig);
+    assert!(shown.iter().any(|&a| a > 200), "its wire shows whole: {shown:?}");
+}
+
+/// A wire whose route changes glides from its old shape to its new one, its ends on the pins
+/// all the way.
+#[test]
+fn a_rerouted_wire_glides_with_its_ends_on_the_pins() {
+    let (mut rig, ids) = Rig::new(&[egui::pos2(40.0, 40.0), egui::pos2(400.0, 60.0)]);
+    let (out, inp) = (egui_snarl::OutPinId { node: ids[0], output: 0 }, egui_snarl::InPinId { node: ids[1], input: 0 });
+    rig.canvas.snarl.connect(out, inp);
+    rig.grid.ease = 0.3;
+    rig.idle(6);
+    rig.canvas.snarl.get_node_info_mut(ids[1]).unwrap().pos += egui::vec2(0.0, 10.0 * B);
+    let painted = |rig: &Rig| -> Vec<egui::Pos2> {
+        // The wire: the longest open path painted, back in graph space.
+        fn walk(s: &egui::Shape, out: &mut Vec<Vec<egui::Pos2>>) {
+            match s {
+                egui::Shape::Path(p) if !p.closed => out.push(p.points.clone()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut paths = Vec::new();
+        rig.shapes.iter().for_each(|c| walk(&c.shape, &mut paths));
+        let back = rig.to_global.inverse();
+        paths.into_iter().max_by_key(|p| p.len()).unwrap_or_default().into_iter().map(|p| back * p).collect()
+    };
+    for frame in 0..12 {
+        rig.idle(1);
+        let route = wire_route(&rig.ctx, rig.snarl_id, out, inp).expect("routed");
+        let wire = painted(&rig);
+        let (a, b) = (wire[0], *wire.last().unwrap());
+        assert!((a - route[0]).length() < 1.0 && (b - *route.last().unwrap()).length() < 1.0,
+            "frame {frame}: the wire's ends {a:?} {b:?} off the pins {:?} {:?}", route[0], route.last());
+    }
+}
+
+/// An Auto-Map socket on a module's header rides with the header while the module glides to
+/// where it moved - a drag along the grid, a step at a time - at the same height below where
+/// the module is drawn every frame. It used to be placed from where the module was going, so
+/// for a frame at every step it jumped ahead of the header and back, its wire with it.
+#[test]
+fn a_header_socket_glides_with_its_module() {
+    let (mut rig, ids) = Rig::real("module.automap_response_curve", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    let pin = egui_snarl::InPinId { node: n, input: 0 };
+    rig.grid.ease = 0.3;
+    rig.idle(6);
+    let height = |rig: &Rig| egui_snarl::ui::pin_heights(&rig.ctx, rig.snarl_id).and_then(|h| h.inputs.get(&pin).copied()).expect("the socket was drawn");
+    let rest = height(&rig);
+    let start = rig.frame_rect(n).min.y;
+    let mut seen = Vec::new();
+    for step in 0..12 {
+        if step % 2 == 0 && step < 8 {
+            rig.canvas.snarl.get_node_info_mut(n).unwrap().pos.y += B;
+        }
+        rig.idle(1);
+        seen.push((rig.frame_rect(n).min.y, height(&rig)));
+    }
+    assert!(seen.iter().any(|(top, _)| *top > start + 0.5 && *top < start + 4.0 * B - 0.5), "the module glides: {seen:?}");
+    for (top, h) in &seen {
+        assert!((h - rest).abs() < 0.6, "at {top}: the socket is {h} below the module, {rest} at rest: {seen:?}");
+    }
+}
+
+/// A new wire drawn out of an input that has one and dropped on empty space offers to merge
+/// the wire there with another. Picked, the module goes in beside the input, the wire there
+/// into its first input and the second left free for what comes next; one undo takes it out.
+#[test]
+fn a_wire_drawn_out_of_a_taken_input_merges_with_room_for_another() {
+    let find = |id: &str| {
+        flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == id).expect("registered")
+    };
+    let (mut rig, ids) = Rig::real("module.knob", &[egui::pos2(20.0, 20.0)]);
+    let k = ids[0];
+    for id in ["display.readout", "math.add"] {
+        rig.descriptors.push(find(id));
+    }
+    let readout = rig.canvas.snarl.insert_node(egui::pos2(420.0, 140.0), NodeData::from(&find("display.readout")));
+    let k_out = egui_snarl::OutPinId { node: k, output: 0 };
+    let target = egui_snarl::InPinId { node: readout, input: 0 };
+    rig.canvas.snarl.connect(k_out, target);
+    rig.idle(10);
+    let before = rig.canvas.snarl.wires().count();
+
+    // What the menu's Add sets (`FlexViewer::open_merge`): the rig can't draw a wire out of a pin.
+    let way = super::merge::merge_ways(SignalType::Float, Some(SignalType::Float), None)[0];
+    assert_eq!(way.module, "math.add");
+    rig.canvas.open_merge = Some((way, k_out, target));
+    rig.idle(6);
+    let add_node = rig
+        .canvas
+        .snarl
+        .nodes_ids_data()
+        .find(|(_, n)| n.value.module_id == "math.add")
+        .map(|(id, _)| id)
+        .expect("an Add was put in");
+    let into_add = |input: usize| rig.canvas.snarl.in_pin(egui_snarl::InPinId { node: add_node, input }).remotes.clone();
+    assert_eq!(into_add(0), vec![k_out], "the wire there into a");
+    assert!(into_add(1).is_empty(), "b left free");
+    assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![egui_snarl::OutPinId { node: add_node, output: 0 }]);
+    let r = |n| rig.frame_rect(n);
+    assert!(r(add_node).right() <= r(readout).left(), "beside the input: {:?} {:?}", r(add_node), r(readout));
+    assert!(!r(add_node).shrink(1.0).intersects(r(k).shrink(1.0)), "on the knob: {:?} {:?}", r(add_node), r(k));
+
+    rig.canvas.undo();
+    rig.idle(2);
+    assert_eq!(rig.canvas.snarl.wires().count(), before);
+    assert!(rig.canvas.snarl.nodes_ids_data().all(|(_, n)| n.value.module_id != "math.add"), "undo took the Add back out");
+    assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![k_out]);
 }

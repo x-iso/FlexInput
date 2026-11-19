@@ -68,6 +68,10 @@ pub struct GridLayout {
     pub wires: WireRouting,
     /// How far wires going around nodes keep from them, beyond the pins' room.
     pub clearance: f32,
+    /// FLEXINPUT PATCH: how long a node takes to ease to where it has moved (a grid step
+    /// while dragged, a push, an arrange), and a routed wire to its new route, in seconds.
+    /// 0 jumps.
+    pub ease: f32,
 }
 
 impl Default for GridLayout {
@@ -82,6 +86,7 @@ impl Default for GridLayout {
             push: true,
             wires: WireRouting::Around,
             clearance: 12.0,
+            ease: 0.0,
         }
     }
 }

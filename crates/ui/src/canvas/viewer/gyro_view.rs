@@ -441,10 +441,12 @@ fn shown_pad(v: &GyroView) -> glam::Quat {
 }
 
 /// The model renderer's frame for `model`, as a multiple of the sphere's radius, that draws
-/// it [`PAD_HALF_W`] of the radius from its centre to either grip - the icon's size. The
-/// renderer frames a model's bounding sphere with room round it; how wide the pad is within
-/// that sphere is its own (a Steam Controller is wider for its depth than a Joy-Con), so it is
-/// measured off the mesh, once per model.
+/// it [`PAD_HALF_W`] of the radius from its centre to its furthest side, across the grips or
+/// nose to back - the icon's size. The renderer frames a model's bounding sphere with room
+/// round it; how big the pad is within that sphere is its own (a Steam Controller is wider for
+/// its depth than a Joy-Con), so it is measured off the mesh, once per model. Measured across
+/// the grips alone, a single Joy-Con - narrow across, long nose to back - came out three and a
+/// half times a Pro Controller's size, nearly the sphere's.
 fn model_frame(model: &str) -> f32 {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, f32>>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
@@ -452,11 +454,12 @@ fn model_frame(model: &str) -> f32 {
         return f;
     }
     let Some(m) = crate::model::load_model_cached(model) else { return 1.0 };
+    // The model's x is across the grips, its z nose to back (y is its thickness).
     let mut half_x = 0.0f32;
     for part in &m.parts {
         for v in part.vertices.chunks_exact(6) {
             let p = part.transform.transform_point3(glam::Vec3::new(v[0], v[1], v[2]));
-            half_x = half_x.max((p.x - m.center.x).abs());
+            half_x = half_x.max((p.x - m.center.x).abs()).max((p.z - m.center.z).abs());
         }
     }
     // The renderer stands back 1.3 bounding radii's worth past a 45° view: a point `x` across
@@ -898,9 +901,11 @@ fn pad_icon(
         pad_outline(painter, at, q, tint, 1.2_f32);
         return;
     };
-    // Across the grips the pad is 1.24 units; nose to back follows the icon's proportions.
-    let half_w = 0.62;
-    let half_h = half_w / aspect.max(0.1);
+    // The pad is 1.24 units along its longer side - across the grips for most, nose to back
+    // for a Joy-Con's tall icon - and the other side follows the icon's proportions. Across
+    // the grips alone, a tall icon came out over twice the sphere's size.
+    let aspect = aspect.max(0.1);
+    let (half_w, half_h) = if aspect >= 1.0 { (0.62, 0.62 / aspect) } else { (0.62 * aspect, 0.62) };
     // Image corners: top-left is forward-left, and so on round.
     let corners = [
         (glam::Vec3::new(half_h, half_w, 0.0), egui::pos2(0.0, 0.0)),
@@ -1191,4 +1196,28 @@ mod tests {
         assert!(near(d.x, -ph.yaw) && near(d.y, -ph.pitch), "{d:?}");
     }
 
+    // Every bundled pad draws the same size in the preview: its furthest side - across the
+    // grips or nose to back - at PAD_HALF_W of the sphere's radius. A single Joy-Con, narrow
+    // across and long nose to back, was sized by its width alone and came out nearly as big as
+    // the sphere.
+    #[test]
+    fn every_pad_model_fits_the_same_footprint() {
+        let models = crate::model::available_models();
+        assert!(models.iter().any(|m| m == "Left Joycon"), "{models:?}");
+        for name in models {
+            let Some(m) = crate::model::load_model_cached(&name) else { continue };
+            let (mut hx, mut hz) = (0.0f32, 0.0f32);
+            for part in &m.parts {
+                for v in part.vertices.chunks_exact(6) {
+                    let p = part.transform.transform_point3(glam::Vec3::new(v[0], v[1], v[2]));
+                    hx = hx.max((p.x - m.center.x).abs());
+                    hz = hz.max((p.z - m.center.z).abs());
+                }
+            }
+            let drawn = |half: f32| half * 22.5_f32.to_radians().cos() / (1.3 * m.radius.max(1e-3)) * model_frame(&name);
+            let (across, length) = (drawn(hx), drawn(hz));
+            assert!(across <= PAD_HALF_W + 1e-3 && length <= PAD_HALF_W + 1e-3, "{name}: {across} across, {length} long");
+            assert!((across.max(length) - PAD_HALF_W).abs() < 1e-3, "{name}: {across} across, {length} long");
+        }
+    }
 }

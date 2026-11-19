@@ -7,6 +7,36 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **A wire dropped onto an input that already has one asks what to do with the two:**
+  Cancel, Replace the wire, or merge them through a module that combines them in a way that
+  means something for what they carry - Add, Max, Min, Multiply or a Selector for numbers and
+  sticks; Either (OR), Both (AND), One of them (XOR) or a Selector for buttons; an AutoMap
+  Combiner or Selector for buses. The old wire goes into the module's first input and the new
+  into its second (a Selector's two signal inputs, never its select), and the module goes
+  beside the input, where nothing else is, so nothing has to be pushed aside. A wire moved
+  onto a taken input leaves the one it came from once it lands. Before, an input quietly took
+  a second wire the engine never read, and an Auto-Map port dropped its old wire. A new wire
+  drawn out of a taken input and let go on empty space offers the same merges at the top of
+  its menu - the module goes in beside the input with the wire there in its first input and
+  its second left free for what comes next - and a module picked from the list below, whose
+  output would land on the taken input, asks as a dropped wire does.
+- **Transitions, in the grid menu:** how long a module takes to glide to where it moved - a
+  step along the grid as it's dragged, one pushed aside, an arrange, an undo - and its wires
+  to their new routes, their ends on the pins all the way. 200 ms to start with; Off jumps as
+  before. A module dragged freely follows the pointer at once.
+- **Wire opacity, in the wires menu,** from hidden to solid (40% to start with), with
+  "Activity shows wires" (on to start with): a see-through wire shows more of itself the more
+  its signal is doing. A hovered or selected module's wires show whole whatever the opacity,
+  Highlight on or off.
+- **Arrange, on the canvas toolbar beside the grid and wire menus, lays the whole patch out
+  along its signal.** Modules go in columns by how far down the signal path they are - the
+  patch's inputs (devices, a sub-patch's inlets) in the first, its outputs in the last, a knob
+  or constant just before the module it turns - each column ordered so its wires cross as
+  little as they can, and each module at the height its wires come in at, so a wire from one
+  pin to the next runs level. Loops lay out like everything else; groups of modules not wired
+  to each other stack one under another, and modules wired to nothing go in a row beneath.
+  Sizes stay as they are, everything lands on the grid when modules snap to it, and one Undo
+  puts the patch back.
 - **3DOF to 2D has an Orient mode: the output follows where the pad's nose points.** It
   keeps a camera - a heading and a pitch - looking where the nose is: each tick the gyro's
   own turn of the pad is taken along the camera's up and its level right, so wherever the
@@ -40,6 +70,37 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **Panic mode resets 3DOF to 2D,** as it is engaged and as it is released: the
   Orientation output, Steering's wheel and the aim start over from neutral, as a Reset
   would, so what drifted or wound up while it was on is gone.
+- **RWS Aim's flick stick has a circle that shows what the stick is doing.** The stick's
+  travel is drawn with each part's job on it: the flick zone as an orange ring from the flick
+  deadzone out, the forward wedge where a flick doesn't snap in green, Stick aim's disc inside
+  the zone in blue (deeper where it turns faster), the dashed release floor a held flick follows
+  the stick down to, and the ring round the centre where the speed gate starts timing a push.
+  The stick is a live dot with a short trail, coloured by what it is doing - aiming, deciding,
+  steering, flicked - and the speed gate's time runs out in a ring round it. While a flick is
+  held, an arrow head outside the ring shows where it points, and an arc shows the turn it has
+  made, dashed where the snap is still turning in. A slow push that shuts the flick zone greys
+  it. A line under the circle says it in words ("flick? 40 of 120 ms", "flick +120°", "steering
+  · zone shut"). The settings sit beside the circle, or under it in a narrow module, in groups
+  named and coloured after the part of it they set - the flick zone and forward wedge, the snap
+  and tracking, Stick aim, the speed gate - with where the flick goes and the stick block
+  below. The deadzone is called the flick zone and the smoothing the snap time, which is what
+  they set, and "slow = aim" is the flick speed gate, ahead of its time: on, only a push that
+  reaches the flick zone in time flicks (switching it on with no time gives it 120 ms). The
+  circle and each group pin on their own, and the pinned circle carries every flick setting
+  for the gamepad; flick rows pinned before keep drawing as they did.
+- **Trackpads read as sticks, and RWS Aim flicks from them or the D-pad.** Each touch field
+  has a Vec2 on the AutoMap bus and on the pads that have one - Touch 1 XY and Touch 2 XY (a
+  Steam Controller's Pad L XY and Pad R XY, a DualSense's two fingers): where the touch is,
+  ±1 from the middle with up positive, after the pad's trackpad calibration, and the middle
+  while nothing touches, so a pad can drive what a stick does. They sit with the other Vec2s,
+  after the D-pad, on a pad's node and in the lists; a saved pad node gains them there too,
+  its later pins' wires moving with their pins. Wired into RWS Aim's Flick input, a trackpad
+  or the D-pad flicks as a stick does, and the stick block covers it - a trackpad's whole
+  touch field, so its touches don't reach its own mappings; before, only the two sticks
+  could be blocked.
+- **"Block stick: In flick zone" lets the stick through while a slow push has the zone shut.**
+  With the flick speed gate on, a push too slow to flick isn't flicking, so the stick is left
+  to what else it is mapped to, even out past the flick zone.
 - **Pinned Style 2 controls say what they do.** Their tooltips gave the field's label
   again ("interp ms"); they now carry the module's own description of each setting, and the
   labels are names - Crossover, Peak hold, Takes over above, Exclude Y, Lean threshold, Edge
@@ -164,8 +225,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   wires a little and dims the rest of the patch, except the modules its wires
   lead to.
 - **A wires menu** on the zoom toolbar, beside the grid menu: how wires are
-  routed, how much a module's wires stand out (0 turns it off), the range the
-  activity glow is shown in, and what makes an Auto-Map bus glow: any reading,
+  routed, how much a module's wires stand out (60% to start with; 0 turns it off),
+  the range the activity glow is shown in (0 to 70% to start with), and what makes
+  an Auto-Map bus glow: any reading,
   only readings moving from where they rest (a pad lying still goes dark), or
   only live input (a touchpad's position only while it's touched).
 - **One layout for module bodies.** Delay, Average, DC Filter, Inverse,
@@ -313,6 +375,30 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **Around wires are tidier.** A wire whose route kept to its pin's row and then turned once
+  stayed square - level, a hard corner, straight up, a hard corner - because only what lay
+  between its first and last runs was pulled taut; now it flows round what is in its way like
+  the rest. Wires that loop back round the module they leave or reach (a wire running right to
+  left) go round it side by side, where they lay on top of each other.
+- **The Dropdown widens with its corner grip,** its options and the choice coming out as wide
+  as you make it, so long option names can be read; its height is still its rows'.
+- **Controller 3D's colours:** the Joy-Con grip's two Joy-Cons are the original neon blue and
+  neon red (they were the grip's dark grey), the GameCube's stick rims are their sticks'
+  colours (they were purple), the WaveBird wears the GameCube's colours, and the Xbox 360 is
+  a soft off-white rather than paper white. Its Orientation input reads "Orient".
+- **The AutoMap lists show the bus grouped by kind:** the sticks as Vec2s, the axes, the
+  buttons, touch, motion, then the keyboard and mouse. Pins the bus gained over time sat at
+  its tail, after the mouse - a Steam Controller's pad clicks and grips, the trackpads'
+  press - and now sit with their kind in the AutoMap curve's pick, the Splitter's and
+  Collector's `add pin` and the bus readout. The bus itself keeps its order, which network
+  peers read by position.
+- **Two-way Response Curve's lanes in colour.** Up in the signal's colour, Down in its
+  opposite - blue for the stock red - half see-through and a little thicker for the lane
+  being edited, fainter for the other, so the trail riding a lane in its full colour fills
+  it where the signal has been; the band and arrow wear the colour of the lane the signal
+  is on.
+- **RWS Aim's header controls sit at its right end,** as every module's do, and Real World
+  Scale shares its row with the gyro and stick V/H biases where the module is wide enough.
 - **3DOF to 2D's Player and World are JoyShockMapper's PLAYER_TURN and WORLD_TURN,** by
   the JSM module's maths, which is JSM's line for line. Player keeps the pad's own pitch for
   Y and takes X from the turn about gravity, yaw and roll both counting, relaxed by JSM's
@@ -979,6 +1065,31 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **3DOF to 2D's preview draws a Joy-Con at a pad's size.** The pad was sized by its width
+  across the grips, and a single Joy-Con is narrow across and long nose to back: its icon came
+  out over twice the sphere's size and its model nearly the sphere's. Both are now sized by
+  their longer side, so every pad takes the same room.
+- **Two-way Response Curve shows the crossover.** After a lane switch the output crosses from
+  one lane to the other over the crossover time, but the graph's point jumped there at once;
+  it now crosses with the output, dashed on to where it is going.
+- **Auto-Map sockets and their wires no longer jump when a module folds or unfolds.** A
+  socket on the header took its place from last frame's distance to the pin column, which
+  folding moves for a few frames; it now hangs off the module's top.
+- **A big tooltip in a small window no longer blinks.** One too big to fit beside what it
+  explains is pushed back over it, and egui keeps such a tooltip open while the pointer is on
+  its widget - but on the canvas it compared the screen's pointer with the widget's place on
+  the zoomed canvas, so it closed and reopened every other frame. egui is vendored for the
+  one line (`vendor/egui`).
+- **Two-way Response Curve's trail outlasts a lane switch.** It was wiped the moment the
+  signal flipped lanes, whatever the trail time; each lane now keeps its own, fading on its
+  own clock.
+- **Pinned 3DOF to 2D Pointer and Steering rows both answer the mouse.** Pinned side by side
+  in Style 2, their cells had the same ids (one field each, on the same node), and a click
+  on either went to whichever row was drawn last - the top of the layout's order. The pad
+  reached both all along. Every Style 2 row's controls are now told apart by the row.
+- **Action buttons stay on one line at any control font size.** At 16 points and up the
+  AutoMap Collector's "MIDI…" broke onto two lines, its dots under its letters; a word now
+  comes a size down to fit its button instead, and a row's buttons share one size.
 - **A Log/Exp scale set with a pad moves the curve's points with it,** every lane's, as the
   slider does: the pad's field editor wrote the scale alone, which left the points where
   they were on the graph and changed what each one stood for - most noticeable on a pinned

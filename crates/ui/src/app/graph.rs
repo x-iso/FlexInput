@@ -998,6 +998,10 @@ fn signal_inputs(snarl: &Snarl<NodeData>, id: NodeId) -> Vec<usize> {
 /// (a game mapping may read the Vec2 or either component). Non-existent members
 /// are harmless — they simply aren't in the block set.
 pub(crate) fn expand_pin_group(pin_id: &str) -> Vec<String> {
+    // A trackpad as a stick is made of its touch field: x, y and the contact.
+    if let Some(field) = flexinput_core::automap::TOUCH_VECTOR_PINS.iter().find(|p| p[0] == pin_id) {
+        return field.iter().map(|s| s.to_string()).collect();
+    }
     let base = pin_id
         .strip_suffix("_x")
         .or_else(|| pin_id.strip_suffix("_y"))
@@ -1418,15 +1422,21 @@ fn trace_rws_flick_source(
             return None;
         }
         let up = snarl.get_node(cur.node)?;
-        // device.source / splitter store their output pin ids; a stick output ends
-        // the walk.
+        // device.source / splitter store their output pin ids; a pin a flick can
+        // come from ends the walk: a stick (as itself or an axis of it), the D-pad,
+        // or a trackpad as a stick.
         let pid = up.params.get("output_pin_ids")
             .and_then(|v| v.as_array())
             .and_then(|a| a.get(cur.output))
             .and_then(|v| v.as_str());
         if let Some(pid) = pid {
-            let base = pid.strip_suffix("_x").or_else(|| pid.strip_suffix("_y")).unwrap_or(pid);
-            if base == "left_stick" || base == "right_stick" {
+            let base = if flexinput_core::automap::TOUCH_VECTOR_PINS.iter().any(|p| p[0] == pid) {
+                Some(pid)
+            } else {
+                Some(pid.strip_suffix("_x").or_else(|| pid.strip_suffix("_y")).unwrap_or(pid))
+                    .filter(|b| matches!(*b, "left_stick" | "right_stick" | "dpad"))
+            };
+            if let Some(base) = base {
                 let dev = if up.module_id == "device.source" {
                     up.params.get("device_id").and_then(|v| v.as_str()).map(|s| s.to_string())
                 } else {
@@ -3086,6 +3096,39 @@ mod subpatch_bus_tests {
         let pins = config_consumed_pins(&s, &[], rws.0).expect("the pins it consumes");
         assert!(pins.contains(&"right_stick".to_string()), "{pins:?}");
         assert!(!pins.contains(&"left_trigger".to_string()), "{pins:?}");
+    }
+
+    /// The Flick input finds the D-pad and a trackpad as a stick as it finds a stick,
+    /// so RWS Aim can block them from their own mappings; a trigger isn't one.
+    #[test]
+    fn the_flick_input_finds_a_dpad_or_a_trackpad() {
+        let v = SignalType::Vec2;
+        let f = SignalType::Float;
+        let p = egui::Pos2::ZERO;
+        for (pin, ty, want) in [
+            ("dpad", v, Some("dpad")),
+            ("touch1_xy", v, Some("touch1_xy")),
+            ("touch2_xy", v, Some("touch2_xy")),
+            ("left_stick_x", f, Some("left_stick")),
+            ("left_trigger", f, None),
+        ] {
+            let mut s: Snarl<NodeData> = Snarl::new();
+            let pad = s.insert_node(p, {
+                let mut n = node("device.source", &[], &[ty]);
+                n.params.insert("device_id".into(), json!("sdl:pad:0"));
+                n.params.insert("output_pin_ids".into(), json!([pin]));
+                n
+            });
+            let rws = s.insert_node(p, node("processing.rws", &[v, v], &[v, v]));
+            wire(&mut s, pad, 0, rws, 1);
+            assert_eq!(
+                trace_rws_flick_source(&s, rws, None),
+                want.map(|w| ("sdl:pad:0".to_string(), w.to_string())),
+                "{pin}",
+            );
+        }
+        let pins = expand_pin_group("touch1_xy");
+        assert_eq!(pins, ["touch1_xy", "touch1_x", "touch1_y", "touch1_active"], "the whole touch field");
     }
 
     /// Moving an AutoMap curve between a trigger and a stick changes which curve

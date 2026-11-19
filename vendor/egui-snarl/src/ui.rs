@@ -572,6 +572,24 @@ pub struct SnarlStyle {
     #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
     pub wire_focus: Option<f32>,
 
+    /// FLEXINPUT PATCH: how opaque connected wires are drawn (0 to 1; `None` is 1). The
+    /// wires of a node in focus show whole whatever this is.
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
+    pub wire_opacity: Option<f32>,
+
+    /// FLEXINPUT PATCH: a see-through wire shows more of itself the more active its signal
+    /// is (`PinWireInfo::activity`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(skip_serializing_if = "Option::is_none", default)
+    )]
+    #[cfg_attr(feature = "egui-probe", egui_probe(skip))]
+    pub wire_activity_reveals: Option<bool>,
+
     /// FLEXINPUT PATCH: the layout grid. See [`GridLayout`].
     #[cfg_attr(
         feature = "serde",
@@ -810,6 +828,8 @@ impl SnarlStyle {
             wire_smoothness: None,
             grid: None,
             wire_focus: None,
+            wire_opacity: None,
+            wire_activity_reveals: None,
 
             _non_exhaustive: (),
         }
@@ -831,6 +851,8 @@ struct DrawNodeResponse {
     final_rect: Rect,
     /// FLEXINPUT PATCH: from the frame's top-left corner to the node's position.
     frame_offset: Vec2,
+    /// FLEXINPUT PATCH: from where the node is drawn, easing in, to where it is.
+    ease_offset: Vec2,
 }
 
 struct DrawPinsResponse {
@@ -849,6 +871,48 @@ struct PinResponse {
     wire_color: Color32,
     wire_style: WireStyle,
     wire_width_factor: f32,
+    /// FLEXINPUT PATCH: `PinWireInfo::activity`.
+    activity: f32,
+}
+
+// FLEXINPUT PATCH: each pin's height below its node's `pos`, as last drawn.
+const PIN_HEIGHTS_KEY: &str = "flexinput-pin-heights";
+
+// FLEXINPUT PATCH: where the wires being dropped were picked up from.
+const MOVED_FROM_KEY: &str = "flexinput-wire-moved-from";
+
+// FLEXINPUT PATCH: the node being drawn, and how far from its `pos` it's drawn.
+const DRAWN_OFFSET_KEY: &str = "flexinput-drawn-offset";
+
+/// Inside the `SnarlViewer` calls that draw a node: how far from its `pos` the node is drawn
+/// this frame - on its way to `pos` while it eases there, [`Vec2::ZERO`] once it's there. Its
+/// top, and anything kept as a distance from it, is `pos` plus this.
+#[must_use]
+pub fn drawn_offset(ctx: &egui::Context, node: NodeId) -> Vec2 {
+    ctx.data(|d| d.get_temp::<(NodeId, Vec2)>(egui::Id::new(DRAWN_OFFSET_KEY)))
+        .filter(|(n, _)| *n == node)
+        .map_or(Vec2::ZERO, |(_, v)| v)
+}
+
+/// Inside `SnarlViewer::connect`: the pin the wires being dropped were picked up from, when
+/// they are existing wires being moved rather than a new one being drawn.
+#[must_use]
+pub fn wire_moved_from(ctx: &egui::Context) -> Option<AnyPin> {
+    ctx.data(|d| d.get_temp::<Option<AnyPin>>(egui::Id::new(MOVED_FROM_KEY))).flatten()
+}
+
+/// Where each pin of a snarl sat on its node the last time it was drawn: its height below
+/// the node's position. For laying a patch out pin to pin.
+#[derive(Clone, Default, Debug)]
+pub struct PinHeights {
+    pub inputs: HashMap<InPinId, f32>,
+    pub outputs: HashMap<OutPinId, f32>,
+}
+
+/// The pin heights the snarl `snarl_id` recorded the last time it was drawn.
+#[must_use]
+pub fn pin_heights(ctx: &egui::Context, snarl_id: Id) -> Option<PinHeights> {
+    ctx.data(|d| d.get_temp(snarl_id.with(PIN_HEIGHTS_KEY)))
 }
 
 /// Widget to display [`Snarl`] graph in [`Ui`].
@@ -1144,6 +1208,10 @@ where
 
     let mut nodes_bb = Rect::NOTHING;
     let mut node_rects = Vec::new();
+    // FLEXINPUT PATCH: the same rects where the nodes are rather than where they're drawn
+    // easing in, for placing and pushing, which move the nodes themselves.
+    let mut real_rects: Vec<(NodeId, Rect)> = Vec::new();
+    let mut ease_offsets: HashMap<NodeId, Vec2> = HashMap::new();
     // FLEXINPUT PATCH: each node's frame offset, for snapping it while it's dragged.
     let mut frame_offsets: HashMap<NodeId, Vec2> = HashMap::new();
 
@@ -1198,8 +1266,34 @@ where
             nodes_bb = nodes_bb.union(response.final_rect);
             // FLEXINPUT PATCH: the grid's routes and pushes need every node's rect.
             node_rects.push((node_idx, response.final_rect));
+            real_rects.push((node_idx, response.final_rect.translate(response.ease_offset)));
+            ease_offsets.insert(node_idx, response.ease_offset);
             frame_offsets.insert(node_idx, response.frame_offset);
         }
+    }
+
+    // FLEXINPUT PATCH: where each pin sits on its node this frame, as a height below the
+    // node's `pos`, for laying a patch out pin to pin (FlexInput's auto-arrange). Read back
+    // with `pin_heights`. Measured from where the node is drawn, which is `pos` once it has
+    // eased there.
+    {
+        let mut heights = PinHeights::default();
+        let below = |node: NodeId, y: f32| {
+            let n = snarl.nodes.get(node.0)?;
+            let off = ease_offsets.get(&node).map_or(0.0, |v| v.y);
+            Some(y - (n.pos.y - off))
+        };
+        for (pin, r) in &input_info {
+            if let Some(h) = below(pin.node, r.pos.y) {
+                heights.inputs.insert(*pin, h);
+            }
+        }
+        for (pin, r) in &output_info {
+            if let Some(h) = below(pin.node, r.pos.y) {
+                heights.outputs.insert(*pin, h);
+            }
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(snarl_id.with(PIN_HEIGHTS_KEY), heights));
     }
 
     let mut hovered_wire = None;
@@ -1226,6 +1320,12 @@ where
             .collect();
         grid::routes(ui.ctx(), snarl_id, &grid, pin_reach, &node_rects, &ends)
     });
+    // FLEXINPUT PATCH: a routed wire that changed route is drawn easing from its old shape
+    // to its new one. Only the wires still on the way are here; the rest draw their route.
+    let eased_wires = routes
+        .as_ref()
+        .map(|r| eased_routes(ui.ctx(), snarl_id, &r.drawn, grid_cfg.map_or(0.0, |g| g.ease)))
+        .unwrap_or_default();
 
     // FLEXINPUT PATCH: a lost pin or a lifted finger can leave a hold behind.
     if !ui.input(|i| i.pointer.primary_down()) {
@@ -1286,7 +1386,8 @@ where
     let highlighted_wire = viewer.highlighted_wire();
 
     // FLEXINPUT PATCH: the wires of the hovered or selected nodes stand out.
-    let focus = wire_focus(&ui, snarl, snarl_id, &snarl_state, &node_rects, style.wire_focus, host_layer);
+    let reveal = style.wire_opacity.is_some_and(|o| o < 1.0);
+    let focus = wire_focus(&ui, snarl, snarl_id, &snarl_state, &node_rects, style.wire_focus, host_layer, reveal);
     let focused = |node: NodeId| focus.nodes.contains(&node);
 
     // Draw and interact with wires
@@ -1340,6 +1441,9 @@ where
         }
 
         let mut color = mix_colors(from_r.wire_color, to_r.wire_color);
+        let key = (wire.out_pin, wire.in_pin);
+        // How opaque the wire is drawn, for its dark underlay to go with it.
+        let mut wire_alpha = 1.0_f32;
 
         let width_factor = from_r.wire_width_factor.max(to_r.wire_width_factor);
         let mut draw_width = wire_width * width_factor;
@@ -1369,24 +1473,43 @@ where
         if highlighted_wire == Some((wire.out_pin, wire.in_pin)) {
             draw_width *= 2.5;
         }
+        let in_focus = focused(wire.out_pin.node) || focused(wire.in_pin.node);
         if focus.amount > 0.0 {
-            if focused(wire.out_pin.node) || focused(wire.in_pin.node) {
+            if in_focus {
                 draw_width *= 1.0 + FOCUS_THICKEN * focus.amount;
                 color = color.lerp_to_gamma(Color32::WHITE, FOCUS_BRIGHTEN * focus.amount);
             } else {
                 color = color.gamma_multiply(1.0 - FOCUS_FADE * focus.amount);
             }
         }
+        // FLEXINPUT PATCH: see-through wires (the style's opacity), more of one showing the
+        // more active its signal is, and all of one in focus, hovered or picked out.
+        let opacity = style.wire_opacity.unwrap_or(1.0).clamp(0.0, 1.0);
+        if opacity < 1.0 {
+            let mut alpha = opacity;
+            if style.wire_activity_reveals.unwrap_or(false) {
+                let activity = from_r.activity.max(to_r.activity).clamp(0.0, 1.0);
+                alpha += (1.0 - alpha) * activity;
+            }
+            if in_focus {
+                alpha += (1.0 - alpha) * focus.fade;
+            }
+            if hovered_wire == Some(wire) || highlighted_wire == Some(key) {
+                alpha = 1.0;
+            }
+            color = color.gamma_multiply(alpha);
+            wire_alpha = alpha;
+        }
         if moved_from.is_some_and(on_pin) {
             color = color.gamma_multiply(0.3);
         }
 
-        if let Some(path) = routes.as_ref().and_then(|r| r.drawn.get(&(wire.out_pin, wire.in_pin))) {
+        if let Some(path) = eased_wires.get(&key).or_else(|| routes.as_ref().and_then(|r| r.drawn.get(&key))) {
             // Thicker than a curve: a routed wire runs along grid lines and beside other
             // wires, and has to stand out from both. (A wire that's already thick, an
             // Auto-Map bundle, keeps its own width.)
             let routed = draw_width / width_factor.max(0.01) * routed_factor(width_factor);
-            let shade = ui.visuals().extreme_bg_color;
+            let shade = ui.visuals().extreme_bg_color.gamma_multiply(wire_alpha);
             draw_routed_wire(&ui, &mut wire_shapes, path, Stroke::new(routed, color), shade);
             continue;
         }
@@ -1497,6 +1620,10 @@ where
 
     if drag_released {
         let moved_from = snarl_state.moved_from();
+        // FLEXINPUT PATCH: where wires being moved came from, for the viewer's `connect` to
+        // read (`wire_moved_from`): a viewer that asks before connecting has to finish the
+        // move itself, and mustn't count the moved wire as one already on the pin.
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(MOVED_FROM_KEY), moved_from));
         let new_wires = snarl_state.take_new_wires();
         if new_wires.is_some() {
             ui.ctx().request_repaint();
@@ -1717,14 +1844,14 @@ where
             placed.push(*n);
             false
         });
-        let first = node_rects.iter().find(|(n, _)| placed.contains(n)).map(|&(_, r)| r);
+        let first = real_rects.iter().find(|(n, _)| placed.contains(n)).map(|&(_, r)| r);
         if let Some(first) = first {
             // The whole group moves alike, so a pasted group keeps its shape.
             let by = grid.snap_offset(first);
             let moves: Vec<(NodeId, Vec2)> = placed.iter().map(|&n| (n, by)).collect();
             apply_pushes(snarl, &moves, ui.ctx());
             if grid.push {
-                let moved: Vec<(NodeId, Rect)> = node_rects
+                let moved: Vec<(NodeId, Rect)> = real_rects
                     .iter()
                     .map(|&(n, r)| (n, if placed.contains(&n) { r.translate(by) } else { r }))
                     .collect();
@@ -1783,7 +1910,7 @@ where
         GridDrag::clear(ui.ctx(), snarl_id);
         let movers: Vec<NodeId> = drag.origins.iter().map(|&(n, _)| n).collect();
         if let Some(grid) = grid_cfg.filter(|g| g.push) {
-            apply_pushes(snarl, &grid::push_apart(&grid, &node_rects, &movers), ui.ctx());
+            apply_pushes(snarl, &grid::push_apart(&grid, &real_rects, &movers), ui.ctx());
         }
         dropped = Some(movers);
     }
@@ -1796,9 +1923,9 @@ where
         } else if down {
             memory.note_held(now);
         }
-        let grown = memory.grown(&node_rects, now);
+        let grown = memory.grown(&real_rects, now);
         if !grown.is_empty() && !grid_dragging {
-            apply_pushes(snarl, &grid::push_apart(&grid, &node_rects, &grown), ui.ctx());
+            apply_pushes(snarl, &grid::push_apart(&grid, &real_rects, &grown), ui.ctx());
             memory.settle(&grown);
         }
         if let Some(movers) = &dropped {
@@ -1820,7 +1947,7 @@ where
             && let Some(routes) = routes.as_ref()
             && let Some(movers) = memory.settle_round()
         {
-            let moves = grid::spread_crowded(&grid, &node_rects, &routes.crowding, &movers);
+            let moves = grid::spread_crowded(&grid, &real_rects, &routes.crowding, &movers);
             if moves.is_empty() {
                 memory.settled();
             } else {
@@ -2014,6 +2141,9 @@ struct WireFocus {
     nodes: Vec<NodeId>,
     neighbors: Vec<NodeId>,
     amount: f32,
+    /// How far along the fade in or out the focus is (0 to 1), whatever its strength: how
+    /// much of a see-through wire it shows.
+    fade: f32,
 }
 
 /// FLEXINPUT PATCH: the nodes in focus: the selected ones and the one under the pointer
@@ -2027,10 +2157,12 @@ fn wire_focus<T>(
     node_rects: &[(NodeId, Rect)],
     strength: Option<f32>,
     host_layer: LayerId,
+    reveal: bool,
 ) -> WireFocus {
     let strength = strength.unwrap_or(0.0).clamp(0.0, 1.0);
-    let none = WireFocus { nodes: Vec::new(), neighbors: Vec::new(), amount: 0.0 };
-    if strength <= 0.0 {
+    let none = WireFocus { nodes: Vec::new(), neighbors: Vec::new(), amount: 0.0, fade: 0.0 };
+    // With see-through wires, focus shows a node's wires whatever its strength.
+    if strength <= 0.0 && !reveal {
         return none;
     }
     let mut nodes: Vec<NodeId> = snarl_state.selected_nodes().to_vec();
@@ -2067,7 +2199,153 @@ fn wire_focus<T>(
             neighbors.push(a);
         }
     }
-    WireFocus { nodes, neighbors, amount: strength * fade }
+    WireFocus { nodes, neighbors, amount: strength * fade, fade }
+}
+
+/// FLEXINPUT PATCH: a node gliding from where it was drawn to where it is now.
+#[derive(Clone, Copy, Default)]
+struct Glide {
+    from: Pos2,
+    to: Pos2,
+    start: f64,
+}
+
+/// How far along a glide of `ease` seconds, started at `start`, is at `now`, eased out (fast,
+/// then settling): 0 to 1, 1 from `ease` on.
+fn glide_t(now: f64, start: f64, ease: f32) -> f32 {
+    let t = (((now - start) / f64::from(ease.max(1e-3))) as f32).clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// FLEXINPUT PATCH: where a node at `target` is drawn: gliding from where it was drawn when it
+/// moved, all the way in `ease` seconds; moved again on the way, from where it is then. A node
+/// settled where it was that moves only a little - dragged freely, a point or two a frame -
+/// follows at once: a glide would only make it trail the pointer. At once with `ease` 0.
+fn eased_pos(ctx: &egui::Context, node_id: Id, target: Pos2, ease: f32) -> Pos2 {
+    let key = node_id.with("flexinput-glide");
+    if ease <= 0.0 {
+        ctx.data_mut(|d| d.remove_temp::<Glide>(key));
+        return target;
+    }
+    // A glide starts a frame back, so the frame that sees the move already shows some of it.
+    let (now, dt) = ctx.input(|i| (i.time, f64::from(i.stable_dt.clamp(0.0, 0.1))));
+    let at = |g: &Glide| g.from + (g.to - g.from) * glide_t(now, g.start, ease);
+    let still = Glide { from: target, to: target, start: now - f64::from(ease) };
+    let mut g = ctx.data(|d| d.get_temp::<Glide>(key)).unwrap_or(still);
+    if (target - g.to).length() > 0.01 {
+        let shown = at(&g);
+        let settled = (shown - g.to).length() < 0.5;
+        g = if (settled && (target - g.to).length() <= EASE_SMALL_STEP) || !shown.is_finite() {
+            still
+        } else {
+            Glide { from: shown, to: target, start: now - dt }
+        };
+    }
+    let shown = at(&g);
+    if (shown - g.to).length() > 0.01 {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(key, g));
+    shown
+}
+
+/// FLEXINPUT PATCH: a move or a change of route this small, from where things had settled,
+/// is drawn at once rather than eased.
+const EASE_SMALL_STEP: f32 = 6.0;
+
+/// FLEXINPUT PATCH: a routed wire as drawn: its latest route, and - while it's on its way
+/// from an old one - the shape it set off from and when.
+#[derive(Clone, Default)]
+struct EasedWire {
+    route: Vec<Pos2>,
+    from: Option<(Vec<Pos2>, f64)>,
+}
+
+/// How many points an easing wire is resampled to, its old shape and its new alike.
+const EASE_POINTS: usize = 64;
+
+/// FLEXINPUT PATCH: the wires in `drawn` on their way from an old route to a new one, as
+/// they're drawn this frame: each point of the old shape going to the same point along the new
+/// (by length), all the way in `ease` seconds, the ends held on the pins. A route that changes
+/// again on the way is the new end of the same glide (a node gliding moves its wires' routes
+/// every frame); a wire seen for the first time, a small change from a settled wire, or `ease`
+/// 0, draws its route at once.
+fn eased_routes(
+    ctx: &egui::Context,
+    snarl_id: Id,
+    drawn: &HashMap<(OutPinId, InPinId), Vec<Pos2>>,
+    ease: f32,
+) -> HashMap<(OutPinId, InPinId), Vec<Pos2>> {
+    let key = snarl_id.with("flexinput-eased-wires");
+    let mut out = HashMap::new();
+    if ease <= 0.0 {
+        ctx.data_mut(|d| d.remove_temp::<HashMap<(OutPinId, InPinId), EasedWire>>(key));
+        return out;
+    }
+    let (now, dt) = ctx.input(|i| (i.time, f64::from(i.stable_dt.clamp(0.0, 0.1))));
+    let mut state: HashMap<(OutPinId, InPinId), EasedWire> = ctx.data_mut(|d| d.remove_temp(key)).unwrap_or_default();
+    state.retain(|w, _| drawn.contains_key(w));
+    for (w, route) in drawn {
+        let Some(e) = state.get_mut(w) else {
+            state.insert(*w, EasedWire { route: route.clone(), from: None });
+            continue;
+        };
+        if e.route != *route {
+            if e.from.is_none() {
+                let (old, new) = (resample(&e.route, EASE_POINTS), resample(route, EASE_POINTS));
+                let apart = old.iter().zip(&new).map(|(a, b)| (*a - *b).length()).fold(0.0f32, f32::max);
+                if old.len() == new.len() && !new.is_empty() && apart > EASE_SMALL_STEP {
+                    e.from = Some((old, now - dt));
+                }
+            }
+            e.route = route.clone();
+        }
+        let Some((from, start)) = &e.from else { continue };
+        let t = glide_t(now, *start, ease);
+        let to = resample(route, EASE_POINTS);
+        if t >= 1.0 || from.len() != to.len() || to.is_empty() {
+            e.from = None;
+            continue;
+        }
+        let mut next: Vec<Pos2> = from.iter().zip(&to).map(|(a, b)| *a + (*b - *a) * t).collect();
+        // The ends on the pins, the correction spread along the wire.
+        let (d0, d1) = (to[0] - next[0], to[to.len() - 1] - next[next.len() - 1]);
+        let last = (next.len() - 1).max(1) as f32;
+        for (i, p) in next.iter_mut().enumerate() {
+            let s = i as f32 / last;
+            *p += d0 * (1.0 - s) + d1 * s;
+        }
+        out.insert(*w, next);
+    }
+    if !out.is_empty() {
+        ctx.request_repaint();
+    }
+    ctx.data_mut(|d| d.insert_temp(key, state));
+    out
+}
+
+/// `path` as `n` points evenly spaced along its length.
+fn resample(path: &[Pos2], n: usize) -> Vec<Pos2> {
+    if path.len() < 2 || n < 2 {
+        return path.to_vec();
+    }
+    let lens: Vec<f32> = path.windows(2).map(|w| (w[1] - w[0]).length()).collect();
+    let total: f32 = lens.iter().sum();
+    if total <= 0.0 {
+        return vec![path[0]; n];
+    }
+    let mut out = Vec::with_capacity(n);
+    let (mut seg, mut walked) = (0usize, 0.0f32);
+    for i in 0..n {
+        let at = total * i as f32 / (n - 1) as f32;
+        while seg + 1 < lens.len() && walked + lens[seg] < at {
+            walked += lens[seg];
+            seg += 1;
+        }
+        let t = if lens[seg] > 0.0 { ((at - walked) / lens[seg]).clamp(0.0, 1.0) } else { 0.0 };
+        out.push(path[seg] + (path[seg + 1] - path[seg]) * t);
+    }
+    out
 }
 
 /// FLEXINPUT PATCH: how many times the style's wire width a routed wire is drawn, at
@@ -2352,6 +2630,7 @@ where
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                     wire_width_factor: wire_info.width_factor,
+                    activity: wire_info.activity,
                 },
             );
 
@@ -2570,6 +2849,7 @@ where
                     wire_color: wire_info.color,
                     wire_style: wire_info.style,
                     wire_width_factor: wire_info.width_factor,
+                    activity: wire_info.activity,
                 },
             );
 
@@ -2660,10 +2940,15 @@ where
         .map(|idx| OutPin::new(snarl, OutPinId { node, output: idx }))
         .collect::<Vec<_>>();
 
-    let node_pos = pos.round_ui();
-
     // Generate persistent id for the node.
     let node_id = snarl_id.with(("snarl-node", node));
+
+    // FLEXINPUT PATCH: a node that has moved - a grid step while it's dragged, a push, an
+    // arrange, an undo - is drawn easing from where it was to where it is.
+    let ease = style.get_grid().map_or(0.0, |g| g.ease);
+    let node_pos = eased_pos(ui.ctx(), node_id, pos, ease).round_ui();
+    // Set before the viewer draws any of it: what `drawn_offset` reads.
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(DRAWN_OFFSET_KEY), (node, node_pos - pos)));
 
     let openness = ui.ctx().animate_bool(node_id, open);
 
@@ -3408,6 +3693,7 @@ where
         pin_hovered,
         final_rect: r.response.rect,
         frame_offset: frame_margin.left_top(),
+        ease_offset: pos - node_pos,
     })
 }
 

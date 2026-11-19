@@ -5892,6 +5892,67 @@ mod rws_tests {
         assert!((flick - 90.0).abs() < 0.01, "flick after the centre: {flick}");
     }
 
+    // The body's flick circle reads what the flick is doing from two display-only
+    // entries after the readouts: the stick, the speed gate's clock while it
+    // decides, the flick's heading and how far it has turned once engaged, and
+    // what the smoothing still owes. They sit after the pins of a node of any age.
+    #[test]
+    fn the_flick_circle_reads_the_flick_state() {
+        let p = gated_params(true);
+        let gyro = Some(Signal::Vec2(glam::Vec2::ZERO));
+        let mut st = NodeState::default();
+        let tick = |st: &mut NodeState, v: glam::Vec2| {
+            let out = rws_fit_outputs(compute_rws(&[gyro, Some(Signal::Vec2(v))], st, &p, 0.001), 3);
+            rws_flick_view(&out, 3).expect("the flick circle's entries")
+        };
+        let idle = tick(&mut st, glam::Vec2::ZERO);
+        assert!(idle.flick_on && idle.aim_on && !idle.engaged && idle.gesture == RwsGesture::Neutral, "{idle:?}");
+        // Out of the centre: deciding, the clock running.
+        let mut v = idle;
+        for _ in 0..20 {
+            v = tick(&mut st, glam::Vec2::new(0.5, 0.0));
+        }
+        assert_eq!(v.gesture, RwsGesture::Deciding);
+        assert!((v.gate_s - 0.019).abs() < 1e-4, "gate clock {}", v.gate_s);
+        assert_eq!(v.stick, glam::Vec2::new(0.5, 0.0));
+        // On into the flick zone in time: a flick, 90° right, its snap still owed.
+        let v = tick(&mut st, glam::Vec2::new(1.0, 0.0));
+        assert!(v.engaged && v.gesture == RwsGesture::Flicked && !v.no_snap, "{v:?}");
+        assert!((v.heading_deg - 90.0).abs() < 1e-3 && (v.turned_deg - 90.0).abs() < 1e-3, "{v:?}");
+        assert!(v.owed_deg > 80.0, "the snap is smoothed in: {v:?}");
+        // Rotated on to straight down: tracked, and paid out once the smoothing ends.
+        let mut v = v;
+        for i in 0..=90 {
+            let r = (90.0 + i as f32).to_radians();
+            v = tick(&mut st, glam::Vec2::new(r.sin(), r.cos()));
+        }
+        for _ in 0..200 {
+            v = tick(&mut st, glam::Vec2::new(0.0, -1.0));
+        }
+        assert!((v.heading_deg.abs() - 180.0).abs() < 1e-2 && (v.turned_deg - 180.0).abs() < 1e-2, "{v:?}");
+        assert!(v.owed_deg.abs() < 0.05, "paid out: {v:?}");
+        // Let go: no longer engaged; the turn is kept for the circle.
+        for _ in 0..100 {
+            v = tick(&mut st, glam::Vec2::ZERO);
+        }
+        assert!(!v.engaged && v.gesture == RwsGesture::Neutral && (v.turned_deg - 180.0).abs() < 1e-2, "{v:?}");
+
+        // A slow push is steering, and with the lock it shows the flick zone shut.
+        let mut st = NodeState::default();
+        let mut v = idle;
+        for _ in 0..100 {
+            v = tick(&mut st, glam::Vec2::new(0.4, 0.0));
+        }
+        assert_eq!(v.gesture, RwsGesture::Steering);
+        // Inside the forward deadzone a flick engages without its snap.
+        let mut q = flick_params(0.0, 1.0, 1.0);
+        q.insert("flick_fwd_dz_deg".into(), serde_json::json!(20.0));
+        let mut st = NodeState::default();
+        let out = compute_rws(&[gyro, stick_at(10.0)], &mut st, &q, 0.001);
+        let v = rws_flick_view(&out, 4).expect("entries");
+        assert!(v.engaged && v.no_snap && v.turned_deg == 0.0 && !v.aim_on, "{v:?}");
+    }
+
     // A quick nudge that comes back before the gate decides is aim, not a
     // flick: it isn't thrown away.
     #[test]
@@ -6254,6 +6315,81 @@ mod rws_tests {
             Some(Signal::Vec2(v)) => assert!(v.x > 45.0, "flick must engage from the snapshot, dx={}", v.x),
             _ => panic!("expected Vec2 output"),
         }
+    }
+
+    // A trackpad on the Flick input is blocked as its whole touch field, and read
+    // from its Vec2: its x and y hold where the last touch was.
+    #[test]
+    fn rws_flicks_from_a_trackpad_and_blocks_its_touch() {
+        let mut snap = rws_snap(26, "full");
+        snap.params.insert("_rws_flick_stick".into(), Value::String("touch1_xy".into()));
+        snap.params.insert("scale".into(), serde_json::json!(1.0));
+        snap.params.insert("flick_smooth_ms".into(), serde_json::json!(0.0));
+        let mut c: BusMap = BusMap::default();
+        let mut state: HashMap<usize, NodeState> = HashMap::new();
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        // Lifted a moment ago at the right edge: x still says so, the Vec2 is the middle...
+        carry.unblocked_src.insert(("dev".into(), "touch1_x".into()), Signal::Float(1.0));
+        carry.unblocked_src.insert(("dev".into(), "touch1_y".into()), Signal::Float(0.0));
+        carry.unblocked_src.insert(("dev".into(), "touch1_xy".into()), Signal::Vec2(glam::Vec2::ZERO));
+        let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(glam::Vec2::ZERO))];
+        let out = eval_rws_node(&snap, 26, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
+        assert_eq!(out[0], Some(Signal::Vec2(glam::Vec2::ZERO)), "no touch, no flick");
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        for pin in ["touch1_xy", "touch1_x", "touch1_y", "touch1_active"] {
+            assert_eq!(c.get(&(sk.clone(), pin.to_string())).map(|s| s.as_bool()), Some(true), "{pin}");
+        }
+        assert!(c.get(&(sk.clone(), "touch2_xy".to_string())).is_none(), "the other pad is untouched");
+        // ...and touched at the bottom edge, it flicks round.
+        let carry = state.entry(MACRO_CARRY_UID).or_default();
+        carry.unblocked_src.insert(("dev".into(), "touch1_xy".into()), Signal::Vec2(glam::Vec2::new(0.0, -1.0)));
+        let out = eval_rws_node(&snap, 26, &inputs, &BusMap::default(), &mut c, &mut state, 0.016);
+        match out[0] {
+            Some(Signal::Vec2(v)) => assert!((v.x.abs() - 180.0).abs() < 1e-3, "flicked {}", v.x),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // In flick zone mode the stick is let through while a slow push has the flick zone
+    // shut: it isn't flicking, and may be meant for something else.
+    #[test]
+    fn rws_flick_zone_block_lets_a_slow_push_through() {
+        let mut snap = rws_snap(27, "deadzone");
+        snap.params.insert("flick_speed_ms".into(), serde_json::json!(60.0));
+        snap.params.insert("flick_slow_lock".into(), Value::Bool(true));
+        let sk = format!("{SRC_BLOCK_PREFIX}dev");
+        let push = |state: &mut HashMap<usize, NodeState>, v: glam::Vec2, ms: usize| {
+            let mut c = BusMap::default();
+            for _ in 0..ms {
+                c = BusMap::default();
+                let inputs = vec![Some(Signal::Vec2(glam::Vec2::ZERO)), Some(Signal::Vec2(v))];
+                eval_rws_node(&snap, 27, &inputs, &BusMap::default(), &mut c, state, 0.001);
+            }
+            c.get(&(sk.clone(), "right_stick".to_string())).is_some()
+        };
+        let mut slow = HashMap::new();
+        assert!(!push(&mut slow, glam::Vec2::new(0.4, 0.0), 100), "steering inside the zone");
+        assert!(!push(&mut slow, glam::Vec2::new(1.0, 0.0), 50), "on into the shut zone: let through");
+        let mut fast = HashMap::new();
+        assert!(push(&mut fast, glam::Vec2::new(1.0, 0.0), 5), "a flick is blocked");
+    }
+
+    // Each touch field reads as a stick: where the touch is while it counts, the
+    // middle once it lifts, and nothing on a device without the field.
+    #[test]
+    fn a_touch_field_reads_as_a_stick() {
+        let mut sigs = BusMap::default();
+        sigs.set_pin("pad", "touch1_active", Signal::Bool(true));
+        sigs.set_pin("pad", "touch1_x", Signal::Float(0.5));
+        sigs.set_pin("pad", "touch1_y", Signal::Float(-0.25));
+        sigs.set_pin("pad", "touch2_active", Signal::Bool(false));
+        sigs.set_pin("pad", "touch2_x", Signal::Float(0.9));
+        sigs.set_pin("pad", "touch2_y", Signal::Float(0.9));
+        sigs.set_pin("stickonly", "right_stick", Signal::Vec2(glam::Vec2::X));
+        touch_vectors(&mut sigs);
+        assert_eq!(sigs.get_pin("pad", "touch1_xy"), Some(&Signal::Vec2(glam::Vec2::new(0.5, -0.25))));
+        assert_eq!(sigs.get_pin("pad", "touch2_xy"), Some(&Signal::Vec2(glam::Vec2::ZERO)), "lifted");
+        assert!(sigs.get_pin("stickonly", "touch1_xy").is_none());
     }
 
     // Stick-aim alone never mutes the stick for other modules: with suppression
@@ -8328,7 +8464,7 @@ mod twoway_curve_tests {
         assert!(*out.last().unwrap() > 0.55, "held on the way down: {out:?}");
     }
 
-    // The UI gets one Vec2(held, lane) per channel after the inputs.
+    // The UI gets one Vec4(held, lane, crossover, shown y) per channel after the inputs.
     #[test]
     fn live_inputs_carry_the_tracker() {
         let p = pulse_curve(1.5);
@@ -8338,9 +8474,44 @@ mod twoway_curve_tests {
         let live = twoway_live_inputs(&[Some(Signal::Float(0.09))], Some(&st));
         assert_eq!(live.len(), 2);
         match live[1] {
-            Some(Signal::Vec2(v)) => { assert!((v.x - 0.10).abs() < 1e-6); assert_eq!(v.y, 1.0); }
+            Some(Signal::Vec4(v)) => {
+                assert!((v.x - 0.10).abs() < 1e-6);
+                assert_eq!(v.y, 1.0);
+                assert_eq!(v.z, 1.0, "no crossover under way");
+                assert!(!v.w.is_nan());
+            }
             other => panic!("{other:?}"),
         }
+    }
+
+    // After a lane switch the graph's point crosses from where it was to the new lane over
+    // the crossover time, as the output does - it used to jump there.
+    #[test]
+    fn the_shown_point_crosses_over_with_the_output() {
+        let mut p = HashMap::new();
+        p.insert("points".into(), json!([[0.0, 0.0], [1.0, 1.0]]));
+        p.insert("points_dn".into(), json!([[0.0, 0.0], [1.0, 0.0]]));
+        p.insert("absolute".into(), json!(true));
+        p.insert("interp_ms".into(), json!(100.0));
+        p.insert("hysteresis_pct".into(), json!(1.0));
+        let mut st = NodeState::default();
+        let shown = |st: &NodeState| st.twoway_shown_y[0];
+        for i in 0..=80 {
+            compute_twoway_response_curve(&[Some(Signal::Float(i as f32 / 100.0))], &mut st, &p, 0.001);
+        }
+        assert!((shown(&st) - 0.8).abs() < 1e-3, "on the Up curve: {}", shown(&st));
+        // Back down past the band: the Down lane, whose curve is flat at 0.
+        compute_twoway_response_curve(&[Some(Signal::Float(0.7))], &mut st, &p, 0.001);
+        let just_after = shown(&st);
+        assert!(just_after > 0.7, "it starts from where it was: {just_after}");
+        for _ in 0..49 {
+            compute_twoway_response_curve(&[Some(Signal::Float(0.7))], &mut st, &p, 0.001);
+        }
+        assert!((shown(&st) - 0.4).abs() < 0.03, "halfway through the crossover: {}", shown(&st));
+        for _ in 0..60 {
+            compute_twoway_response_curve(&[Some(Signal::Float(0.7))], &mut st, &p, 0.001);
+        }
+        assert!(shown(&st).abs() < 1e-4, "on the Down curve once it's done: {}", shown(&st));
     }
 }
 

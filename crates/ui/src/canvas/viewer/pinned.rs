@@ -462,6 +462,17 @@ pub(crate) fn render_pinned_element_impl(
             render_rws_flick_speed(inner_id, ui, inner_snarl, container_size);
             return;
         }
+        // The flick rows grouped round the flick circle came after the rows had two
+        // looks: they have the one, whichever the pin says.
+        ("processing.rws", "flick_zone" | "flick_aim" | "flick_feel" | "flick_route") => {
+            super::pin_style2::render_live(inner_id, module_id, element_id, ui, inner_snarl, container_size, live_signals, bridged_parent);
+            return;
+        }
+        // The flick circle: the stick live on its zones. Sizes itself to the container.
+        ("processing.rws", "flick_view") => {
+            let _ = render_rws_flick_view(inner_id, ui, inner_snarl, container_size);
+            return;
+        }
         // Source stick suppression (None / Left / Right / Both).
         ("processing.rws", "suppress") => {
             render_rws_suppress(inner_id, ui, inner_snarl, container_size);

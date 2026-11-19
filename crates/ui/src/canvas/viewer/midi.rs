@@ -251,11 +251,11 @@ pub(crate) fn midi_pin_add_button(
     let usable = allowed && built.is_some();
     // An action button, as the rows of buttons round it are (`kit::body_button`).
     let font = super::simple_bodies::control_font_at(super::simple_bodies::control_font_size() + 1.0);
-    let w = (ui.painter().layout_no_wrap(label.to_string(), font, egui::Color32::PLACEHOLDER).size().x
+    let w = (ui.painter().layout_no_wrap(label.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x
         + 2.0 * ui.spacing().button_padding.x
         + 12.0)
         .max(44.0);
-    let resp = ui.add_enabled(usable, super::remapper_bodies::action_button(label, w));
+    let resp = ui.add_enabled(usable, super::remapper_bodies::action_button_font(label, w, font));
     match (&built, allowed) {
         (None, _) => resp.on_disabled_hover_text(format!(
             "A complete SysEx message: starts F0, ends F7, at most {} bytes.",
