@@ -1065,6 +1065,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **JSM Config's tabs sit on the editor and scroll when there are more than fit.** A band of
+  the body's colour separated the tab in front from the editor under it; now the tab is the
+  top of the editor, outlined in its frame. Tabs that overflow get the scroll bar the patch
+  tabs have, over their bottom edge while the pointer is on them, and the wheel or a
+  trackpad's two-finger scroll over them runs along them, on the canvas and in Easy mode.
+  Pinned, the editor scrolls with the wheel or a trackpad too (only its scroll bar moved it),
+  its text stays inside it rather than showing over the tabs, and beside the faders it runs
+  their whole height - it stopped short by up to a line and a line of counts that wasn't
+  there. With the last tab in
+  front, the strip shows the `+` after it too - it was left off the end.
 - **Zoomed-in text and icons are sharp.** Easy mode draws its layout bigger to fill the panel
   and the canvas zooms by scaling what's drawn, and both stretched text and icons rasterized
   for their size in points: twice the size was twice as blurry, worst on a 1080p screen at

@@ -52,9 +52,14 @@ struct Held {
 /// A scroll area in a node body: it takes the wheel turned over it, keeps the
 /// canvas from panning with it, and scrolls itself.
 ///
-/// Pass the area configured however you like; its offset is this function's
-/// business. Anywhere egui can scroll on its own (the config overlay, say) this
-/// simply shows the area, because there is no lifted delta to apply.
+/// Pass the area configured however you like; its offset (and its wheel) is this
+/// function's business. On the canvas and the config overlay the wheel comes lifted out
+/// of the input for it ([`take_wheel_from_canvas`]). Anywhere else - a pinned widget in
+/// Easy mode's page - nothing lifts it, and egui's own scrolling can't tell the pointer
+/// is over the body either (the layer lookup, above), so a trackpad scrolled nothing
+/// there: it's read here, over the box the body took last frame while it has more than
+/// fits, and the page is told to leave it ([`keep_wheel_from_page`]). egui's own wheel
+/// handling is off, so nowhere scrolls twice.
 pub(crate) fn scrolling_body<R>(
     ui: &mut Ui,
     claimant: Id,
@@ -62,8 +67,18 @@ pub(crate) fn scrolling_body<R>(
     add_contents: impl FnOnce(&mut Ui) -> R,
 ) -> egui::scroll_area::ScrollAreaOutput<R> {
     let offset_key = here(ui.ctx(), claimant).with("offset");
-    let wheel = take_claimed_wheel(ui.ctx(), claimant);
-    let mut area = area;
+    let box_key = here(ui.ctx(), claimant).with(("box", ui.layer_id()));
+    let mut wheel = take_claimed_wheel(ui.ctx(), claimant);
+    if wheel == Vec2::ZERO {
+        let last = ui.ctx().data(|d| d.get_temp::<(Rect, bool)>(box_key));
+        if let Some((rect, true)) = last {
+            if pointer_on(ui, rect) {
+                keep_wheel_from_page(ui.ctx());
+                wheel = ui.input(|i| i.smooth_scroll_delta);
+            }
+        }
+    }
+    let mut area = area.scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: false, ..Default::default() });
     if wheel.y != 0.0 {
         // Where we left it, plus this turn of the wheel. Over- or under-shooting
         // is fine: the area clamps the offset to its own content.
@@ -80,7 +95,19 @@ pub(crate) fn scrolling_body<R>(
     let bar = ui.style().spacing.scroll.allocated_width();
     let claimed = out.inner_rect.with_max_x(out.inner_rect.max.x + bar);
     claim_wheel(ui, claimant, claimed);
+    let more = out.content_size.y > out.inner_rect.height() + 0.5;
+    ui.ctx().data_mut(|d| d.insert_temp(box_key, (claimed, more)));
     out
+}
+
+/// Whether the pointer is on `rect` of `ui`'s layer as it's drawn - zoomed and panned on the
+/// canvas, scaled in Easy mode - and in view.
+pub(crate) fn pointer_on(ui: &Ui, rect: Rect) -> bool {
+    let visible = rect.intersect(ui.clip_rect());
+    ui.ctx()
+        .pointer_latest_pos()
+        .map(|p| ui.ctx().layer_transform_from_global(ui.layer_id()).map_or(p, |t| t * p))
+        .is_some_and(|p| visible.contains(p))
 }
 
 /// How far the wheel turned this frame, for a value under the pointer (a knob, a fader) to
@@ -163,7 +190,7 @@ pub(crate) fn take_wheel_from_canvas(ctx: &Context) {
 }
 
 /// What the canvas lifted for this body this frame, taken so it is used once.
-fn take_claimed_wheel(ctx: &Context, claimant: Id) -> Vec2 {
+pub(crate) fn take_claimed_wheel(ctx: &Context, claimant: Id) -> Vec2 {
     let key = here(ctx, claimant);
     let held = ctx.data(|d| d.get_temp::<Held>(Id::new(HELD)))
         .filter(|h| h.claimant == key);

@@ -5438,3 +5438,143 @@ fn a_wire_drawn_out_of_a_taken_input_merges_with_room_for_another() {
     assert!(rig.canvas.snarl.nodes_ids_data().all(|(_, n)| n.value.module_id != "math.add"), "undo took the Add back out");
     assert_eq!(rig.canvas.snarl.in_pin(target).remotes, vec![k_out]);
 }
+
+/// A JSM Config with more tabs than its width holds and the last one in front: the strip
+/// scrolls to show it and the `+` after it (the `+` was left off the end), and the tab in
+/// front sits on the editor with no gap between them (the row's spacing left one).
+/// A JSM Config 340 points wide with eight tabs, the last in front: more than fit.
+fn jsm_with_many_tabs() -> (Rig, NodeId) {
+    let (mut rig, ids) = Rig::real("module.jsm", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    let tabs: Vec<serde_json::Value> = ["main", "CC stuff example", "config", "config2", "config3", "aiming", "driving", "menus"]
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "text": "" }))
+        .collect();
+    if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+        node.params.insert("ui_w".into(), serde_json::json!(340));
+        node.params.insert("jsm_tabs".into(), serde_json::Value::Array(tabs));
+        node.params.insert("jsm_active_tab".into(), serde_json::json!(7));
+    }
+    rig.idle(10);
+    (rig, n)
+}
+
+/// The tab in front and the editor under it (graph space), as last painted: both filled as
+/// a code editor is, the tab with only its top corners rounded.
+fn jsm_front_tab_and_editor(rig: &Rig) -> (egui::Rect, egui::Rect) {
+    let back = rig.to_global.inverse();
+    let fill = rig.ctx.style().visuals.extreme_bg_color;
+    let filled: Vec<(egui::Rect, egui::CornerRadius)> = rig
+        .shapes
+        .iter()
+        .filter_map(|cs| match &cs.shape {
+            egui::epaint::Shape::Rect(r) if r.fill == fill => Some((back * r.rect, r.corner_radius)),
+            _ => None,
+        })
+        .collect();
+    let tab = filled.iter().find(|(_, c)| c.nw > 0 && c.nw == c.ne && c.sw == 0).map(|(r, _)| *r).expect("the front tab");
+    let editor = filled
+        .iter()
+        .filter(|(r, c)| c.nw == c.sw && r.top() >= tab.top())
+        .map(|(r, _)| *r)
+        .max_by(|a, b| a.area().total_cmp(&b.area()))
+        .expect("the editor");
+    (tab, editor)
+}
+
+#[test]
+fn the_jsm_tab_in_front_sits_on_the_editor_and_shows_the_plus() {
+    let (rig, _) = jsm_with_many_tabs();
+    let back = rig.to_global.inverse();
+    // The `+`: its across stroke, 8 points long (the shapes are on screen, at the rig's
+    // zoom), shown only where its clip lets it be.
+    let zoom = rig.to_global.scaling;
+    let plus = rig.shapes.iter().find_map(|cs| match &cs.shape {
+        egui::epaint::Shape::LineSegment { points: [a, b], stroke }
+            if (a.y - b.y).abs() < 0.01
+                && ((b.x - a.x).abs() / zoom - 8.0).abs() < 0.1
+                && (stroke.width / zoom - 1.3).abs() < 0.01 =>
+        {
+            Some((back * egui::pos2((a.x + b.x) * 0.5, a.y), back * cs.clip_rect))
+        }
+        _ => None,
+    });
+    let (plus, clip) = plus.expect("the + was drawn");
+    assert!(clip.contains(plus), "the + is off the end of the strip: {plus:?} outside {clip:?}");
+    let (tab, editor) = jsm_front_tab_and_editor(&rig);
+    assert!((editor.top() - tab.bottom()).abs() < 0.6, "a gap under the tab: {tab:?} over {editor:?}");
+    // No bar until the pointer is on the tabs: they keep the strip's whole height.
+    assert!(tab.height() > 20.0, "the tabs were squashed: {tab:?}");
+}
+
+/// The JSM tabs' scroll bar is the patch tabs': nothing until the pointer is on the tabs,
+/// then a bar over their bottom edge, and a drag along it carries the tabs. A click low on a
+/// tab, where the bar is, still picks the tab.
+#[test]
+fn the_jsm_tab_scroll_bar_shows_on_the_tabs_and_drags_them() {
+    let (mut rig, n) = jsm_with_many_tabs();
+    let (tab, editor) = jsm_front_tab_and_editor(&rig);
+    let zoom = rig.to_global.scaling;
+    // A bar: a flat shape lying along the strip's bottom edge, the editor's width or less -
+    // not the editor's own colour, which opens its frame under the front tab.
+    let opaque = rig.ctx.style().visuals.extreme_bg_color;
+    let bars = |rig: &Rig| {
+        let back = rig.to_global.inverse();
+        rig.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Rect(r) if r.fill != opaque => Some(back * r.rect),
+                _ => None,
+            })
+            .filter(|r| r.height() <= 8.0 && r.width() >= 12.0 && (r.bottom() - tab.bottom()).abs() < 1.0)
+            .count()
+    };
+    assert_eq!(bars(&rig), 0, "a bar with the pointer away");
+    let over = rig.to_global * egui::pos2(tab.center().x, tab.top() + 4.0);
+    rig.frame(vec![egui::Event::PointerMoved(over)]);
+    rig.idle(12);
+    assert!(bars(&rig) > 0, "no bar with the pointer on the tabs");
+
+    // Scrolled to the end, the handle is at the right: drag it left, the tabs follow.
+    let x_of = |rig: &Rig, name: &str| rig.painted_text(name).map(|(_, r)| r.left()).expect("drawn");
+    let before = x_of(&rig, "config2");
+    rig.drag(egui::pos2(editor.right() - 6.0, tab.bottom() - 1.0), egui::vec2(-120.0, 0.0));
+    let after = x_of(&rig, "config2");
+    assert!(after > before + 20.0, "the tabs didn't follow the bar: {before} -> {after}");
+
+    // A click low on a tab picks it.
+    let (_, config3) = rig.painted_text("config3").expect("drawn");
+    rig.click(egui::pos2(config3.center().x, tab.bottom() - 2.0));
+    rig.idle(3);
+    let active = rig.canvas.snarl.get_node(n).and_then(|d| d.params.get("jsm_active_tab")).and_then(|v| v.as_u64());
+    assert_eq!(active, Some(4), "the click went to the bar, not the tab (zoom {zoom})");
+}
+
+/// A trackpad's two-finger scroll over the JSM tabs - as the wheel, either way - runs along
+/// them, as it does along the patch tabs; the canvas stays where it is.
+#[test]
+fn the_wheel_over_the_jsm_tabs_scrolls_them() {
+    let (mut rig, _) = jsm_with_many_tabs();
+    let (tab, _) = jsm_front_tab_and_editor(&rig);
+    let x_of = |rig: &Rig, name: &str| rig.painted_text(name).map(|(_, r)| r.left()).expect("drawn");
+    let over = rig.to_global * egui::pos2(tab.center().x - 60.0, tab.center().y);
+    let wheel = |delta: egui::Vec2| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta, modifiers: Default::default() };
+    rig.frame(vec![egui::Event::PointerMoved(over)]);
+    rig.idle(2);
+    for delta in [egui::vec2(0.0, 30.0), egui::vec2(30.0, 0.0)] {
+        let before = x_of(&rig, "config2");
+        let pan = rig.to_global.translation;
+        for _ in 0..4 {
+            rig.frame(vec![egui::Event::PointerMoved(over), wheel(delta)]);
+        }
+        rig.idle(6);
+        let after = x_of(&rig, "config2");
+        assert!(after > before + 10.0, "{delta:?}: the tabs didn't scroll ({before} -> {after})");
+        assert_eq!(rig.to_global.translation, pan, "{delta:?}: the canvas panned");
+        // Back to the end for the next way.
+        for _ in 0..8 {
+            rig.frame(vec![egui::Event::PointerMoved(over), wheel(-delta)]);
+        }
+        rig.idle(6);
+    }
+}

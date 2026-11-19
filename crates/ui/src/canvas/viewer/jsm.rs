@@ -913,7 +913,11 @@ fn jsm_rows(
     }
 
     let strip = ui.allocate_exact_size(egui::vec2(size.x, BAR_H), egui::Sense::hover()).0;
-    changed |= tab_strip(ui, node_id, strip, &mut tabs, &mut active);
+    let (tabs_changed, front_tab) = tab_strip(ui, node_id, strip, &mut tabs, &mut active);
+    changed |= tabs_changed;
+    // The editor right under the tabs, so the one in front sits on it. The row's spacing
+    // left a band of the body's colour between them, and the tab floated.
+    ui.add_space(-ui.spacing().item_spacing.y);
 
     // ── the editor, on its own row ───────────────────────────────────────────
     // Compiled against every tab, so a line that switches layers can be checked:
@@ -951,7 +955,10 @@ fn jsm_rows(
     } else {
         0.0
     };
-    let body_left = (size.y - used - SUMMARY_H - list_want).max(0.0);
+    // The line of counts under the editor takes its room only when there's something to count.
+    let (errors, pending, ignored) = compiled.summary();
+    let summary_h = if errors + pending + ignored > 0 { SUMMARY_H } else { 0.0 };
+    let body_left = (size.y - used - summary_h - list_want).max(0.0);
     let (mut rows, mut strip_h) = split_body(body_left, line_h, strip_want);
     // The bar between the editor and the strip, once it has been dragged: the editor's
     // share of what the two have between them.
@@ -976,6 +983,10 @@ fn jsm_rows(
     // The same in a node, now that a node's body has the size its grip gave it rather than
     // growing to fit: a strip with more faders than room scrolls there too.
     let strip_budget = knobs_on.then_some(strip_h);
+    // How tall the editor is: whole lines over a strip below it (the strip takes what's
+    // left), and with nothing below it, all of what's left - it used to stop at its last
+    // whole line, short of a strip beside it by up to a line.
+    let editor_h = if knobs_on { rows as f32 * line_h } else { body_left.max(rows as f32 * line_h) };
     let statuses: Vec<_> = compiled.lines.iter().map(|l| l.status.clone()).collect();
     // Where the pad is, if it is driving this editor. A byte range rather than a
     // line, so the highlight covers exactly the token the buttons would act on.
@@ -1084,12 +1095,16 @@ fn jsm_rows(
     // tall as the text, so its bottom edge was wherever the scrolling cut it, and its right
     // edge was under the scrollbar, which stood outside it.
     let plate_idx = ui.painter().add(egui::Shape::Noop);
+    // The text stops at the editor's edge. egui lets a scroll area's contents run a few points
+    // past it, which ran them into the tab strip now that the editor is right under it.
+    ui.visuals_mut().clip_rect_margin = 0.0;
     let editor = crate::canvas::wheel::scrolling_body(
         ui,
         wheel_id,
         egui::ScrollArea::vertical()
             .id_salt(("jsm_editor", node_id.0))
-            .max_height(rows as f32 * line_h)
+            .max_height(editor_h)
+            .auto_shrink([true, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible),
         |ui| {
             // Tab cycles the setting value under the caret, before the editor
@@ -1151,6 +1166,23 @@ fn jsm_rows(
             plate_idx,
             egui::epaint::RectShape::new(editor_rect, 2.0, v.extreme_bg_color, stroke, egui::StrokeKind::Inside),
         );
+        // The tab in front is the top of the editor: outlined in the editor's frame, and open
+        // where the two meet - the frame's top edge doesn't run under it.
+        if let Some(tab) = front_tab {
+            let clip = strip.with_max_y(editor_rect.top() + stroke.width + 1.0).intersect(ui.clip_rect());
+            let painter = ui.painter().with_clip_rect(clip);
+            let top = egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 };
+            painter.rect_stroke(tab, top, stroke, egui::StrokeKind::Inside);
+            let w = stroke.width;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(tab.left() + w, tab.bottom() - w),
+                    egui::pos2(tab.right() - w, editor_rect.top() + w),
+                ),
+                0.0,
+                v.extreme_bg_color,
+            );
+        }
     }
     mark_pane(ui, node_id, editor_rect, crate::gamepad_nav::JsmPane::Text);
     let caret = editor.inner.cursor_range.map(|r| r.primary.index);
@@ -1288,7 +1320,6 @@ fn jsm_rows(
     }
 
     // ── what the parser made of it ───────────────────────────────────────────
-    let (errors, pending, ignored) = compiled.summary();
     if errors + pending + ignored > 0 {
         ui.horizontal_wrapped(|ui| {
             if errors > 0 {
@@ -1373,25 +1404,69 @@ fn jsm_rows(
 /// The config tabs, drawn the way the app's own tab bar draws its tabs: a rounded top on the
 /// one in front, filled with the editor's own colour so it reads as the top of the editor
 /// under it; a hairline between the others; `+` after the last. When there are more than
-/// fit the strip scrolls, and each end that has more beyond it fades out. Returns whether
-/// the tabs or the choice of tab changed.
-fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Vec<JsmTab>, active: &mut usize) -> bool {
-    let h = rect.height();
+/// fit the strip scrolls - a bar over the bottom of the tabs as the patch tabs have
+/// (`tab_scroll_bar`), the wheel over it - and each end that has more beyond it fades out. Returns whether the tabs or the choice of tab changed, and
+/// where the tab in front is (the part of it in view), for the editor to join it to its frame.
+fn tab_strip(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    rect: egui::Rect,
+    tabs: &mut Vec<JsmTab>,
+    active: &mut usize,
+) -> (bool, Option<egui::Rect>) {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let v = ui.visuals().clone();
-    let seen_id = egui::Id::new(("jsm_tab_seen", node_id.0, ui.layer_id()));
+    let layer = ui.layer_id();
+    let here = move |what: &str| egui::Id::new(("jsm_tab_strip", what, node_id.0, layer));
+    let seen_id = here("seen");
     // The tab in front is brought into view when it changes - the pad's triggers walk the
     // tabs, and a tab picked that way may be off either end.
     let follow = ui.ctx().data(|d| d.get_temp::<usize>(seen_id)) != Some(*active);
     ui.ctx().data_mut(|d| d.insert_temp(seen_id, *active));
+    let (offset_id, goto_id) = (here("offset"), here("goto"));
+    let tabs_rect = rect;
+    let h = tabs_rect.height();
+    // Where to put the strip this frame: where the bar was dragged or clicked to, or where
+    // the wheel turned over it took it (up or left is towards the first tab).
+    // On the canvas (and the overlay) the wheel turned over the strip is lifted out of the
+    // input for it before the canvas can pan with it (`claim_wheel` below). Anywhere else -
+    // Easy mode's page - nothing lifts it, and egui's own scroll area can't tell the pointer
+    // is on the strip, so a trackpad's scroll did nothing there: it's read here, and the page
+    // is told to leave it. Only while there are more tabs than fit (as last drawn).
+    let wheel_id = here("wheel");
+    let overflow_id = here("overflow");
+    let overflowed = ui.ctx().data(|d| d.get_temp::<bool>(overflow_id)).unwrap_or(false);
+    let on_strip = overflowed && crate::canvas::wheel::pointer_on(ui, rect);
+    if on_strip {
+        crate::canvas::wheel::keep_wheel_from_page(ui.ctx());
+    }
+    let lifted = crate::canvas::wheel::take_claimed_wheel(ui.ctx(), wheel_id);
+    let wheel = if lifted != egui::Vec2::ZERO {
+        lifted
+    } else if on_strip {
+        ui.input(|i| i.smooth_scroll_delta)
+    } else {
+        egui::Vec2::ZERO
+    };
+    let last = ui.ctx().data(|d| d.get_temp::<f32>(offset_id)).unwrap_or(0.0);
+    let goto = ui.ctx().data_mut(|d| d.remove_temp::<f32>(goto_id));
+    let to = goto.or_else(|| (wheel.x + wheel.y != 0.0).then(|| last - wheel.x - wheel.y));
     let (mut switch, mut close, mut add) = (None, None, false);
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("jsm_tabs", node_id.0)));
-    child.set_clip_rect(rect.intersect(ui.clip_rect()));
-    let out = egui::ScrollArea::horizontal()
+    let mut front_rect = None;
+    // Where each tab is (`None`: the `+`), for a click on the scroll bar over them.
+    let mut spots: Vec<(egui::Rect, Option<usize>)> = Vec::new();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(tabs_rect).id_salt(("jsm_tabs", node_id.0)));
+    child.set_clip_rect(tabs_rect.intersect(ui.clip_rect()));
+    let mut area = egui::ScrollArea::horizontal()
         .id_salt(("jsm_tab_scroll", node_id.0))
         .auto_shrink([false, false])
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .show(&mut child, |ui| {
+        // The wheel is handled above, the bar below: egui's own would only scroll twice.
+        .scroll_source(egui::scroll_area::ScrollSource { mouse_wheel: false, scroll_bar: false, drag: true });
+    if let Some(x) = to {
+        area = area.horizontal_scroll_offset(x.max(0.0));
+    }
+    let out = area.show(&mut child, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let count = tabs.len();
@@ -1436,11 +1511,18 @@ fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Ve
                             egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color),
                         );
                     }
-                    if front && follow {
-                        resp.scroll_to_me(None);
+                    if front {
+                        front_rect = Some(r);
                     }
+                    spots.push((r, Some(i)));
                 }
                 let (pr, plus) = ui.allocate_exact_size(egui::vec2(22.0, h), egui::Sense::click());
+                spots.push((pr, None));
+                // The tab in front brought into view - and with it the `+`, when it's the last:
+                // a new tab is added from there, and it was left off the end.
+                if let (true, Some(f)) = (follow, front_rect) {
+                    ui.scroll_to_rect(if *active + 1 == count { f.union(pr) } else { f }, None);
+                }
                 let plus = plus.on_hover_text("Add a config tab");
                 if plus.hovered() {
                     ui.painter().rect_filled(pr, egui::CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, v.widgets.hovered.bg_fill);
@@ -1454,13 +1536,22 @@ fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Ve
     // More tabs beyond an end: that end fades into the body's own colour.
     let hidden = (out.content_size.x - out.inner_rect.width()).max(0.0);
     let at = out.state.offset.x;
+    ui.ctx().data_mut(|d| d.insert_temp(offset_id, at));
+    let overflows = hidden > 0.5;
+    if overflows != overflowed {
+        ui.ctx().data_mut(|d| d.insert_temp(overflow_id, overflows));
+    }
+    if overflows {
+        // The wheel over the strip runs along it rather than panning the canvas.
+        crate::canvas::wheel::claim_wheel(ui, wheel_id, rect);
+    }
     let (solid, clear) = (v.window_fill(), v.window_fill().gamma_multiply(0.0));
     let fade = |x0: f32, x1: f32, left: egui::Color32, right: egui::Color32| {
         let mut mesh = egui::Mesh::default();
-        mesh.colored_vertex(egui::pos2(x0, rect.top()), left);
-        mesh.colored_vertex(egui::pos2(x1, rect.top()), right);
-        mesh.colored_vertex(egui::pos2(x1, rect.bottom()), right);
-        mesh.colored_vertex(egui::pos2(x0, rect.bottom()), left);
+        mesh.colored_vertex(egui::pos2(x0, tabs_rect.top()), left);
+        mesh.colored_vertex(egui::pos2(x1, tabs_rect.top()), right);
+        mesh.colored_vertex(egui::pos2(x1, tabs_rect.bottom()), right);
+        mesh.colored_vertex(egui::pos2(x0, tabs_rect.bottom()), left);
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
         ui.painter().with_clip_rect(rect).add(mesh);
@@ -1471,6 +1562,19 @@ fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Ve
     }
     if at < hidden - 0.5 {
         fade(rect.right() - FADE, rect.right(), clear, solid);
+    }
+    let seen = out.inner_rect.width() / out.content_size.x.max(1.0);
+    if overflows {
+        match tab_scroll_bar(ui, rect, here("bar"), here("shown"), here("wide"), at, hidden, seen) {
+            Some(BarAnswer::Scroll(x)) => ui.ctx().data_mut(|d| d.insert_temp(goto_id, x)),
+            // A click on the bar is a click on the tab under it.
+            Some(BarAnswer::Click(x)) => match spots.iter().find(|(r, _)| r.x_range().contains(x)) {
+                Some((_, Some(i))) if *i != *active => switch = Some(*i),
+                Some((_, None)) => add = true,
+                _ => {}
+            },
+            None => {}
+        }
     }
 
     let mut changed = false;
@@ -1488,7 +1592,87 @@ fn tab_strip(ui: &mut egui::Ui, node_id: NodeId, rect: egui::Rect, tabs: &mut Ve
         *active = tabs.len() - 1;
         changed = true;
     }
-    changed
+    let front = front_rect.map(|r| r.intersect(tabs_rect)).filter(|r| r.width() > 1.0);
+    (changed, front)
+}
+
+/// The scroll bar of the config tabs when there are more than fit: the one the patch tabs
+/// have - egui's floating bar, over the bottom of the tabs, there only while the pointer is
+/// on them, thin until the pointer reaches it - drawn here because egui's own can't tell the
+/// pointer is over a strip on the canvas (the layer lookup it asks only knows windows), so on
+/// the canvas it never showed. It takes no room from the tabs. `at` is how far the tabs are
+/// scrolled of the `hidden` that doesn't fit, `seen` the share of them in view. Returns where
+/// a drag takes them, or where a click that wasn't a drag landed: that's a click on the tab
+/// under the bar (egui gives a click to nothing under a widget on top that takes drags).
+#[allow(clippy::too_many_arguments)]
+fn tab_scroll_bar(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    bar_id: egui::Id,
+    shown_id: egui::Id,
+    wide_id: egui::Id,
+    at: f32,
+    hidden: f32,
+    seen: f32,
+) -> Option<BarAnswer> {
+    let sc = ui.spacing().scroll;
+    let v = ui.visuals();
+    let visible = rect.intersect(ui.clip_rect());
+    // Where the pointer is, in this layer: a strip on the canvas is drawn zoomed and panned.
+    let pointer = ui.ctx().pointer_latest_pos().map(|p| {
+        ui.ctx().layer_transform_from_global(ui.layer_id()).map_or(p, |t| t * p)
+    });
+    let dragging = ui.ctx().is_being_dragged(bar_id);
+    // As wide as the patch tabs' bar at its widest, but no more than a third of the strip:
+    // the tab names are above it.
+    let widest = sc.bar_width.min(rect.height() / 3.0);
+    let zone = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - sc.bar_outer_margin - widest),
+        egui::pos2(rect.right(), rect.bottom() - sc.bar_outer_margin),
+    );
+    let on_strip = dragging || pointer.is_some_and(|p| visible.contains(p));
+    let on_bar = dragging || pointer.is_some_and(|p| visible.contains(p) && zone.contains(p));
+    let shown = ui.ctx().animate_bool_responsive(shown_id, on_strip);
+    let wide = ui.ctx().animate_bool_responsive(wide_id, on_bar);
+    if shown <= 0.0 {
+        return None;
+    }
+    let track = zone.with_min_y(zone.bottom() - egui::lerp(sc.floating_width..=widest, wide));
+    let thumb_w = (track.width() * seen.clamp(0.0, 1.0)).max(sc.handle_min_length).min(track.width());
+    let room = (track.width() - thumb_w).max(1.0);
+    let thumb_x = track.left() + room * (at / hidden.max(1.0)).clamp(0.0, 1.0);
+    let thumb = egui::Rect::from_min_size(egui::pos2(thumb_x, track.top()), egui::vec2(thumb_w, track.height()));
+    let bar = ui.interact(zone, bar_id, egui::Sense::click_and_drag());
+    let style = if bar.is_pointer_button_down_on() {
+        &v.widgets.active
+    } else if on_bar {
+        &v.widgets.hovered
+    } else {
+        &v.widgets.inactive
+    };
+    let (background, handle) = if on_bar {
+        (sc.interact_background_opacity, sc.interact_handle_opacity)
+    } else {
+        (sc.active_background_opacity * shown, sc.active_handle_opacity * shown)
+    };
+    let painter = ui.painter().with_clip_rect(visible);
+    painter.rect_filled(track, style.corner_radius, v.extreme_bg_color.gamma_multiply(background));
+    painter.rect_filled(thumb, style.corner_radius, style.fg_stroke.color.gamma_multiply(handle));
+    if bar.dragged() && bar.drag_delta().x != 0.0 {
+        ui.ctx().request_repaint();
+        return Some(BarAnswer::Scroll((at + bar.drag_delta().x * hidden / room).clamp(0.0, hidden)));
+    }
+    if bar.clicked() {
+        return bar.interact_pointer_pos().map(|p| BarAnswer::Click(p.x));
+    }
+    None
+}
+
+/// What the config tabs' scroll bar was asked: to take the tabs this far along, or a click at
+/// this x for the tab under it.
+enum BarAnswer {
+    Scroll(f32),
+    Click(f32),
 }
 
 /// The bar between the editor and the tuning strip: this thick, dragged to share the body
@@ -1836,6 +2020,190 @@ pub(crate) fn write_tabs(snarl: &mut Snarl<NodeData>, node_id: NodeId, tabs: &[J
         .collect();
     node.params.insert("jsm_tabs".into(), Value::Array(arr));
     node.params.insert("jsm_active_tab".into(), Value::from(active as u64));
+}
+
+#[cfg(test)]
+mod pinned_body_tests {
+    use super::show_jsm_body_sized;
+    use crate::canvas::node::NodeData;
+    use egui_snarl::{NodeId, Snarl};
+
+    /// Where the pinned body goes, and how big it is.
+    const AT: egui::Pos2 = egui::pos2(20.0, 20.0);
+    const SIZE: egui::Vec2 = egui::vec2(700.0, 400.0);
+
+    struct Pin {
+        ctx: egui::Context,
+        snarl: Snarl<NodeData>,
+        node: NodeId,
+        shapes: Vec<egui::epaint::ClippedShape>,
+    }
+
+    impl Pin {
+        fn new(params: serde_json::Value) -> Self {
+            let desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == "module.jsm")
+                .expect("registered");
+            let mut snarl = Snarl::new();
+            let node = snarl.insert_node(egui::Pos2::ZERO, NodeData::from(&desc));
+            if let (Some(n), serde_json::Value::Object(extra)) = (snarl.get_node_mut(node), params) {
+                n.params.extend(extra);
+            }
+            let mut pin = Self { ctx: egui::Context::default(), snarl, node, shapes: Vec::new() };
+            pin.idle(4);
+            pin
+        }
+
+        /// One frame of the body pinned at `AT`, `SIZE` big, off any canvas - as Easy mode's
+        /// page draws it.
+        fn frame(&mut self, events: Vec<egui::Event>) {
+            let raw = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let Self { ctx, snarl, node, .. } = self;
+            let live = std::collections::HashMap::new();
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = egui::Rect::from_min_size(AT, SIZE);
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        show_jsm_body_sized(*node, ui, snarl, SIZE, &live, None, None);
+                    });
+                });
+            });
+            self.shapes = out.shapes;
+        }
+
+        fn idle(&mut self, frames: usize) {
+            for _ in 0..frames {
+                self.frame(vec![]);
+            }
+        }
+
+        /// The editor's plate: the biggest thing filled as a code editor is, all four
+        /// corners alike (the tab in front has only its top ones rounded).
+        fn editor(&self) -> egui::Rect {
+            let fill = self.ctx.style().visuals.extreme_bg_color;
+            self.shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Rect(r) if r.fill == fill && r.corner_radius.nw == r.corner_radius.sw => Some(r.rect),
+                    _ => None,
+                })
+                .max_by(|a, b| a.area().total_cmp(&b.area()))
+                .expect("the editor")
+        }
+
+        /// The editor's text as drawn: where it is, and what it's clipped to.
+        fn text(&self) -> (egui::Pos2, egui::Rect) {
+            self.shapes
+                .iter()
+                .find_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text().starts_with("LINE_0") => Some((t.pos, cs.clip_rect)),
+                    _ => None,
+                })
+                .expect("the editor's text")
+        }
+    }
+
+    fn long_config() -> String {
+        (0..60).map(|i| format!("LINE_{i} = {i}\n")).collect()
+    }
+
+    // Pinned with the faders beside it, the editor runs the whole height the pin has, as the
+    // fader column does. It stopped short by a line it couldn't fit whole and the room for a
+    // line of counts under it that wasn't there.
+    #[test]
+    fn a_pinned_editor_runs_down_beside_the_faders() {
+        let pin = Pin::new(serde_json::json!({
+            "jsm_show_knobs": true,
+            "jsm_knob_side": "left",
+            "jsm_tabs": [{ "name": "main", "text": "MIN_GYRO_SENS = 5\nMAX_GYRO_SENS = 5\nGYRO_SMOOTH_TIME = 0.14\n" }],
+        }));
+        let editor = pin.editor();
+        let bottom = AT.y + SIZE.y;
+        assert!((editor.bottom() - bottom).abs() < 2.0, "the editor stops at {} of {bottom}", editor.bottom());
+    }
+
+    // Off the canvas - Easy mode's page - the wheel (a trackpad's scroll) over a config longer
+    // than the editor scrolls it, and the page is told to leave it; and the text, scrolled,
+    // stays inside the editor rather than showing over the tabs above it.
+    #[test]
+    fn a_pinned_editor_scrolls_with_the_wheel_and_keeps_its_text_inside() {
+        let mut pin = Pin::new(serde_json::json!({
+            "jsm_tabs": [{ "name": "main", "text": long_config() }],
+        }));
+        let editor = pin.editor();
+        let (start, _) = pin.text();
+        let over = editor.center();
+        let mut page_left_it = false;
+        for frame in 0..12 {
+            let mut events = vec![egui::Event::PointerMoved(over)];
+            if frame < 4 {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -40.0),
+                    modifiers: Default::default(),
+                });
+            }
+            pin.frame(events);
+            page_left_it |= crate::canvas::wheel::widget_has_wheel(&pin.ctx);
+        }
+        let (now, clip) = pin.text();
+        assert!(now.y < start.y - 40.0, "the editor didn't scroll: {start:?} -> {now:?}");
+        assert!(page_left_it, "the page would have scrolled too");
+        let editor = pin.editor();
+        assert!(clip.top() >= editor.top() - 0.5, "the text shows above the editor: clip {clip:?}, editor {editor:?}");
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_tests {
+    use super::{tab_strip, JsmTab};
+
+    // Off the canvas - Easy mode's page, where nothing lifts the wheel out of the input for
+    // the strip - a trackpad's scroll over more tabs than fit runs along them all the same,
+    // either way it's turned, and the page is told to leave it.
+    #[test]
+    fn the_wheel_runs_along_the_tabs_off_the_canvas_too() {
+        for delta in [egui::vec2(0.0, -30.0), egui::vec2(-30.0, 0.0)] {
+            let ctx = egui::Context::default();
+            let mut tabs: Vec<JsmTab> =
+                (0..10).map(|i| JsmTab { name: format!("config{i}"), text: String::new() }).collect();
+            let mut active = 0usize;
+            let rect = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(200.0, 22.0));
+            let node = egui_snarl::NodeId(0);
+            let offset_id = egui::Id::new(("jsm_tab_strip", "offset", node.0, egui::LayerId::background()));
+            let mut page_left_it = false;
+            for frame in 0..14 {
+                let mut events = vec![egui::Event::PointerMoved(egui::pos2(100.0, 30.0))];
+                if (3..7).contains(&frame) {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: Default::default(),
+                    });
+                }
+                let raw = egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = tab_strip(ui, node, rect, &mut tabs, &mut active);
+                    });
+                    page_left_it |= crate::canvas::wheel::widget_has_wheel(ctx);
+                });
+            }
+            let offset = ctx.data(|d| d.get_temp::<f32>(offset_id)).unwrap_or(0.0);
+            assert!(offset > 20.0, "{delta:?}: the tabs didn't scroll ({offset})");
+            assert!(page_left_it, "{delta:?}: the page would have scrolled too");
+        }
+    }
 }
 
 #[cfg(test)]
