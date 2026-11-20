@@ -1001,9 +1001,32 @@ pub(crate) fn show_controller3d_body(
         let mut xray_pct =
             c3d_xray_visible(snarl, node_id).unwrap_or(crate::model::callback::GHOST_VIS_LOW) * 100.0;
 
-        // The rows are drawn at the width the surface was given, so the viewport and the
-        // settings end on the same edge and the corner grip means what it says.
-        let w = surface.size.x;
+        // Wide enough, the settings go in a column of their own on the left and the viewport
+        // beside them, as tall as the module (or the settings, if they're taller), a bar
+        // between the two sharing the width out. Narrower, the viewport is under the rows.
+        let rows_min = C3D_WIDEST_GROUP.max(C3D_PICKER_W);
+        let wide = super::kit::beside(snarl, node_id, surface.size.x, rows_min, 160.0, "view_frac", 0.55);
+        let top_left = ui.cursor().min;
+        let mut columns = wide.map(|b| {
+            let mut col = |x: f32, cw: f32| {
+                ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(egui::Rect::from_min_size(egui::pos2(top_left.x + x, top_left.y), egui::vec2(cw, 1.0e5)))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                )
+            };
+            let left = col(0.0, b.left_w);
+            let right = col(b.left_w + super::kit::BESIDE_BAR_W, b.right_w);
+            (b, left, right)
+        });
+        let parent: &mut egui::Ui = ui;
+        let ui: &mut egui::Ui = match columns.as_mut() {
+            Some((_, left, _)) => left,
+            None => &mut *parent,
+        };
+        // The rows are drawn at the width the surface was given - or their column's - so the
+        // viewport and the settings end on the same edge and the corner grip means what it says.
+        let w = wide.map_or(surface.size.x, |b| b.left_w);
         // Bound the flow to that width. A ComboBox, a fold and a grid of swatches each fill
         // whatever room they are handed, which is the frame as it was the frame before - so
         // without this the module can be dragged wider and never narrower.
@@ -1341,9 +1364,14 @@ pub(crate) fn show_controller3d_body(
             surface.need(C3D_WIDEST_GROUP.max(C3D_PICKER_W));
         }
 
-        // The viewport: what the frame leaves under the rows. It had a grip of its own in
-        // its corner and a size kept in egui's memory rather than in the patch.
-        let size = [surface.size.x, surface.size.y];
+        // The viewport: what the frame leaves under the rows - or beside them, their column's
+        // height or the module's, whichever is more. It had a grip of its own in its corner
+        // and a size kept in egui's memory rather than in the patch.
+        let rows_h = ui.min_rect().height();
+        let (ui, size): (&mut egui::Ui, [f32; 2]) = match columns.as_mut() {
+            Some((b, _, right)) => (right, [b.right_w, rows_h.max(body_h - 4.0).max(60.0)]),
+            None => (&mut *parent, [surface.size.x, surface.size.y]),
+        };
         let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(size[0], size[1]));
         // Reserve the full rect for layout so the node keeps a stable size (the
         // painter/callback don't allocate). The body always renders with default
@@ -1371,7 +1399,21 @@ pub(crate) fn show_controller3d_body(
         );
         // Expose the viewport so it can be pinned to a sub-patch layout / overlay.
         register_exposable_element(ui, node_id, "viewer", rect);
+        super::simple_bodies::trace_rect(ui, node_id, "c3d_view", rect);
 
-        surface.end(ui);
+        // Side by side, the body takes in both columns, with the bar between them; the
+        // surface's own sizing is the stacked layout's, so it measures this as all rows.
+        if let Some((b, left, right)) = columns {
+            let both = left.min_rect().union(right.min_rect());
+            parent.allocate_rect(both, egui::Sense::hover());
+            let bar = egui::Rect::from_min_size(
+                egui::pos2(top_left.x + b.left_w, top_left.y),
+                egui::vec2(super::kit::BESIDE_BAR_W, both.height()),
+            );
+            super::kit::beside_bar(parent, snarl, node_id, b, bar, "Drag to share the width between the settings and the view. Double-click to reset.");
+            surface.end_folded(parent);
+        } else {
+            surface.end(parent);
+        }
     });
 }

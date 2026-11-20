@@ -215,6 +215,24 @@ pub(crate) fn show_gyro_3dof_body(
         let band = super::curve_rows::band_h(ui);
         let ctrl = band - 4.0;
 
+        // Wide enough, the preview goes in a column of its own on the left, as tall as the
+        // module, and the settings in a column beside it (the Lean lists, the widest of them,
+        // set how narrow it gets), a bar between the two sharing the width out. Wider still,
+        // the Lean section takes a column of its own on the right, a second bar between it
+        // and the settings. Narrower, it's one column, the preview on top; folded, the
+        // preview is a heading across the top, and Lean can still go beside the settings.
+        let view_open = snarl
+            .get_node(node_id)
+            .and_then(|n| n.params.get("fold_view").and_then(|v| v.as_bool()))
+            .map_or(true, |folded| !folded);
+        let wide = if view_open {
+            super::kit::beside(snarl, node_id, w, PREVIEW_MIN_W.max(super::gyro_view::GYRO_VIEW_MIN.x), LEAN_LIST_W, "view_frac", 0.5)
+        } else {
+            None
+        };
+        let lean_beside = super::kit::beside(snarl, node_id, wide.map_or(w, |b| b.right_w), SETTINGS_MIN_W, LEAN_LIST_W, "lean_frac", 0.5);
+        let top_left = ui.cursor().min;
+
         // ── The viewport: the pose, and the 2D it becomes ───────────────────
         let view = super::gyro_view::GyroView {
             axes: super::gyro_view::GyroAxes::of(ui.visuals()),
@@ -239,15 +257,14 @@ pub(crate) fn show_gyro_3dof_body(
             frame: None,
             model_alpha,
         };
-        // Folded with the rest of the settings when it isn't wanted: the frame then is the
-        // rows alone, and the viewport gets the grip's room back when it is unfolded.
-        let view_open = super::curve_rows::section(ui, snarl, node_id, "view", "3D preview", true);
-        if view_open {
-            let (vr, _) = ui.allocate_exact_size(surface.size, egui::Sense::hover());
+        // The preview, `size` big, with how the pad is drawn in its corner.
+        let draw_preview = |ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, size: egui::Vec2| {
+            let (vr, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             super::gyro_view::draw_gyro_view(ui, node_id, vr, &view);
             // Pinnable on its own: a layout or an overlay can carry the picture of what the
             // module is doing.
             register_exposable_element(ui, node_id, "preview", vr);
+            super::simple_bodies::trace_rect(ui, node_id, "gyro_view", vr);
             // How the pad is drawn, in the preview's corner: its icon, the icon's outline,
             // or its 3D model.
             {
@@ -279,10 +296,21 @@ pub(crate) fn show_gyro_3dof_body(
                     }
                 }
             }
+        };
+        // Folded with the rest of the settings when it isn't wanted: the frame then is the
+        // rows alone, and the viewport gets the grip's room back when it is unfolded.
+        let parent: &mut egui::Ui = ui;
+        let mut view_drawn = false;
+        // One column, the preview is on top, as wide as the frame and as tall as the rows
+        // leave it, with a bar under it. Beside the rest it's drawn last, once how tall they
+        // came out is known.
+        if wide.is_none() && super::curve_rows::section(parent, snarl, node_id, "view", "3D preview", true) {
+            draw_preview(parent, snarl, surface.size);
+            view_drawn = true;
             // The bar under the preview: the preview takes what the frame leaves, so
             // dragging it grows or shrinks the frame and the preview with it.
-            let (bar, _) = ui.allocate_exact_size(egui::vec2(w, 8.0), egui::Sense::hover());
-            let (dy, _) = super::kit::resize_bar(ui, bar, ("gyro_view_bar", node_id), true,
+            let (bar, _) = parent.allocate_exact_size(egui::vec2(surface.size.x, 8.0), egui::Sense::hover());
+            let (dy, _) = super::kit::resize_bar(parent, bar, ("gyro_view_bar", node_id), true,
                 "Drag to make the preview taller or shorter.");
             if dy != 0.0 {
                 if let Some(n) = snarl.get_node_mut(node_id) {
@@ -291,7 +319,28 @@ pub(crate) fn show_gyro_3dof_body(
             }
         }
 
-
+        // The settings and the Lean section after them: in columns of their own beside the
+        // preview and each other as far as the width goes, else on down the body's one.
+        let rest_x = top_left.x + wide.map_or(0.0, |b| b.left_w + super::kit::BESIDE_BAR_W);
+        let rest_top = if wide.is_some() { top_left.y } else { parent.cursor().min.y };
+        let column = |parent: &mut egui::Ui, x: f32, y: f32, cw: f32| {
+            parent.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cw, 1.0e5)))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            )
+        };
+        let (settings_w, lean_w) = match (lean_beside, wide) {
+            (Some(lb), _) => (lb.left_w, lb.right_w),
+            (None, Some(b)) => (b.right_w, b.right_w),
+            (None, None) => (w, w),
+        };
+        let mut settings_col = (wide.is_some() || lean_beside.is_some()).then(|| column(parent, rest_x, rest_top, settings_w));
+        let mut lean_col = lean_beside.map(|lb| column(parent, rest_x + lb.left_w + super::kit::BESIDE_BAR_W, rest_top, lb.right_w));
+        let (ui, w): (&mut egui::Ui, f32) = match settings_col.as_mut() {
+            Some(c) => (c, settings_w),
+            None => (&mut *parent, w),
+        };
         let steering_on = family == "steering";
         let roll_mix_on = axis_id == "pitch_yaw";
         let pose_rows_on = orient_source != "device";
@@ -495,6 +544,20 @@ pub(crate) fn show_gyro_3dof_body(
 
         }
 
+        // Lean: in its own column on the right when there's room, else on under the settings.
+        // In a column of their own the lists are as wide as it, their cards scaled to it as
+        // the other modules' mapping columns are; else at the width cards are drawn at.
+        let list_w = if lean_col.is_some() { lean_w } else { LEAN_LIST_W };
+        let (ui, w): (&mut egui::Ui, f32) = match (lean_col.as_mut(), settings_col.as_mut()) {
+            (Some(c), _) => (c, lean_w),
+            (None, Some(c)) => (c, settings_w),
+            (None, None) => (&mut *parent, w),
+        };
+        let lay = |ui: &mut egui::Ui, mins: &[f32]| -> Vec<egui::Rect> {
+            let (cells, h) = super::curve_rows::bands(w, mins, band, 3.0 * super::kit::GAP);
+            let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            cells.into_iter().map(|c| c.translate(area.min.to_vec2())).collect()
+        };
         if super::curve_rows::section(ui, snarl, node_id, "lean", "Lean", true) {
         let cells = lay(ui, &[LEAN_W]);
         let cell = |i: usize| cells[i];
@@ -531,24 +594,68 @@ pub(crate) fn show_gyro_3dof_body(
             ("right", "lean_r", "lean_r_h", &mut lean_right_rect),
         ] {
             let rect = super::pinned::card_window(
-                ui, snarl, node_id, tag, LEAN_LIST_W, key, band,
+                ui, snarl, node_id, tag, list_w, key, band,
                 live_signals, panic_shortcut, automap_parent,
                 move |id, ins, ui, sn, sigs, panic, am| {
                     show_gyro_lean_mapping_section(id, ui, sn, side, ins, sigs, panic, am);
                 },
                 move |n: &NodeData| lean_hash(n, if side == "left" { "lean_left" } else { "lean_right" }),
                 move |n: &NodeData| lean_hash(n, if side == "left" { "_lean_left_draft" } else { "_lean_right_draft" }),
+                None,
             );
+            if side == "left" {
+                super::simple_bodies::trace_rect(ui, node_id, "gyro_lean", rect);
+            }
             *out = Some(rect);
         }
         let _ = inputs;
         }
-        // The lists are a fixed width whatever the grip asks for, so the surface is told the
-        // frame has to be at least that wide.
-        if view_open {
-            surface.end(ui);
+        // Beside the rest, the preview runs the whole height of the body: the grip's, or what
+        // the columns beside it came out at if that's more - it never squeezes in under
+        // them, and there's no bar of its own to say otherwise.
+        let rest_bottom = [settings_col.as_ref(), lean_col.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|c| c.min_rect().bottom())
+            .fold(rest_top, f32::max);
+        let preview_col = wide.map(|b| {
+            let mut col = column(parent, top_left.x, top_left.y, b.left_w);
+            if super::curve_rows::section(&mut col, snarl, node_id, "view", "3D preview", true) {
+                let bottom = rest_bottom.max(top_left.y + body_h);
+                let h = (bottom - col.cursor().min.y).max(super::gyro_view::GYRO_VIEW_MIN.y);
+                draw_preview(&mut col, snarl, egui::vec2(b.left_w, h));
+            }
+            col
+        });
+        // In columns, the body takes them all in, with the bars between them; the surface's
+        // own sizing is the stacked layout's, so beside the preview it measures all this as
+        // rows.
+        let all = [preview_col.as_ref(), settings_col.as_ref(), lean_col.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|c| c.min_rect())
+            .reduce(|a, b| a.union(b));
+        if let Some(all) = all {
+            parent.allocate_rect(all, egui::Sense::hover());
+            if let Some(b) = wide {
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(top_left.x + b.left_w, top_left.y),
+                    egui::pos2(top_left.x + b.left_w + super::kit::BESIDE_BAR_W, all.bottom()),
+                );
+                super::kit::beside_bar(parent, snarl, node_id, b, bar, "Drag to share the width between the preview and the settings. Double-click to reset.");
+            }
+            if let Some(lb) = lean_beside {
+                let bar = egui::Rect::from_min_max(
+                    egui::pos2(rest_x + lb.left_w, rest_top),
+                    egui::pos2(rest_x + lb.left_w + super::kit::BESIDE_BAR_W, all.bottom()),
+                );
+                super::kit::beside_bar(parent, snarl, node_id, lb, bar, "Drag to share the width between the settings and Lean. Double-click to reset.");
+            }
+        }
+        if wide.is_none() && view_drawn {
+            surface.end(parent);
         } else {
-            surface.end_folded(ui);
+            surface.end_folded(parent);
         }
     });
 
@@ -1030,6 +1137,11 @@ impl GyroEdge {
 /// The Lean card lists are drawn at the shared card renderer's own width whatever the grip
 /// asks for: the same cards, at the same size as their pinned copy.
 const LEAN_LIST_W: f32 = 380.0;
+/// The narrowest the preview's column gets beside the settings.
+const PREVIEW_MIN_W: f32 = 160.0;
+/// The narrowest the settings' column gets beside Lean's: the widest band of them, the
+/// Steering row's, with the mode rows' captions and icons.
+const SETTINGS_MIN_W: f32 = 300.0;
 
 /// The narrowest each group of pills reads at. `bands` shares the rest of a band among the
 /// groups in it, so these are floors rather than fixed widths.

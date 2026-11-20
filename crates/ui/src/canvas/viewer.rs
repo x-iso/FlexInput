@@ -232,6 +232,48 @@ pub fn node_rects_id(view_salt: u64) -> egui::Id {
 /// The measured node-rect map: NodeId.0 → canvas-space [x, y, w, h].
 pub type NodeRectMap = std::collections::HashMap<usize, [f32; 4]>;
 
+impl FlexViewer<'_> {
+    /// The narrowest frame a resizable node's contents take, for `node_frame_now` to hold an
+    /// easing frame to: the grip's floor for its body (`floor`), or - for a surface module -
+    /// the rows beside the surface as they measured last frame (`kit::Surface`), which can be
+    /// wider than that. An easing frame dragged in past it squeezed the contents for a frame
+    /// before snarl found out where they stop.
+    fn keep_grip_floor(&self, ui: &egui::Ui, node: NodeId, floor: f32, frame_w: Option<f32>) {
+        let ctx = ui.ctx();
+        let around = frame_w.map_or(0.0, |w| w - ui.available_width());
+        let rows: egui::Vec2 = ctx
+            .data(|d| d.get_temp(egui::Id::new(("kit_surface", ctx.viewport_id(), ui.layer_id(), node.0))))
+            .unwrap_or_default();
+        let narrowest = floor.max(if rows.x > 0.0 { rows.x + around } else { 0.0 });
+        ctx.data_mut(|d| d.insert_temp(self.snarl_id.with(("grip-floor", node.0)), narrowest));
+    }
+
+    /// The easing a node's grip-set size is laid out with (`kit::SizeEase`): keyed per canvas
+    /// and node, over the canvas's transition time. The body and `node_frame_now` share it.
+    fn size_ease<'c>(&self, ctx: &'c egui::Context, node: NodeId) -> kit::SizeEase<'c> {
+        kit::SizeEase {
+            ctx,
+            key: self.snarl_id.with(("grip-size-ease", node.0)),
+            seconds: crate::canvas::canvas_grid(ctx).map_or(0.0, |g| g.ease),
+        }
+    }
+}
+
+/// How tall a stretchy module's frame is before its grip is first dragged, if it has a
+/// starting height at all. The default is a *frame* size, like what the grip writes: a knob
+/// starts 112 points tall - two of the old blocks, four of these - and its floor lets it come
+/// down to one.
+fn default_frame_h(module_id: &str, block: Option<f32>) -> Option<f32> {
+    match module_id {
+        "module.knob" => Some(4.0 * block.unwrap_or(28.0)),
+        // Where an envelope starts is what it drew before it followed its frame: a curve of
+        // about 180 by 150 plus six stacked rows, which is ten blocks and change. Nothing
+        // about the module's use asks for more or less.
+        "generator.envelope" => Some(9.0 * block.unwrap_or(28.0)),
+        _ => kit::surface_spec(module_id).map(|s| s.default_blocks.1 * block.unwrap_or(28.0)),
+    }
+}
+
 /// What the node measures this frame: the frame as it is laid out now, not the one the
 /// canvas last drew. A body that sized itself off last frame's rect would overshoot
 /// every other frame, so this reads the layout state for the current one.
@@ -243,6 +285,11 @@ fn node_frame_size(
     margin_x: f32,
     margin_y: f32,
 ) -> Option<(f32, f32)> {
+    // The frame snarl is laying the node out in this frame - which is the one it's easing
+    // through while its grip's size eases (`node_frame_now`).
+    if let Some(s) = egui_snarl::ui::laid_out_frame(ui.ctx(), node_id) {
+        return Some((s.x, s.y));
+    }
     let info = snarl.get_node_info(node_id)?;
     let state = egui_snarl::ui::NodeState::load(ui.ctx(), snarl_id.with(("snarl-node", node_id)), &ui.style().spacing);
     let rect = state.node_rect(info.pos, 1.0);
@@ -1954,6 +2001,57 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         self.header_content.get(&node.0).copied()
     }
 
+    /// The frame a resizable node is easing through this frame on the axes its grip set and
+    /// is still on its way to - the same easing its body is laid out with (`size_ease`).
+    fn node_frame_now(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> [egui_snarl::ui::FrameNow; 2] {
+        use egui_snarl::ui::FrameNow;
+        let Some(n) = snarl.get_node(node) else { return [FrameNow::Snarl, FrameNow::Snarl] };
+        let id = n.module_id.as_str();
+        let width = (kit::uses_kit(id) || kit::stretchy(id)) && !kit::fixed_size(id);
+        // A module that keeps its shape takes its height from its width: the height follows
+        // what the body takes while the width eases, rather than easing on its own.
+        let keeps_shape = kit::keeps_aspect(id);
+        let height = kit::stretchy(id) && !keeps_shape;
+        let ctx = self.ctx.clone();
+        let ease = self.size_ease(&ctx, node);
+        let block = crate::canvas::canvas_grid(&ctx).filter(|g| g.snap).map(|g| g.block);
+        let whole = |w: f32| block.map_or(w, |b| ((w - 0.5) / b).ceil().max(1.0) * b);
+        let along = |on: bool, key: &str, axis: &str| {
+            let wanted = n.params.get(key).and_then(|v| v.as_f64()).map(|v| whole(v as f32))?;
+            let (now, easing) = ease.ease(axis, wanted);
+            (on && easing).then_some(now)
+        };
+        // Never narrower than what it holds (`keep_grip_floor`, as last measured).
+        let narrowest: f32 = ctx.data(|d| d.get_temp(self.snarl_id.with(("grip-floor", node.0)))).unwrap_or(0.0);
+        let w = along(width, kit::WIDTH_PARAM, "w").map(|w| w.max(narrowest));
+        // The height the grip set (or the module starts at), as eased this frame: the same
+        // answer the body gets from `body_height`.
+        let h = height
+            .then(|| {
+                n.params
+                    .get(kit::HEIGHT_PARAM)
+                    .and_then(|v| v.as_f64())
+                    .map(|v| whole(v as f32))
+                    .or_else(|| default_frame_h(id, block))
+            })
+            .flatten()
+            .map(|wanted| ease.ease("h", wanted));
+        [
+            w.map_or(FrameNow::Snarl, FrameNow::Eased),
+            // While the width eases, a module the grip sets the height of stays at that height
+            // (it followed what it held, which re-wrapped and re-measured as the width went,
+            // and the bottom edge wobbled); one whose height is what it holds follows that as
+            // it goes - rows re-wrapping, a board keeping its shape - rather than gliding
+            // along the grid behind it. Holding more than the grip's height, either is as tall
+            // as what it holds, on its way to the grid line above (snarl's `snaps_down`).
+            match (h, w.is_some()) {
+                (Some((h, true)), _) | (Some((h, false)), true) => FrameNow::Eased(h),
+                (None, true) => FrameNow::Contents,
+                _ => FrameNow::Snarl,
+            },
+        ]
+    }
+
     /// A module that keeps its shape (the Vectorscope is a square) is scaled by its grip.
     fn node_resize_uniform(&mut self, node: NodeId, snarl: &Snarl<NodeData>) -> bool {
         snarl.get_node(node).is_some_and(|n| kit::keeps_aspect(&n.module_id))
@@ -1972,6 +2070,9 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     | "module.automap_combiner"
                     | "module.automap_fork"
                     | "module.automap_selector"
+                    // A board kept to its shape: the grid's rounding of its height is spare
+                    // room above and below it, not a strip of nothing under it.
+                    | "module.input_viewer"
             )
         })
     }
@@ -2062,6 +2163,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // Kit bodies are handed their width (see `kit::body_width`), and stretchy ones
         // their height as well (see `kit::body_height`).
         let frame_size = node_frame_size(node_id, ui, snarl, self.snarl_id, self.node_margin_x, self.node_margin_y);
+        // What the grip asked for is laid out easing to it with the transition time, so the
+        // contents move with the frame rather than a block ahead of it (the frame is told
+        // the same: `node_frame_now`).
+        let ease_ctx = ui.ctx().clone();
+        let size_ease = Some(self.size_ease(&ease_ctx, node_id));
         let kit_w = if kit::uses_kit(&module_id) {
             let avail = ui.available_width();
             snarl.get_node(node_id).map_or(kit::MIN_W, |n| {
@@ -2072,7 +2178,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     let mine = kit_min_width(&module_id);
                     (mine, mine)
                 } else {
-                    kit::body_width(n, avail, frame_size.map(|s| s.0), kit_min_width(&module_id), block, None)
+                    let (w, floor, _) =
+                        kit::body_width(n, avail, frame_size.map(|s| s.0), kit_min_width(&module_id), block, None, size_ease);
+                    self.keep_grip_floor(ui, node_id, floor, frame_size.map(|s| s.0));
+                    (w, floor)
                 };
                 self.size_floors.insert(node_id.0, floor);
                 w
@@ -2150,17 +2259,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     // and it runs away sideways.
                     _ => kit::surface_spec(&module_id).map_or(72.0, |s| s.min.y),
                 };
-                // The default is a *frame* size, like what the grip writes: a knob starts
-                // 112 points tall - two of the old blocks, four of these - and the floor
-                // above lets it come down to one.
-                let default_h = match module_id.as_str() {
-                    "module.knob" => Some(4.0 * block.unwrap_or(28.0)),
-                    // Where an envelope starts is what it drew before it followed its frame:
-                    // a curve of about 180 by 150 plus six stacked rows, which is ten blocks
-                    // and change. Nothing about the module's use asks for more or less.
-                    "generator.envelope" => Some(9.0 * block.unwrap_or(28.0)),
-                    _ => kit::surface_spec(&module_id).map(|s| s.default_blocks.1 * block.unwrap_or(28.0)),
-                };
+                let default_h = default_frame_h(&module_id, block);
                 let legacy = n
                     .params
                     .get("box_width")
@@ -2188,12 +2287,13 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                     _ => kit::surface_spec(&module_id)
                         .map(|s| s.default_blocks.0 * crate::canvas::canvas_grid(ui.ctx()).map_or(28.0, |g| g.block)),
                 };
-                let (w, floor) = kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w);
+                let (w, floor, _) =
+                    kit::body_width(n, ui.available_width(), frame_size.map(|s| s.0), min_w, block, default_w, size_ease);
                 self.size_floors.insert(node_id.0, floor);
-                (
-                    w.max(held_w),
-                    kit::body_height(n, ui.available_height(), frame_size.map(|s| s.1), min_h, block, default_h),
-                )
+                self.keep_grip_floor(ui, node_id, floor, frame_size.map(|s| s.0));
+                let (h, _) =
+                    kit::body_height(n, ui.available_height(), frame_size.map(|s| s.1), min_h, block, default_h, size_ease);
+                (w.max(held_w), h)
             })
         } else {
             (0.0, 0.0)
@@ -2303,7 +2403,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             ),
             "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
             "module.input_viewer" => super::input_viewer::show_input_viewer_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref()),
+                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w),
             "module.menu" => super::menu_body::show_menu_body(
                 node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
             "module.stick_rotation" => {

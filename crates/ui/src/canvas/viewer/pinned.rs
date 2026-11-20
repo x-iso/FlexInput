@@ -1675,6 +1675,7 @@ pub(crate) fn card_window<BodyFn, MapLenFn, DraftLenFn>(
     body_fn: BodyFn,
     map_len_fn: MapLenFn,
     draft_len_fn: DraftLenFn,
+    fixed_h: Option<f32>,
 ) -> egui::Rect
 where
     BodyFn: FnOnce(
@@ -1704,9 +1705,10 @@ where
         .and_then(|n| n.params.get(height_key))
         .and_then(|v| v.as_f64())
         .map(|h| h as f32);
-    let h = match set_h {
-        Some(h) => h.max(min_h),
-        None => natural.unwrap_or(200.0),
+    let h = match (fixed_h, set_h) {
+        (Some(h), _) => h.max(min_h),
+        (None, Some(h)) => h.max(min_h),
+        (None, None) => natural.unwrap_or(200.0),
     };
     let top_left = ui.cursor().min;
     render_remap_whole_module_impl(
@@ -1715,6 +1717,11 @@ where
         body_fn, map_len_fn, draft_len_fn,
     );
     let rect = egui::Rect::from_min_size(top_left, egui::vec2(width, h));
+    // A window given its height (`fixed_h`, a column beside the
+    // rest of a body that sets it) has no bar of its own to drag it taller.
+    if fixed_h.is_some() {
+        return rect;
+    }
     let (bar, _) = ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
     let (dy, reset) = super::kit::resize_bar(ui, bar, (tag, "card_window_bar", node_id), true,
         "Drag to make the card list taller or shorter; the cards scroll in what it has.\n\

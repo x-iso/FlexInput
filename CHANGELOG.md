@@ -7,12 +7,55 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
-- **The Input Viewer draws a Steam Controller as one.** It used to get the Xbox board. Now
-  the Steam Deck's arrangement: the d-pad and face buttons outboard at the top with View and
-  Menu up between them and the sticks, two sticks level either side of the Steam button, a
-  square trackpad under each stick with its own finger and click, the aux button between
-  the pads, and the back buttons low on the sides, L4 over L5 and R4 over R5, on a plate
-  that lights while that grip is held. Touching a stick's cap lights its ring a little.
+- **A layout grid on the canvas.** Modules snap to a grid of 28-point blocks as they're
+  dragged (Alt drags freely), with their edges in the middle of a block and their size in
+  whole blocks, so there's always a block's gap between two. A module dropped onto others, or
+  grown into them, pushes them aside; so does one added from the menu, pasted (at the pointer)
+  or inserted on a wire, which stays where it was put. The grid is drawn as faint crosses on
+  the block corners (or lines, or dashed lines), with a brightness slider for low-contrast
+  themes and, if wanted, a brighter line every 3, 5, 7 or 9 blocks (off to start with).
+  Zoomed out past where the blocks crowd together it draws every second, fourth, eighth line
+  at a floor of brightness - the lines a step drops fading out as it's taken - so a zoomed-out
+  patch still says how big a module is. The I/O nodes Easy mode places around its sub-patch
+  sit on the grid too.
+- **Wires that go around modules.** By default a wire is a plain curve where its way is clear
+  and takes the shortest way round any module in its way, with a berth you set; wires going
+  round a module together go round it side by side. Or, along the grid: wires run along the
+  grid's lines like traces on a circuit board, each in its own lane with clear space between
+  where they share a gap, ordered so they cross as little as they can, eased into an S where
+  pins nearly line up; a gap with more wires than fit widens, moving the modules beside it
+  apart. Or plain curves straight over everything, as before. A dark edge shows which wire
+  crosses over which.
+- **A module's wires stand out.** Hovering or selecting a module thickens its wires a little
+  and fades the rest of the patch part-way transparent (half at most, so everything can still
+  be read), except the modules its wires lead to.
+- **A wires menu** on the zoom toolbar, beside the grid menu: how wires are routed, how much a
+  module's wires stand out (60% to start with; 0 turns it off), the range the activity glow is
+  shown in (0 to 70% to start with), and what makes an Auto-Map bus glow: any reading, only
+  readings moving from where they rest (a pad lying still goes dark), or only live input (a
+  touchpad's position only while it's touched).
+- **Wire opacity, in the wires menu,** from hidden to solid (40% to start with), with
+  "Activity shows wires" (on to start with): a see-through wire shows more of itself the more
+  its signal is doing. A hovered or selected module's wires show whole whatever the opacity,
+  Highlight on or off.
+- **Transitions, in the grid menu:** how long a module takes to glide to where it moved - a
+  step along the grid as it's dragged, one pushed aside, an arrange, an undo - and its wires
+  to their new routes, their ends on the pins all the way, and its frame to a new size - a
+  step of the grid as its corner grip is dragged, a module grown by what it holds. Dragging
+  the grip eases what the module holds along with its frame, the two together every frame -
+  a module that keeps its shape (the Input Viewer) across and down alike, one axis after the
+  other just as well - and dragged in past what it holds, the frame stops there, its bottom
+  edge easing straight onto the grid line. 200 ms to start with; Off jumps as before. A
+  module dragged freely follows the pointer at once.
+- **Arrange, on the canvas toolbar beside the grid and wire menus, lays the whole patch out
+  along its signal.** Modules go in columns by how far down the signal path they are - the
+  patch's inputs (devices, a sub-patch's inlets) in the first, its outputs in the last, a knob
+  or constant just before the module it turns - each column ordered so its wires cross as
+  little as they can, and each module at the height its wires come in at, so a wire from one
+  pin to the next runs level. Loops lay out like everything else; groups of modules not wired
+  to each other stack one under another, and modules wired to nothing go in a row beneath.
+  Sizes stay as they are, everything lands on the grid when modules snap to it, and one Undo
+  puts the patch back.
 - **A wire dropped onto an input that already has one asks what to do with the two:**
   Cancel, Replace the wire, or merge them through a module that combines them in a way that
   means something for what they carry - Add, Max, Min, Multiply or a Selector for numbers and
@@ -26,23 +69,23 @@ All notable changes to FlexInput are documented here. This project adheres to
   its menu - the module goes in beside the input with the wire there in its first input and
   its second left free for what comes next - and a module picked from the list below, whose
   output would land on the taken input, asks as a dropped wire does.
-- **Transitions, in the grid menu:** how long a module takes to glide to where it moved - a
-  step along the grid as it's dragged, one pushed aside, an arrange, an undo - and its wires
-  to their new routes, their ends on the pins all the way. 200 ms to start with; Off jumps as
-  before. A module dragged freely follows the pointer at once.
-- **Wire opacity, in the wires menu,** from hidden to solid (40% to start with), with
-  "Activity shows wires" (on to start with): a see-through wire shows more of itself the more
-  its signal is doing. A hovered or selected module's wires show whole whatever the opacity,
-  Highlight on or off.
-- **Arrange, on the canvas toolbar beside the grid and wire menus, lays the whole patch out
-  along its signal.** Modules go in columns by how far down the signal path they are - the
-  patch's inputs (devices, a sub-patch's inlets) in the first, its outputs in the last, a knob
-  or constant just before the module it turns - each column ordered so its wires cross as
-  little as they can, and each module at the height its wires come in at, so a wire from one
-  pin to the next runs level. Loops lay out like everything else; groups of modules not wired
-  to each other stack one under another, and modules wired to nothing go in a row beneath.
-  Sizes stay as they are, everything lands on the grid when modules snap to it, and one Undo
-  puts the patch back.
+- **Modules with two big parts lay them out side by side when stretched wide enough,** a
+  vertical bar between the two columns sharing the width out (double-click to reset); at
+  their usual width they're one column, as before. The Area Mapper, Touch Zones and the
+  Virtual Menu (in mapping mode): the settings and the field on the left, the mappings on
+  the right as tall as them. 3DOF to 2D: the 3D preview on the left, the whole height of the
+  module, the settings on the right - and wider still, Lean in a third column of its own.
+  Controller 3D: the settings on the left, the 3D view on the right as tall as the module.
+  Once they're wider than they're tall, Gyro to Stick Rotation puts its settings beside the
+  circle and Audio Stream Haptics its scope beside the rows, as tall as the module.
+- **The Input Viewer draws a Steam Controller as one.** It used to get the Xbox board. Now
+  the Steam Deck's arrangement: the d-pad and face buttons outboard at the top with View and
+  Menu up between them and the sticks, two sticks level either side of the Steam button, a
+  square trackpad under each stick with its own finger and click, the aux button between
+  the pads, and the back buttons low on the sides, L4 over L5 and R4 over R5, on a plate
+  that lights while that grip is held. Touching a stick's cap lights its ring a little.
+- **The Input Viewer scales with its corner grip,** every skin's board, keeping its shape -
+  from half the size it was always drawn at, up. It was one fixed size.
 - **3DOF to 2D has an Orient mode: the output follows where the pad's nose points.** It
   keeps a camera - a heading and a pitch - looking where the nose is: each tick the gyro's
   own turn of the pad is taken along the camera's up and its level right, so wherever the
@@ -57,22 +100,35 @@ All notable changes to FlexInput are documented here. This project adheres to
   turn the pad's up away from the camera's; once they are more than about 107° apart the
   camera turns over about its own look, so a pad rolled upside down and back level never
   leaves the camera upside down against it, mirroring the outputs. Which way is down comes
-  from the orientation JoyShockMapper's motion library keeps, held to gravity, but gravity only holds
-  the frame the turns are measured in: bringing it back after the gyro drifted never moves
-  the pointer. Near straight up a nose moved sideways is a big change of heading; past 75°
-  the camera takes it a little at a time instead of spinning on the spot. The camera matches
-  the pad as far as the game lets it: at a 1:1 sensitivity with no acceleration curve, no
-  ratchet and nothing else turning it - a game that stops its pitch at straight up parts
-  from the pad over the top, until a Reset puts the camera back on the nose. The preview
-  draws the pad as that orientation, so it never spins as the nose crosses a pole. The JSM
-  module has it too, as FlexInput's own `GYRO_SPACE = ORIENT`.
-- **Auto re-center puts Orient's pointer back on the pad.** Once the pad has lain still for
-  three seconds, the camera eases onto where its nose points and the heading back to
-  forward, as a Reset would, sending no movement. A pad just connected, its gyro still
-  reading a turn it isn't making until its calibration settles, left the pointer off the
-  pad's nose (x -8°, y +12° for a pad lying flat) until a Reset or a change of mode; gravity
-  takes that turn out of the pad, never out of the pointer. In Orient the switch works
-  whatever the pose's source.
+  from the orientation JoyShockMapper's motion library keeps, held to gravity, but gravity
+  only holds the frame the turns are measured in: bringing it back after the gyro drifted
+  never moves the pointer. Near straight up a nose moved sideways is a big change of
+  heading; past 75° the camera takes it a little at a time instead of spinning on the spot.
+  The camera matches the pad as far as the game lets it: at a 1:1 sensitivity with no
+  acceleration curve, no ratchet and nothing else turning it - a game that stops its pitch at
+  straight up parts from the pad over the top, until a Reset puts the camera back on the
+  nose. The JSM module has it too, as FlexInput's own `GYRO_SPACE = ORIENT`. Auto re-center
+  puts Orient's pointer back on the pad: once the pad has lain still for three seconds, the
+  camera eases onto where its nose points and the heading back to forward, as a Reset would,
+  sending no movement - whatever the pose's source.
+- **3DOF to 2D has a 3D preview of what it's doing.** The pad - its own icon, the one its
+  device card shows; or that icon's outline; or its 3D model, half see-through at an opacity
+  you set, picked in the preview's corner - sits in a sphere marked in degrees, seen from
+  behind it the way it is held; drag to look round it, double-click to put the view back. A
+  pointer runs from it to where the output lands: the arc along the heading ring from forward
+  is the turn that becomes X, the arc up from there the tilt that becomes Y, and with roll let
+  into X the pointer pivots along a yellow arc from where it would be without roll. An arc
+  under the sphere is Lean, its ticks the threshold, and a legend says which mark is which.
+  The pointer is where the module's X/Y outputs have added up to, summed by the module as it
+  puts them out, and the pad is drawn as the output has it - its nose on the pointer, rolled
+  as it is held - so pad and pointer agree in every mode; in Steering the pointer is the
+  wheel's own angle. A neutral hold is a faint ghost the pad sits on at a Reset; the output
+  leaves a trail for the last 0.6 s; past the Edge-turn zone a yellow sphere turns against the
+  pointer as Edge turn keeps the camera turning, the zone ring with its blend as a fading band
+  and Ramp's full speed as a dotted ring. Every pad is sized by its longer side, and one
+  nothing names is drawn as the Xbox pad. The preview folds away like the other sections, a
+  bar under it sets its height, and it can be pinned to a layout or an overlay on its own,
+  with a style of its own in the layout inspector.
 - **Panic mode resets 3DOF to 2D,** as it is engaged and as it is released: the
   Orientation output, Steering's wheel and the aim start over from neutral, as a Reset
   would, so what drifted or wound up while it was on is gone.
@@ -107,40 +163,93 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **"Block stick: In flick zone" lets the stick through while a slow push has the zone shut.**
   With the flick speed gate on, a push too slow to flick isn't flicking, so the stick is left
   to what else it is mapped to, even out past the flick zone.
-- **Pinned Style 2 controls say what they do.** Their tooltips gave the field's label
-  again ("interp ms"); they now carry the module's own description of each setting, and the
-  labels are names - Crossover, Peak hold, Takes over above, Exclude Y, Lean threshold, Edge
-  zone, Real world scale - where they were abbreviations. On the modules, a pill or switch
-  with a short name now has a long one it shows whenever there is room (`exclude Y`,
-  `recenter`, `reset ease`, `edge zone`, `ramp width`, `in max`, `model opacity`,
-  `symmetric`, `pass through`, `softness`, `crossover`), and 3DOF's Steering row shares its
-  width instead of standing its pills at the right edge at a fixed size, which showed "ctr"
-  however much room was left of them. RWS's V/H pills are named in their labels ("gy v/h",
-  "gyro v/h") where the value said it again ("gy 1.00").
-- **AutoMap Splitter and Collector list their ports as strips, on their sockets,** as Split
-  and Selector do: each port's strip is on the row of its own socket, from the top of the
-  body (the bus pin is on the header), with `add pin` under the last one, and the sockets
-  carry no small name of their own beside them. A strip shows the pin as a mapping card
-  does - its button glyph, in the pad's own family, then its name in the controls' font and
-  the strong text colour - or the name alone for a pin with no glyph, with its handle and
-  `×` centred on the row. Every pin with a drawing anywhere wears it: a stick's or the
-  D-pad's axis, the pad's gyro and accelerometer axes (the Choose picker's motion glyphs),
-  the cursor's move as well as its delta - the name beside it says which. `add pin` is the
-  strips' full width, and MIDI…, Learn (the Collector's) and Clear are one action row in
-  the Remapper's button style, Clear greyed while every port is wired; the MIDI picker opens
-  under the row. `add pin`'s list shows each pin with its glyph, as its strip will. The list
-  ran down the body at its own pitch, in small grey text, under sockets that each said their
-  name again, and its buttons were egui's small ones.
-- **MIDI In and MIDI Out list their messages the same way:** a strip each on its own
-  socket's row - a handle that moves it, its name, its `×` - with no second name beside the
-  socket, then the picker that adds one and an action row under them (Learn and Clear unused
-  on a MIDI In, Clear unused on a MIDI Out). They were small rows of `×` and name under
-  sockets that named themselves again, with Learn, Clear unused and the picker up in the
-  header. MIDI Out's Thru is a switch in the same style, where it was a checkbox. The
-  picker is pills too - the type, the channel, the number (a note with its name) - laid out
-  for the width there is: one row when they fit, else the type and its channel over the
-  number and Add, each row the strips' width. It was egui dropdowns and a bare drag field
-  wrapped into ragged lines.
+- **RWS Aim is calibrated over the game, from a widget on the config overlay.** The module's
+  body no longer carries the calibration method and output controls: its button pins a Real
+  World Calibration widget to the config overlay of the tab in front, or says it is already
+  there. Each RWS Aim has its own button and widget, labelled with the pad that drives its
+  Rotation input. The widget is one big button and needs gamepad navigation on; pressing it
+  puts large prompts in a click-through window over the game. First choose what to calibrate:
+  South Mouse Scale, West Stick °/s, North Gyro scale, East cancels - while you choose, the
+  pad's aim reaches the game (only the four face buttons are held back), and the prompt asks
+  you to aim straight ahead, level with the horizon. Then turn one full 360° in game: the
+  flick stick for the bulk of it, the controller to line up exactly with where you started.
+  The snapshot of the starting view is always on, and a ring with a travelling arrow shows
+  the angle measured so far. South finishes, East cancels, and the result (old value → new,
+  or why nothing changed) stays up for four seconds. The choice sits at the bottom of the
+  screen and the turn at the top, so the middle stays clear.
+- **RWS Aim scales a pad's own gyro, for games that aim with it.** It has a Device input
+  and a Map output, both AutoMap: wire the pad in and the Map output on to the virtual pad,
+  and the bus passes through with its gyro axes multiplied by the new `gyro` value - the
+  calibrated scale - times Real World Scale, pitch by the gyro V/H too. Calibrating Gyro sets
+  `gyro` so the game turns as far as the pad does. A patch saved before gets both pins after
+  the ones it has, so its wires stay; the value can be pinned and is saved in `.fxrws`
+  presets.
+- **Overlays can show on any monitor.** With more than one connected, a picker beside the
+  overlay buttons in the header - a monitor with the display's number on it - chooses the
+  monitor every overlay covers - the info and config overlays, menus, the calibration
+  prompts - and so the one a calibration's screenshot is taken of. Each overlay places itself
+  there in that monitor's own pixels, whatever its scale, and edits there: where the cursor
+  is over an overlay is measured from the overlay, not the desktop's corner. They sat at the
+  desktop's corner, on the primary monitor, sized from whichever monitor the main window was
+  on. The choice is kept; a monitor that has been unplugged falls back to the primary.
+- **Theme and control font settings** in Settings → Display: the accent colour (what is
+  selected, lit or on, egui's blue until changed), a tint the greys lean toward with its
+  strength (0% = plain grey, lightness kept), and the font - normal or console, regular or
+  bold, 11 to 18 points (Normal Regular 15 by default; the size applies when the slider is
+  let go). The controls - every button, dropdown, value pill, segment and switch - take it at
+  its size; labels, hints, headings, Easy mode's cards, the mapping cards, the calibration
+  panels and the overlays take its face and weight at their own sizes scaled by it (unchanged
+  at the default 15); monospace text and the canvas's pin labels, which are sized to the
+  layout grid, keep theirs. Console and bold are drawn as wide as normal text at that size,
+  so a setting fits the same room whichever face it is, and a larger size widens the rows
+  (they wrap to another band) instead of spilling out of the pills. Text a control can't hold
+  is drawn smaller to fit before anything is cut short. Bold uses the system's bold face
+  (Segoe UI / Consolas on Windows, DejaVu on Linux). The tint reaches the greys painted by
+  hand too - node borders, graph backdrops, hint text, the calibration panels, Easy mode's
+  side panel and device cards, the mapping cards - and the text greys. The grey tint and the
+  font are on the gamepad settings panel as well.
+- **A redesigned pinned row can wear either look.** Style 1 is the look it had before the
+  redesign, Style 2 the module's own - value pills, joined segments. A layout saved before
+  keeps Style 1, a new pin is made as Style 2, and the layout editor's inspector switches
+  between them. Every redesigned row has it: the Response Curve family's scale, range, grid
+  and Two-way rows, the Oscilloscope's and Trigger Scope's controls and grid rows, RWS Aim's
+  view, flick and calibration rows, the Area Mapper's options, layers, press mode and border,
+  the Virtual Menu's options, Vec Reshaper's rows, 3DOF to 2D's mode, hold, roll mix,
+  steering, Edge turn, orientation and inversion rows, Stick Rotation's six rows, the
+  Envelope's, the Oscillator's, and the small modules' (Average, Delay, DC Filter, Counter,
+  Logic Delay, Sample & Hold, Has Changed, Inverse, Quantize, Vec to Deflection). JSM Config
+  has one look. A Style 2 row is one band at the largest size its frame holds both ways, its
+  pills sharing the frame's whole width, centred in a frame taller than that, and never draws
+  outside it; a pin of several bands shares its frame's height among them. The rows that were
+  bare drag fields and checkboxes are drawn from the gamepad's own field list, so the pills
+  are the fields the pad walks, in its order. Each control's tooltip is the module's own
+  description of that setting, and labels are names - Crossover, Peak hold, Takes over above,
+  Exclude Y, Lean threshold, Edge zone, Real world scale. 3DOF to 2D's Pointer and Steering
+  rows wear the modes' drawings as the module does, and a row of one band held to its scale
+  by a narrow frame fills the frame's height (up to three times its own).
+- **NAND, NOR and XNOR are modules now.** The three gated pairs the AND / OR / XOR set
+  was missing: two Bool inputs, one Bool out, each its sibling with the output negated —
+  the same relationship the gate glyphs already drew with a bubble. They come out of the
+  palette like the other gates, wearing their glyph.
+- **A Constant can be read to a resolution.** Under the number sits one divided pill:
+  `res` on the left, the digits it keeps after the dot on the right — `int`, then `1`, `2`,
+  `3`, `4` — and the value cell is dragged across its width to set it. The resolution is also
+  how far a drag of the number moves it: a box reading tenths moves in tenths. The value snaps
+  to it, in the box and in the engine alike, so `3.7` read at whole numbers drives `4`
+  downstream — while the number itself is left alone in storage, so stepping away and back
+  gives `3.7` again.
+- **A Dropdown menu can be walked from outside it.** It takes an optional `shift` input now:
+  whatever that pin says is added to the option chosen on the module - not replaced by it - and
+  wraps in both directions, so a dial, a stepping switch or a comparator moves through the menu
+  from wherever it was left. The module marks the option that is actually coming out rather than
+  the one it was set to - the `shift` inlet and that option are drawn green - and choosing an
+  option while the pin is holding it somewhere else moves the base, so the option you click is
+  the option you get. A menu saved before gains the pin the first time it draws.
+- **A module's header says what the module is.** Hovering its name, or the symbol it wears
+  instead of a name, shows the name the patch calls it by - for a renamed module, yours and
+  then the module's own - and, under a rule, what the module does, in the words of
+  `docs/MODULES_REFERENCE.md`'s Purpose lines, 75 of them, plus the six modules the
+  reference leaves unsaid.
 - **The Virtual Keyboard & Mouse can Choose its keys** as well as learn them: Choose… opens
   the picker on its keyboard and mouse alone, and every key picked becomes an input, named
   as Learn names it (a key it has already, by either name, isn't added twice). Learn,
@@ -156,275 +265,309 @@ All notable changes to FlexInput are documented here. This project adheres to
   where Lean Left's cards pushed Lean Right out of view and the scroll misbehaved. A card
   list pinned whole keeps the same minimum: the layout won't size it below its top part and
   one card.
-- **The Area Mapper's analog mode is a widget of its own,** pinned apart from the layer tabs
-  and colour. Its settings always take their room - two bands, the ramp's cell too under
-  fixed PWM, greyed - and while it is off one outlined "enable analog" button covers that
-  room, so turning it on, or switching how it pulses, changes nothing's size: on the layer
-  row, Analog grew a pinned row by its settings every time it was pressed. The selected
-  cell - its icon and name, and its haptic - can be pinned too, and its tone settings are
-  always there, greyed until the haptic is on, for the same reason.
-- **Style 2 mode rows show their drawings and grow into tall frames.** 3DOF to 2D's Pointer
-  and Steering rows, pinned, wear the modes' drawings as the module does; a word takes its
-  capitals once the pill is tall enough for them, and stays lower case in a thin strip. A
-  row of one band, held to its scale by a narrow frame, fills the frame's height (up to
-  three times its own): taller pills, a drawing over its word where there is room above
-  and beside it where there is room across.
-- **A row of joined choices is in one font size.** Each choice was fitted on its own, so a
-  short word came out bigger than its neighbours ("Yaw" over "Player").
-- **3DOF to 2D's Mode section is "2D Output mode",** and a rule sets Edge turn apart from
-  the mode's other settings.
-- **3DOF to 2D's Mode rows have drawings.** Each mode's cell shows one beside its name - the
-  turn Pitch+Yaw and Pitch+Roll take X from, a figure for Player, a globe for World, a
-  compass for Orient - and the Pointer and Steering captions an aim and a wheel. Where the
-  cells are narrow, Pitch+Yaw and Pitch+Roll say the half the drawing doesn't (Yaw, Roll).
-  Steering's own settings (exclude Y, recenter, reset ease) now sit straight under the
-  Steering row, with the neutral hold and roll mix after them.
-- **The SVG module is sized by its corner grip** like every other picture on the canvas, the
-  drawing kept to its own shape inside, and drawn at the pixels it covers - the screen's
-  density and the canvas's zoom - so it stays sharp zoomed in. Load and Clear are drawings
-  in the header and the tint a swatch their height, in one row at the header's right edge;
-  the name is painted in the room they leave, cut with dots, as every module's is, so the
-  grip takes the module down to its controls. With nothing loaded it says so in the
-  controls' font. It was a fixed 160-point square, its name laid out beside egui's small
-  buttons and holding the module as wide as the two.
+- **A pinned Envelope graph can be drawn differently from the module it came from.** The overlay
+  inspector's graph row - the one that already carries a copy's colours - now also offers
+  `grid`, `labels` and `snap`, each with `module` (follow the module on the canvas), `on` and
+  `off`. `module` is the default, so every copy saved until now looks exactly as it did. A
+  pinned Response Curve graph can set its grid and labels the same way.
+
+### Changed
+
+- **Module bodies follow one style,** written down in `docs/MODULE_UI_GUIDELINES.md`.
+  Settings are value pills - drag across, or double-click (or Ctrl-click) to type - joined
+  segments and switches, in bands that wrap to the module's width, where they were egui's
+  checkboxes, bare number fields, sliders and dropdowns of every size. A two-value setting is
+  the Switch module's button; a short list is a divided pill - label on the left, current
+  value on the right - scrubbed by a drag across the value. Every on/off switch - the house
+  button, the word toggles, the paired switches in a header, the Switch module, JSM's `tune` -
+  is outlined in both states, in the selection's colour while on, so a switch reads apart from
+  a button, a one-of-several selector or a value pill. A pill shows its whole name when there
+  is room for it and its value (`stabilise`, `forward deadzone`, `recenter`, `roll mix`,
+  `flick output`) and the short one when there isn't; nothing is sized for the long name.
+- **A value box being dragged shows where its value is.** A dark field with a darker shade of
+  the accent filling it from the start of the range to the value - from the middle for a
+  range either side of zero. A range across orders of magnitude (a time up to a minute, a
+  frequency up to 200 Hz) is measured on a log scale, so 100 ms of a minute is plainly there;
+  a value whose range is a million wide or more (a Constant, a Counter's limits) fills the
+  whole box in that shade. The same for every number box egui draws, in modules and windows
+  alike.
 - **Buttons in module bodies wear the house style:** MIDI Out's Unmute and the MIDI picker's
   Add, the 3D viewer's colour Reset / Save… / Load…, Network Receive's Copy, and a raw
   pad's Learn, Clear unused and motion setup (Skip, Cancel, Use it, Redo, Try again) are
   action-row buttons in the controls' font, where they were egui's small grey ones.
-- **A Response Curve's In / Out range reads in the units its axes do:** a motion sensor's
-  view in °/s or G as value pills like the plain range's (they were bare drag fields on a
-  row of their own), and an axis that ends on a feedback pin in that pin's own units - a
-  haptic's pitch in Hz, its strength in dB, a rumble's share in % - dragged and typed in
-  them, where it said 1.00 for full strength.
-- **A Response Curve's Log/Exp slider is as tall as the Abs and Snap buttons beside it,** and
-  Log and Exp are in the controls' font; it was a thin strip between two small captions.
-- **The Envelope's Hold, Bounce and Loop say their names** beside their drawings when the
-  module is wide enough for all three.
-- **Overlays can show on any monitor.** With more than one connected, a picker beside the
-  overlay buttons in the header - a monitor with the display's number on it - chooses the
-  monitor every overlay covers - the info and config overlays, menus, the calibration
-  prompts - and so the one a calibration's screenshot is taken of. Each overlay places itself
-  there in that monitor's own pixels, whatever its scale, and edits there: where the cursor
-  is over an overlay is measured from the overlay, not the desktop's corner. They sat at the
-  desktop's corner, on the primary monitor, sized from whichever monitor the main window was
-  on. The choice is kept; a monitor that has been unplugged falls back to the primary.
-- **A layout grid on the canvas.** Modules snap to a grid of blocks as they're
-  dragged (Alt drags freely), with their edges in the middle of a block and their
-  size in whole blocks, so there's always a block's gap between two. A module
-  dropped onto others, or grown into them, pushes them aside; so does one added
-  from the menu, pasted (at the pointer) or inserted on a wire, which stays where
-  it was put. The grid is drawn as faint crosses on the block corners (or lines,
-  or dashed lines), a little brighter every second block - the 56-point major
-  line - with a brightness slider
-  for low-contrast themes. The I/O nodes Easy mode places around its sub-patch
-  sit on the grid too.
-- **Wires that go around modules.** By default a wire is a plain curve where its
-  way is clear and takes the shortest way round any module in its way, with a
-  berth you set; wires going round a module together go round it side by side.
-  Or, along the grid: wires run along the grid's lines like traces on a circuit
-  board, each in its own lane with clear space between where they share a gap,
-  ordered so they cross as little as they can, eased into an S where pins nearly
-  line up; a gap with more wires than fit widens, moving the modules beside it
-  apart. Or plain curves straight over everything, as before. A dark edge shows
-  which wire crosses over which.
-- **A module's wires stand out.** Hovering or selecting a module thickens its
-  wires a little and dims the rest of the patch, except the modules its wires
-  lead to.
-- **A wires menu** on the zoom toolbar, beside the grid menu: how wires are
-  routed, how much a module's wires stand out (60% to start with; 0 turns it off),
-  the range the activity glow is shown in (0 to 70% to start with), and what makes
-  an Auto-Map bus glow: any reading,
-  only readings moving from where they rest (a pad lying still goes dark), or
-  only live input (a touchpad's position only while it's touched).
-- **One layout for module bodies.** Delay, Average, DC Filter, Inverse,
-  Quantize, Logic Delay, Counter, Has Changed, Greater / Less Than and Vec to
-  Deflection are rebuilt on a shared body kit (label column, one flexible
-  control per row, value boxes on a shared right edge) and get a width grip on
-  their corner. The rules are in `docs/MODULE_UI_GUIDELINES.md`; the other
-  modules follow.
+- **A module's name never decides how wide it is, and never runs under the buttons beside
+  it.** It's painted in the header's room: whole if it fits before the controls at the right
+  edge, cut with dots if only part of it does, and left out if the room is smaller than a word
+  worth reading - it is always in the hover text, and widening the frame brings it back. Laid
+  out like a control, the name added its own width to the module: "DC Filter" needed a
+  168-point module for two numbers where the same module called "Average" managed with 140, a
+  Selector's name ended under its `+`, and a Response Curve's sat under Save / Load / Reset.
+- **Pin labels are short on the canvas and full on hover.** `out_0` and `in_11` come down
+  to their number, the common words have fixed short forms (`dir`, `lat`, `sel`, `chg`,
+  `inc`, `dec`, `def`, `ang`…), and anything else longer than four letters loses its tail —
+  with the real name in the hover text. Only modules small enough for a block to matter do
+  this; a Remapper keeps its labels spelled out, and the names stored in a patch are
+  untouched. Curve pins read `i1 o1`, `i2 o2`; Map Range's four range pins `in↓ in↑ out↓
+  out↑`. Hovering any pin label shows the pin's full name and the module and pin at the other
+  end of each wire on it. AutoMap pins carry no label, except on the device modules, where
+  the pin is the device.
 - **The small operations wear their symbol, and carry their `+`/`−` in the header.**
   Add, Subtract, Multiply, Divide and Min/Max show `+ − × ÷ ↕` where their name was —
   the name moves to the hover text, and a module the user renamed keeps its name — and
   the row of buttons they used to carry under the header is gone: the pair sits at the
   header's right edge, and the module is its header and its pins and nothing in
-  between. Every one of them, gates included, stays two blocks square; five inputs fit
-  inside the second block, a sixth takes a third and hands it back when it goes.
-  Greater / Less Than show `>` and `<` (`≥` and `≤` while or-equal is on), their
-  "Equal — counts too" row is a single `or equal` button in the Switch module's style —
-  filled, its text in the middle — and they lose the corner grip they had as kit
-  modules: nothing inside them has room to stretch into.
-- **The same modules are drawn with a glyph.** The gates' — AND, NAND, NOR, NOT, OR,
-  XNOR, XOR — are the drawings now kept in `app/assets/modules/`; the arithmetic
-  (`+ − × ÷ ↕`) and the comparisons (`> < ≥ ≤ = ≠`) were cut to the same idiom: a 59×59
-  box, a 4-point stroke with round tips, no fill, the mark filling the band the gate
-  shapes fill. Each is painted into whatever band the module's pin rows leave under them,
-  centred on the module rather than on the column between its pin labels — that column
-  isn't the middle of the module, since `a` and `b` are one letter and `out` is three —
-  up to one block wide, and not at all once the band is too small to read. Painted,
-  never allocated: a glyph can't grow a module or take a row from its pins, so the inputs
-  that fit before the frame grows a block are the same with a glyph as without one. The
-  `or equal` button is centred the same way, and the comparison glyph follows or-equal
-  like the header mark does. A test holds every asset to the style and the box the set
-  shares, and a rig test clicks across the toggle's row to check it answers on the
-  module's centre.
-- **The range modules and the converters are drawn with a glyph too.** Clamp shows the
-  transfer it performs — flat, ramp, flat — Map Range a diagonal between two corner
-  brackets, Axis to Vec two leads merging into one, Vec to Axis one splitting into two,
-  all in the same 59×59 box and 4-point stroke as the gates. They sit in the column
-  between the pin labels, which runs the height of the pin rows rather than under them,
-  so a five-input Map Range gets a mark as large as Add's: 56 points, one block. None of
-  these modules changed size — they were already two blocks square, and a glyph takes no
-  room of its own.
+  between. Every one of them, gates included, stays 112 points square; five inputs fit,
+  a sixth takes another block and hands it back when it goes. Greater / Less Than show `>`
+  and `<` (`≥` and `≤` while or-equal is on), and their "Equal — counts too" row is a single
+  `or equal` button in the Switch module's style.
+- **The same modules are drawn with a glyph.** The gates' — AND, NAND, NOR, NOT, OR, XNOR,
+  XOR — are the drawings now kept in `app/assets/modules/`; the arithmetic (`+ − × ÷ ↕`) and
+  the comparisons (`> < ≥ ≤ = ≠`) are cut to the same idiom: a 59×59 box, a 4-point stroke
+  with round tips, no fill. Each is painted into whatever band the module's pin rows leave,
+  centred on the module, up to one block wide, and not at all once the band is too small to
+  read - painted, never allocated, so a glyph can't grow a module or take a row from its
+  pins. The comparison glyph follows or-equal like the header mark does. Clamp shows the
+  transfer it performs — flat, ramp, flat — Map Range a diagonal between two corner brackets,
+  Axis to Vec two leads merging into one, Vec to Axis one splitting into two, Quantize a
+  staircase, and Vec to Deflection a vector bent away from straight ahead with the arc that
+  says by how much. Abs and NOT are square now, keeping a band for `|x|` and the inverter.
 - **Constant is one number box that sizes itself to the number.** No grip and no width
-  setting: the box is as wide as the digits it holds (30 points tall, monospace 12), with
-  a floor built around `9999.99` — that value still sits inside a module two blocks wide,
+  setting: the box is as wide as the digits it holds - measured against the text as
+  displayed, trailing zeros trimmed - with a floor that keeps `9999.99` inside 112 points,
   while `10000.00` takes the frame a block wider and hands the block back when the value
-  shrinks again. The box sits centred on the module, and because the width comes from the
-  value's own text rather than from the module's size, it can grow and shrink without
-  ever sticking. A rig test walks it out to three blocks and home.
-- **NAND, NOR and XNOR are modules now.** The three gated pairs the AND / OR / XOR set
-  was missing: two Bool inputs, one Bool out, each its sibling with the output negated —
-  the same relationship the gate glyphs already drew with a bubble. They come out of the
-  palette like the other gates, two blocks square, wearing their glyph, and a test holds
-  each one to being exactly its sibling's opposite across all four input pairs.
-- **Abs and NOT are square, and Abs has a mark.** Both have a single pin row between them,
-  which left them a block shorter than every other module with a mark and gave the mark
-  nowhere to sit; they keep a band for it now, so `|x|` and the inverter read at the same
-  size as the rest.
-
-- **A Constant can be read to a resolution.** Under the number sits one divided pill:
-  `res` on the left, the digits it keeps after the dot on the right — `int`, then `1`, `2`,
-  `3`, `4` — and the value cell is dragged across its width to set it, whole numbers at the
-  left and four digits at the right, rather than clicked one step at a time. It's written as
-  the count of digits rather than the step (`0.0001`) so the pill never has to grow. The
-  resolution is also how far a drag of the number moves it: a box reading tenths moves in
-  tenths. It isn't decoration either: the value snaps to it, in the box and in the engine
-  alike, so `3.7` read at whole numbers drives `4` downstream — while the number itself is
-  left alone in storage, so stepping away and back gives `3.7` again rather than the `4`
-  that was on screen. The box is measured against the text as actually displayed — trailing
-  zeros trimmed — so a whole number doesn't pay for a dot and two zeros it never shows, and
-  `9999.99` still fits two blocks. It carries no outline: outlined things inside a module
-  read as waiting to be pressed, and this one isn't a button.
-
-- **Sample and Hold, and what it does.** It has a mark now: the stepped curve of a signal
-  sampled and held, drawn in the same idiom as Clamp's and Map Range's transfer curves, in
-  the room its own pins leave over. Its mode — Sample or Hold — is one button in the house
-  shape, the same control `or equal` uses, labelled with whichever mode is current, and
-  clicking it renames the second pin between "Trigger" and "Gate" as before. It's the same
-  size it was, three blocks by two.
-
-- **The Readout reads.** Its number is centred on the module and set a size larger, and the
-  box it sits in is a constant rather than whatever the current reading happens to need — a
-  display that measured its own content would widen the module every time a value ticked
-  past a thousand and give the block back a frame later. What adapts instead is the text:
-  it steps down in size until it fits, and a number too large for four meaningful decimals
-  is written in scientific notation, which keeps readings about the width the box was sized
-  for. A test pushes 0, a five-digit value, 1e30 and 1e-30 through it and checks the frame
-  never moves.
-
-- **Settings have two shapes, and they're the same everywhere.** A two-value setting is the
-  Switch module's button; a short list is a divided pill — label on the left, current value
-  on the right — that answers a drag across the value cell, so the list is scrubbed rather
-  than clicked through one at a time. Sample and Hold's mode started life as a pill and had
-  to become a button: measured across a body column about 56 points wide, `mode` plus
-  `sample` is 96 points, and the module went from three blocks to four.
-
+  shrinks. The box sits centred under the header. Folded, it shows its number in the band
+  under its header, as a folded Knob and Readout do.
+- **Switch, Inverse, Logic Delay, Has Changed and Vec to Deflection came down to 112 points
+  square.** In every case the extra width was a label rather than a control: rows that spelled
+  out "Delay", "Time", "Hysteresis" or "Angle" beside their values, or a name in the header
+  wider than the pins underneath. Inverse has a small sign/range button and a max pill; Logic
+  Delay is three rows; Has Changed has its hysteresis pill between the pin labels; Vec to
+  Deflection is `∠` with one pill for the angle unit; Switch's button is painted across the
+  bottom of the frame instead of widening the column between its pins.
+- **Quantize is 112 points square,** its body two pills under the pin rows where it was a
+  Factor drag box and a Rounding choice with four words spelled out: a `÷` pill (the number
+  counts subdivisions per unit) dragged through doublings (1, 2, 4 … 1k), and the rounding
+  word, which opens a short list when clicked. A factor coming down a wire shows on the pill,
+  which then stops pretending to control it.
+- **Sample and Hold shows its numbers.** The body carries two readings: what the wire is
+  bringing in, in the header's strong colour, and what the module is handing out — dim while
+  the trigger or gate is idle, amber while it's doing something, so *holding* and *following*
+  look different. Its mode, Sample or Hold, is one button labelled with the mode it is in, and
+  clicking it renames the second pin between `Trig` and `Gate` as before; the header wears an
+  `S/H` mark. It's 112 points square, and a nine-figure value doesn't change that.
+- **The Readout reads.** Its number is centred on the module and fills whatever box it's
+  given - the type steps down from 34 points to ten until it fits, and a number too large for
+  four meaningful decimals is written in scientific notation - while the box is a constant
+  rather than whatever the reading happens to need, so the module never jumps as a value's
+  digits come and go. It starts 84 points across, and its corner grip takes it in both
+  directions, down to one block across by two down - enough for a row of readings along a
+  patch. It reads in the units of what it is wired to (a motion sensor's °/s or G, a Feedback
+  Control outlet's %). Folded, it shows its number under its header.
+- **The Knob fills whatever frame its corner grip gives it.** The face was a fixed 56-point
+  dial in a module that could not be resized: dragged wide it becomes a horizontal fader,
+  dragged tall a vertical one, and a fader is thin by design, so the grip can take a knob to
+  one block in either direction; it starts 112 points square. A dial keeps its reading in its
+  middle, its indicator stopping short of it; a fader with height to spare writes the number
+  under its track, and a strip a block tall at the end of it. The Uni/Bi range switch is in
+  the header and the output label is gone. Collapsed, a knob draws no face and shows just its
+  number in the band under its header - collapsing one is how you keep it from being nudged.
 - **A Text note takes its size from the module's corner, not from a grip floating at the
-  bottom of the writing.** The module's own corner grip — the one the row-based modules
-  already had — now drags both ways, in blocks, and the text field fills whatever frame it
-  gets: the width is what the text wraps to, the height is a floor the text overruns by
+  bottom of the writing.** The module's corner grip drags both ways, in blocks, and the text
+  field covers the body it's given - no inner border, no padding that shifts with how much is
+  written: the width is what the text wraps to, the height is a floor the text overruns by
   growing the note another whole block, and back down to the floor when the lines go away.
   Its settings — font size and colour — moved to the right edge of the header, so the body
-  is nothing but the text. Notes open three blocks wide rather than four: the old body
-  reserved its 160-point box *inside* the frame's own margin, and the canvas rounded that
-  up, so the frame was wider than anything in it asked for. A note saved before any of this
-  keeps the width it had set for itself.
-- **A Dropdown menu can be walked from outside it.** It takes an optional `shift` input now:
-  whatever that pin says is added to the option chosen on the module - not replaced by it - and
-  wraps in both directions, so a dial, a stepping switch or a comparator moves through the menu
-  from wherever it was left. The module marks the option that is actually coming out rather than
-  the one it was set to, and choosing an option while the pin is holding it somewhere else moves
-  the base, so the option you click is the option you get. The list it drops down also asks for
-  the height its options need: it was egui's default of about four rows, so a menu of eight made
-  you scroll in the middle of an empty canvas.
-- **A module's header says what the module is.** Hovering its name, or the symbol it wears
-  instead of a name, opens the name the patch calls it by and, under a rule, what the module
-  does - in the words of `docs/MODULES_REFERENCE.md`'s Purpose lines, 75 of them, plus the six
-  modules the reference leaves unsaid.
-- **RWS Aim is calibrated over the game, from a widget on the config overlay.** The module's
-  body no longer carries the calibration method and output controls: its button pins a Real
-  World Calibration widget to the config overlay of the tab in front, or says it is already
-  there. Each RWS Aim has its own button and widget, labelled with the pad that drives its
-  Rotation input. The widget is one big button and needs gamepad navigation on; pressing it
-  puts large prompts in a click-through window over the game. First choose what to calibrate:
-  South Mouse Scale, West Stick °/s, North Gyro scale, East cancels. Then turn one full
-  360° in game: the flick stick for the bulk of it, the controller to line up exactly with
-  where you started. The snapshot of the starting view is always on, and a ring with a
-  travelling arrow shows the angle measured so far. South finishes, East cancels, and the
-  result (old value → new, or why nothing changed) stays up for four seconds. The choice sits
-  at the bottom of the screen and the turn at the top, so the middle stays clear.
-- **RWS Aim scales a pad's own gyro, for games that aim with it.** It has a Device input
-  and a Map output, both AutoMap: wire the pad in and the Map output on to the virtual pad,
-  and the bus passes through with its gyro axes multiplied by the new `gyro` value - the
-  calibrated scale - times Real World Scale, pitch by the gyro V/H too. Calibrating Gyro sets
-  `gyro` so the game turns as far as the pad does. A patch saved before gets both pins after
-  the ones it has, so its wires stay; the value can be pinned and is saved in `.fxrws`
-  presets.
-- **A redesigned pinned row can wear either look.** Style 1 is the look it had before the
-  redesign, Style 2 the module's own - value pills, joined segments. A layout saved before
-  keeps Style 1, a new pin is made as Style 2, and the layout editor's inspector switches
-  between them. It applies to the Response Curve family's scale, range and grid rows, the
-  Oscilloscope's and Trigger Scope's controls and grid rows, and RWS Aim's view and flick
-  rows. JSM Config has one look. A Style 2 row is one band at the largest size its frame
-  holds both ways, its pills sharing the frame's whole width, centred in a frame taller than
-  that, and never draws outside it.
-
-### Changed
-
-- **A switch is outlined, on and off.** Every on/off toggle in a module - the house
-  two-state button, the word toggles, the paired switches in a header, the Switch module,
-  JSM's `tune` - wears an outline in both states, in the selection's colour while on, so a
-  switch reads apart from a button, a one-of-several selector or a value pill. Only the
-  house toggle had one, and only while on (off, it was drawn in nothing).
-- **A value box being dragged shows where its value is.** A dark field with a darker shade of
-  the accent filling it from the start of the range to the value - from the middle for a
-  range either side of zero - in place of the label's accent across the whole box, with a
-  label or without (Delay, Average, DC Filter). A range across orders of magnitude (a time up
-  to a minute, a frequency up to 200 Hz) is measured on a log scale, so 100 ms of a minute is
-  plainly there; a value whose range is a million wide or more (a Constant, a Counter's
-  limits) fills the whole box in that shade. The same for every number box egui draws, in
-  modules and windows alike.
-- **Around wires are tidier.** A wire whose route kept to its pin's row and then turned once
-  stayed square - level, a hard corner, straight up, a hard corner - because only what lay
-  between its first and last runs was pulled taut; now it flows round what is in its way like
-  the rest. Wires that loop back round the module they leave or reach (a wire running right to
-  left) go round it side by side, where they lay on top of each other.
-- **The Dropdown widens with its corner grip,** its options and the choice coming out as wide
-  as you make it, so long option names can be read; its height is still its rows'.
-- **Controller 3D's colours:** the Joy-Con grip's two Joy-Cons are the original neon blue and
-  neon red (they were the grip's dark grey), the GameCube's stick rims are their sticks'
-  colours (they were purple), the WaveBird wears the GameCube's colours, and the Xbox 360 is
-  a soft off-white rather than paper white. Its Orientation input reads "Orient".
+  is nothing but the text. A note saved before keeps the width it had set for itself.
+- **The Dropdown menu is a column of its options under its reading.** It sized itself from a
+  `box_width` parameter that could be dialled up to 600 points, wrapped its reading in a resize
+  frame, led every row with its own `×`, and drew its handle as a monospace `≡`. Now the current
+  option is the reading on top, then a row per option - handle, the option's text cut at the
+  column's edge with the whole of it on hover, the `×` at the right edge - and the `+` that
+  adds one at the right of the header. The corner grip widens it, so long option names can be
+  read; its height is its rows'. A patch that had set `box_width` keeps the parameter, which no
+  longer moves anything. The list it drops down asks for the height its options need: it was
+  egui's default of about four rows, so a menu of eight made you scroll.
+- **The Counter's settings are cells, not a column of labelled rows.** It was a mode strip, an
+  "Output" row, a "Step" row and a "Range" row with two captioned boxes, 336 points across,
+  most of that the words beside the things they named. The cells are the module now - the mode
+  two per row so the words stay whole, the output pair, the range and the step as pills with
+  the reset at the end of the step row - and it is 196 by 168, with no corner grip. Its six pin
+  words are drawn short on the canvas (`inc`, `dec`, `rst`, `step`, `min`, `max`).
+- **Delay, Average and DC Filter are pills.** Each one was a label, a slider rail and a value
+  box per setting, with a "Channels" row across the body on top: 252 points of module to hold
+  one or two numbers. The settings are pills you drag across or double-click to type into,
+  each with its word written above it - Window, Spikes, Decay - and a channel - always an In and
+  its matching Out - is added from the header's `− +` the way the variadic operations add a
+  pin. Delay wears a stopwatch in its header and the word "Delay" over its number. Delay is
+  112 by 112; Average and DC Filter 140 by 112.
+- **The Oscillator is a shape, a wave and two numbers.** It was three rows of small controls -
+  four shape buttons, a unit toggle and a DragValue, a "Phase" label with a DragValue and a
+  Bi/Uni pair split by a separator - and then a waveform stretched across whatever width that
+  left. The shape is one strip of four cells, the wave a painted band between the shape and the
+  numbers, and the frequency and the phase are pills, each with the toggle that says how to
+  read it beside it - hertz or the period in milliseconds, -1..1 or 0..1. A pill whose pin is
+  wired takes no drags: the wire's value is what the module shows. 196 by 140.
+- **The Switch makes room for the label you give it.** The button was a fixed 64 points with
+  the caption shrunk to fit inside them — a two-word label came out at eight points. It is now
+  measured from the caption at the size it's painted at, with the icon taking a square beside
+  it or above it wherever it was put: a long caption takes another block and hands it back.
+- **Selector and Split are columns of port strips.** A strip per port, each carrying the
+  port's name — the field edits the pin's own name, which is what the patch stores — a handle
+  that drags the port up or down the list, taking its wire with it because the engine reads
+  these by position, and a `×` once there are more than two to choose between; `+` is in the
+  header. A strip is on the row of its own socket, and a numbered port draws no label beside
+  the socket, so adding a port moves the module by one row on both sides; the strips are one
+  width and end at the edge their sockets are on. The interpolate setting sits on the row of
+  its own pin, above the strips. The port the selection is pointing at wears a glowing edge;
+  interpolating splits the glow between the two ports the value sits between, so the light
+  slides along the list. A name too long for its strip is cut with dots, whole on hover.
+- **A Macro Output's ports are a strip column, like a Split's.** Each row used to measure
+  itself out as an icon button, a 96-point name field, a 58-point dropdown, a `✕`, and a
+  button named "+ Add output" underneath: 308 points of module to name a pin. Now each row is
+  handle, icon, name, the type (Bool, Float, Vec2, Any) and the `×` at the right edge, on the
+  pitch its sockets are laid out at so a port's socket is level with the row that names it,
+  with the `+` in the header. The name beside the socket is gone (it was the same word twice),
+  and the rows are as wide as the names on them, so a port called "Right Trigger, half
+  pressed" takes the width it costs to read it. The name is painted, cut with dots at its
+  cell's edge; a click opens it for editing.
+- **Every list of ports moves the same way.** A Selector's, Split's, Macro Output's,
+  Dropdown's or AutoMap Combiner's, Fork's or Selector's row is dragged by its handle or its
+  name: it rides under the finger, the rows it passes slide aside, and the move lands as one
+  move, wires and all, when the finger leaves; a drag is never also a click. The Combiner used
+  to stand still and draw a line where the row would land, and the Dropdown's and Macro's
+  rows could only be picked up by the dots at their end.
+- **A port's name opens for editing with its text in it,** selected: type to replace it, or
+  click / arrow into it. On a Macro Output, Selector or Split, renaming opened an empty field,
+  so changing one letter meant typing the name again. The module widens as a long name is
+  typed (up to ten blocks).
+- **AutoMap Splitter and Collector list their ports as strips, on their sockets,** as Split
+  and Selector do: each port's strip is on the row of its own socket, from the top of the
+  body (the bus pin is on the header), with `add pin` under the last one, and the sockets
+  carry no small name of their own beside them. A strip shows the pin as a mapping card
+  does - its button glyph, in the pad's own family, then its name in the controls' font and
+  the strong text colour - or the name alone for a pin with no glyph. Every pin with a drawing
+  anywhere wears it: a stick's or the D-pad's axis, the pad's gyro and accelerometer axes, the
+  cursor's move as well as its delta. Port names are never shortened - which port feeds what
+  is what these modules are read for - so a long learned name makes the module wide instead.
+  `add pin` is a pill the strips' full width whose list shows each pin with its glyph, and
+  MIDI…, Learn (the Collector's) and Clear are one action row in the Remapper's button style,
+  Clear greyed while every port is wired; the MIDI picker opens under the row. The list ran
+  down the body at its own pitch, in small grey text, each row led by its `×`, under sockets
+  that each said their name again, and its buttons were egui's small ones. An Inlet or Outlet
+  sets its type from a `type` pill.
+- **AutoMap Fork and AutoMap Selector list their ports as strips,** like Split and Selector:
+  a row level with each socket, a handle to reorder, `×` on the row, `+` in the header. They
+  were a stack of labels over a "+ output" / "+ input" button.
+- **The AutoMap Combiner's port rows are one strip wide,** a block per port, each row as wide
+  as the longest name and device label in the list - with different devices attached the rows
+  came out at different widths - and its rule and port dropdowns lined up with the strips'
+  right edge on every row. Its `+ input` moved to the header, and the list of ports offering a
+  pin moved from the end of the row to its hover text. The Motion "Section" dropdown is as wide
+  as the two dropdowns on the pin rows under it, and in Correlate mode the noise gate has a row
+  of its own.
+- **MIDI In and MIDI Out list their messages the same way:** a strip each on its own
+  socket's row - a handle that moves it, its name, its `×` - with no second name beside the
+  socket, then the picker that adds one and an action row under them (Learn and Clear unused
+  on a MIDI In, Clear unused on a MIDI Out). They were small rows of `×` and name under
+  sockets that named themselves again, with Learn, Clear unused and the picker up in the
+  header. MIDI Out's Thru is a switch in the same style, where it was a checkbox. The
+  picker is pills too - the type, the channel, the number (a note with its name) - laid out
+  for the width there is: one row when they fit, else the type and its channel over the
+  number and Add. It was egui dropdowns and a bare drag field wrapped into ragged lines.
+- **AutoMap Fork has `select` as its first input,** as on Split and Selector; it was the second.
+  Patches saved before are converted when they load: the two pins change places and each keeps
+  its wires.
+- **An AutoMap socket with no label sits on the header row,** where it is when the module is
+  folded, on modules with one bus pin on that side - so folding doesn't move it, and the bus
+  in and out line up. Strip modules keep a socket by each numbered port. A device module's
+  header is a whole number of blocks tall, with its rows centred in it.
 - **The AutoMap lists show the bus grouped by kind:** the sticks as Vec2s, the axes, the
   buttons, touch, motion, then the keyboard and mouse. Pins the bus gained over time sat at
   its tail, after the mouse - a Steam Controller's pad clicks and grips, the trackpads'
   press - and now sit with their kind in the AutoMap curve's pick, the Splitter's and
   Collector's `add pin` and the bus readout. The bus itself keeps its order, which network
   peers read by position.
-- **Two-way Response Curve's lanes in colour.** Up in the signal's colour, Down in its
-  opposite - blue for the stock red - half see-through and a little thicker for the lane
-  being edited, fainter for the other, so the trail riding a lane in its full colour fills
-  it where the signal has been; the band and arrow wear the colour of the lane the signal
-  is on.
-- **RWS Aim's header controls sit at its right end,** as every module's do, and Real World
-  Scale shares its row with the gyro and stick V/H biases where the module is wide enough.
-- **3DOF to 2D's Player and World are JoyShockMapper's PLAYER_TURN and WORLD_TURN,** by
-  the JSM module's maths, which is JSM's line for line. Player keeps the pad's own pitch for
-  Y and takes X from the turn about gravity, yaw and roll both counting, relaxed by JSM's
-  60° buffer but never more than the pad is turning; it was a world-style split before, so
-  it feels different - held on its side, a turn about gravity is pitch, as in JSM. World's Y
-  is the pitch axis laid level and normalised, fading as the pad goes onto its side; it
-  weakened as the pad rolled and never faded. Hold offsets still name which way is down.
+- **A module has one resize grip.** The second grip inside Oscilloscope, Trigger Scope,
+  Vectorscope, the Response Curve family (and the AutoMap curves), Vec Reshaper, Controller 3D,
+  Audio Stream Haptics, JSM Config, Touch Zones, Virtual Menu, Area Mapper and the Envelope is
+  gone: the module's own corner grip sizes the graph, scope, pad or editor, which takes whatever
+  the frame leaves after the rows of settings. The size is saved in the patch with the module.
+  Sizes set with the old inner grips are not carried over, so these modules open at a default
+  size. Vectorscope and the Area Mapper field stay square, in the middle of the room they have,
+  the Vectorscope with no padding round it; Touch Zones in split mode shares the width between
+  its two pads; Vec Reshaper stacks its curve and its preview pad, with a bar between them
+  that shares the height.
+- **The SVG module is sized by its corner grip** like every other picture on the canvas, the
+  drawing kept to its own shape inside, and drawn at the pixels it covers - the screen's
+  density and the canvas's zoom - so it stays sharp zoomed in. Load and Clear are drawings
+  in the header and the tint a swatch their height, in one row at the header's right edge.
+  With nothing loaded it says so in the controls' font. It was a fixed 160-point square, its
+  name laid out beside egui's small buttons and holding the module as wide as the two.
+- **Remapper and Map Action can be resized with the corner grip.** The width sets the scale
+  of the mapping cards. The height is a window onto the list, which is cropped and scrolls
+  with the wheel, touch or gamepad like a pinned Remapper widget. Their Learn, Choose and Add
+  buttons are bigger, a size a finger or a pad's highlight can find, sharing the row's width.
+- **Pinned whole, a Remapper's Learn / MIDI / Choose / Add row stays at the top while the
+  cards scroll,** the status and drafts above it with it; so do Map Action's, a Touch Zones
+  zone's and the 3DOF Lean lists'. With a pad, LB and RB jump between the row and the cards,
+  back to the card you were on.
+- **Scope and curve channels come from the header.** Oscilloscope, Trigger Scope, Vectorscope,
+  Response Curve, Vec Response Curve and Two-way Response Curve use the `- n +` stepper in the
+  header, like Delay, Average and DC Filter. The `Ch + -` row under their graphs is gone.
+- **The scopes' setting rows were rebuilt** as value pills and switches in groups that share a
+  row while the width holds them. The time window is a slider that takes the room its group
+  has. The Oscilloscope's plot can no longer be squeezed narrower than the controls under it,
+  and it has a `Sync` button next to Freeze: the view starts where the first channel rises
+  through its middle level - taken from the recent signal, so a wave riding on an offset
+  syncs too - and a repeating wave stands still instead of running across the plot.
+- **The Response Curve family's settings were rebuilt.** The Log/Exp slider stretches with
+  the graph, as tall as the Abs and Snap icon switches at its right end (the Two-way curve
+  also has a small `vec` button there), with Log and Exp in the controls' font. Range, grid
+  and trail numbers are value pills, in groups that share a row while the width holds them
+  and wrap when it doesn't; in Abs mode only the upper ends of the ranges are shown. The
+  graph switches are in the header: `grid` (new: takes the grid lines off), `scaled` and
+  `labels`, with Save, Load and Reset beside them as drawings. The Two-way curve's Up / Down /
+  Hyst are one joined pill, the hysteresis and peak hold's ↕ ↑ ↓ joined pills, Start ↑ a word
+  switch, and its crossing time a pill wearing a stopwatch and `⇌`. Its lanes are in colour:
+  Up in the signal's colour, Down in its opposite - blue for the stock red - half see-through
+  and a little thicker for the lane being edited, fainter for the other, so the trail riding
+  a lane fills it where the signal has been; the band and arrow wear the colour of the lane
+  the signal is on.
+- **Moving Log/Exp no longer changes the curve you set.** The slider used to leave the points
+  where they were on the graph, which changed the input/output pair each stood for. Each
+  point now moves on the graph so it keeps the same input and output - every lane's, and set
+  with a pad or Reset to default as well as with the slider; only the shape between points
+  follows the scale, and setting the slider back returns them to where they were.
+- **A Response Curve's In / Out range reads in the units its axes do:** a motion sensor's
+  view in °/s or G as value pills like the plain range's (they were bare drag fields on a
+  row of their own), and an axis that ends on a feedback pin in that pin's own units - a
+  haptic's pitch in Hz, its strength in dB, a rumble's share in % - dragged and typed in
+  them, where it said 1.00 for full strength.
+- **Feedback pins read in their units.** A Response Curve whose output ends on a feedback
+  pin - a Feedback Control's inlet or a pad's own - labels its Out axis and its dots in that
+  pin's units: Hz for a haptic's pitch (the Switch Pro's table or 80-500 Hz, as the pad
+  says), dB for its strength, % for a rumble motor, 0-255 for a light bar, zones, forces and
+  effects for an adaptive trigger. A Knob driving one reads its value in those units too and
+  takes the pin's name until it is named by hand, and a curve a Knob feeds reads its In axis
+  in them as well - Hz in, Hz out (fed by a stick or a Constant, In keeps its own scale).
+- **The Envelope follows the frame its corner grip is dragged to.** It carried a resizable box
+  of its own with a saved size, inside a module that was already resizable, with six stacked
+  rows under it costing the same height whatever the frame looked like. The graph now takes
+  whatever the rows don't need and the whole width; its rows are one block tall, so every
+  block the grip hands the module goes to the graph, and a frame too short for them grows
+  rather than eating the curve. The sustain level is a rail of the graph's width under it,
+  and the groups of settings - the unit (`ms | s | Hz`) and the length it counts, as a pill
+  taking the rest of its row; the three behaviours; the grid divisions and snap; what the
+  grid shows - fill the width, one band with hairline separators in a wide frame, wrapped into
+  more in a narrow one. The behaviour switches are drawings - a magnet for snapping, the
+  flat-topped shape of a hold, an arrow out and back for bouncing, a ring for looping - with
+  their names beside them when the module is wide enough. `grid` and `labels` are two small
+  switches against the header's right edge. With `labels` on, the pointer (or the gamepad
+  cursor) over the graph shows when that is and the level that comes out then, as on a
+  Response Curve; the times along the grid are on the bottom edge, and each point paints its
+  level beside its dot, hovering one giving the level and where along the envelope it falls.
+  It starts at 280 by 252, its pins drawn short on the canvas (Trig, the full word on hover),
+  and every pinned piece keeps the id it was pinned by.
 - **The Area Mapper, Touch Zones and Virtual Menu look like the other modules.** Their
   settings are value pills, joined segments and lit word switches laid out in bands that
   wrap to the module's width, where they were checkboxes, bare number fields and dropdowns
@@ -436,664 +579,98 @@ All notable changes to FlexInput are documented here. This project adheres to
   Zones' mode, Split pads and colours share one band. The mapping cards' Learn / Choose… /
   MIDI… / Add row on all three has the Remapper's full-size buttons. Pinned rows look as
   they did.
-- **Theme and control font settings** in Settings → Display: the accent colour (what is
-  selected, lit or on, egui's blue until changed), a tint the greys lean toward with its
-  strength (0% = plain grey, lightness kept), and the control font - normal or console,
-  regular or bold, 11 to 18 points (Normal Regular 15 by default; the size applies when the
-  slider is let go). The control font is every
-  button, dropdown, value pill, segment and switch, which mixed the pills' monospace with
-  the proportional small font. Its size is the normal font's: console and bold are drawn as
-  wide as normal text at that size, so a setting fits the same room whichever face it is,
-  and a larger size widens the rows (they wrap to another band) instead of spilling out of
-  the pills. Text a control can't hold is drawn smaller to fit before anything is cut short,
-  and a dropdown with a set width keeps its text inside it. Bold uses the system's bold face
-  (Segoe UI / Consolas on Windows, DejaVu on Linux), Consolas lowered to sit in the middle
-  of a pill. The tint reaches the greys painted by hand too - node borders, graph
-  backdrops, hint text, the calibration panels, Easy mode's side panel and device cards, the
-  mapping cards - and the text greys. The grey tint and the font are on the gamepad settings
-  panel as well.
-- **The font setting reaches all the text,** not only the controls: labels, hints, headings,
-  Easy mode's cards, the mapping cards, the calibration panels and the overlays take its face
-  and weight, at their own sizes scaled by it (unchanged at the default 15). Monospace text
-  and the canvas's pin labels, which are sized to the layout grid, keep theirs.
-- **Feedback pins read in their units.** A Response Curve whose output ends on a feedback
-  pin - a Feedback Control's inlet or a pad's own - labels its Out axis and its dots in that
-  pin's units: Hz for a haptic's pitch (the Switch Pro's table or 80-500 Hz, as the pad
-  says), dB for its strength, % for a rumble motor, 0-255 for a light bar, zones, forces and
-  effects for an adaptive trigger. A Knob driving one reads its value in those units too and
-  takes the pin's name until it is named by hand, and a curve a Knob feeds reads its In axis
-  in them as well - Hz in, Hz out (fed by a stick or a Constant, In keeps its own scale). A
-  Readout reads in the units of what it is wired to (a motion sensor's °/s or G, a Feedback
-  Control outlet's %), and its type is sized to the widest it reads, so it no longer jumps as
-  a value's digits come and go.
-- **A value pill shares its width between its name and its value fairly.** The value gets the
-  room its widest value takes first (`+100 %` across ±100), and the name what is left - the
-  long name when it fits, the short one when it doesn't; with room past both the narrower
-  half grows until the two are as wide, and then they grow together. The name was squeezed
-  while the value stretched, and values were cut short in narrow pills (`hyst 0....`).
-- **The Two-way curve's last old controls are pills:** Up / Down / Hyst as one joined pill,
-  the hysteresis and peak hold's ↕ ↑ ↓ as joined pills, Start ↑ a word switch, and the
-  crossing time a pill named for it.
-- **Every redesigned row pins with the Style 2 switch:** the Area Mapper's options, layers,
-  press mode and border, the Virtual Menu's options, Vec Reshaper's rows, and now 3DOF to
-  2D's mode, hold, roll mix, steering, Edge turn, orientation and inversion rows, Stick
-  Rotation's six rows, RWS Aim's calibration rows, the Envelope's, the curves' grid options
-  and Two-way rows, the Oscillator's, and the small modules' (Average, Delay, DC Filter,
-  Counter, Logic Delay, Sample & Hold, Has Changed, Inverse, Quantize, Vec to Deflection).
-  The ones that were bare drag fields and checkboxes are drawn from the gamepad's own field
-  list, so the pills are the fields the pad walks, in its order. A pin of several bands
-  shares its frame's height among them.
-- **3DOF to 2D's preview:** the pad's icon and its 3D model are drawn the same size - half
-  the sphere's radius grip to grip, the icon larger and the model smaller than they were -
-  and in model mode the neutral hold is a faint dark grey model. The pad is drawn as it is
-  held: with a neutral hold set, at a Reset it sits on the hold's ghost, tilted as the hold
-  is, while the pointer it drives points straight ahead (it was drawn flat). The output
-  leaves a trail on the sphere for the last 0.6 s, as a vectorscope does. Past the Edge-turn
-  zone a yellow sphere turns against the pointer - the world going by as Edge turn keeps
-  the camera turning, by the module's own Edge-turn step - and fades once the pad is back
-  inside; the pointer stays on the pad throughout, and its trail is drawn on that turning
-  world, so it streams off the pointer with the motion Edge turn gives the 2D output. The
-  pointer is where the module's X/Y outputs have added up to, summed by the module itself
-  as it puts them out - its hold, gravity, roll share and inverts and all, at the engine's
-  rate - rather than worked out again from the pose at the screen's rate (which ignored the
-  hold offsets and read the inverts twice on a computed pose). Yawing a tilted pad moves it
-  straight across, as the output does, and pitching over the top carries it over the pole.
-  The pad is drawn as the output has it: its nose on the pointer, rolled as it is held -
-  the camera's heading and pitch are the output's, whatever path the pad took and wherever
-  the Orientation output, integrated on its own, has wandered - so pad and pointer agree in
-  every mode (after a tumble they parted: two numbers added up can't follow every path a pad
-  turns through). In Steering the pointer is the wheel's own angle, centred and Reset as it
-  goes out. The pointer no longer eases back near neutral on its own, which the output never
-  did. The
-  Edge-turn zone ring has its blend as a band fading out past it, and Ramp's full speed as a
-  dotted ring. Pinned, the preview has a style of its own in the layout inspector - frame
-  fill and outline, and the pad as the module draws it or as its icon, outline or 3D model -
-  and its model is the device the module reads (a pin inside a sub-patch drew the first
-  model on disk). The sphere is drawn in two halves round the pad: what is behind the model
-  is behind it, and what is in front of it in front (every ring was painted across it, and
-  then each half was drawn on the wrong side). The model's opacity is a setting, on the
-  module and per pin. Its look dropdown is as wide as its words.
+- **The Area Mapper's analog mode is a widget of its own,** pinned apart from the layer tabs
+  and colour. Its settings always take their room - two bands, the ramp's cell too under
+  fixed PWM, greyed - and while it is off one outlined "enable analog" button covers that
+  room, so turning it on, or switching how it pulses, changes nothing's size: on the layer
+  row, Analog grew a pinned row by its settings every time it was pressed. The selected
+  cell - its icon and name, and its haptic - can be pinned too, and its tone settings are
+  always there, greyed until the haptic is on, for the same reason.
 - **Vec Reshaper's settings are pills too,** Gain / Boundary and 4-way / X-mirror as joined
   segments, with what dragging a point does written in the curve's corner; Audio Stream
   Haptics' capture choice, Swap, Split L/R and Pure tones are word switches where they were
-  checkboxes, and so is Feedback Control's "override game feedback".
-- **RWS Aim's settings read as two kinds of number.** The first section is "Real world
-  calibration and scale": the calibration values (mouse scale, stick speed, gyro scale) under
-  one caption, the output sensitivity under another - Real World Scale across the whole
-  width with its name in full, and the V/H biases. The view section is "Heading rotation
-  preview", it always draws its degree labels (the switch is gone), and its "both" mode
-  no longer pushes its three pills past the module's edge.
-- **An AutoMap socket with no label sits on the header row,** where it is when the module is
-  folded, on modules with one bus pin on that side - so folding doesn't move it, and the bus
-  in and out line up. Strip modules keep a socket by each numbered port.
-- **Pinned whole, a Remapper's Learn / MIDI / Choose / Add row stays at the top while the
-  cards scroll,** the status and drafts above it with it; so do Map Action's, a Touch Zones
-  zone's and the 3DOF Lean lists'. With a pad, LB and RB jump between the row and the cards,
-  back to the card you were on.
-- **3DOF to 2D's Lean lists look like the Remapper's,** with its full-size action buttons, and
-  a bar under them sets their height - they scroll in what it leaves them, the module growing
-  by the same so nothing else gives way; double-click it to let them be as tall as they are.
-  A bar under the 3D preview makes the preview taller or shorter.
-- **3DOF to 2D's preview shows the projection.** The pad - its own icon, the one its device
-  card shows, lying in its frame; or that icon's outline; or the pad's 3D model, half
-  see-through, picked in the preview's corner - sits in a sphere marked in degrees,
-  seen from behind it the way it is held. A pointer runs from it to where the output lands:
-  the arc along the heading ring from forward is the turn that becomes X, the arc up from
-  there the tilt that becomes Y. With roll let into X - a roll mix in Pitch+Yaw, or Pitch+Roll -
-  the pointer pivots along a yellow arc from a yellow dot, where it would be without roll, to
-  where it lands. An arc under the sphere is Lean, its ticks the threshold, and a legend says
-  which mark is which. The output square beside it is gone - any scope on the outputs is a
-  bigger one. The preview can be pinned to a layout or an overlay on its own.
+  checkboxes, and so is Feedback Control's "override game feedback" (shortened to "override"
+  in a narrow header).
+- **Gyro to Stick Rotation was rebuilt in the house style.** Its live circle is the module's
+  surface, sized by the corner grip, and the settings beside or under it are strips and value
+  pills: the stick and the turn as two strips, Absolute and Relative as one, Sens with an
+  `invert` switch, and Takeover's speed and outer zone greyed while it is off. Each group
+  still pins on its own.
+- **Network Send and Receive use compact rows:** small labels in one column, and port, rate,
+  failsafe and feedback as value pills the width of the row.
+- **3DOF to 2D's Player and World are JoyShockMapper's PLAYER_TURN and WORLD_TURN,** by
+  the JSM module's maths, which is JSM's line for line. Player keeps the pad's own pitch for
+  Y and takes X from the turn about gravity, yaw and roll both counting, relaxed by JSM's
+  60° buffer but never more than the pad is turning; it was a world-style split before, so
+  it feels different - held on its side, a turn about gravity is pitch, as in JSM. World's Y
+  is the pitch axis laid level and normalised, fading as the pad goes onto its side; it
+  weakened as the pad rolled and never faded. Hold offsets still name which way is down.
+- **3DOF to 2D's settings stopped being a pile of boxes.** They are value pills, strips of
+  cells and switches in bands, in categories that fold under their headings, saved with the
+  patch: the 3D preview; 2D Output mode - the Pointer and Steering rows, each mode's cell with a
+  drawing beside its name (the turn Pitch+Yaw and Pitch+Roll take X from, a figure for Player,
+  a globe for World, a compass for Orient; where the cells are narrow, Pitch+Yaw and Pitch+Roll
+  say the half the drawing doesn't), Steering's own settings (exclude Y, recenter, reset ease)
+  straight under the Steering row, the neutral hold and roll mix, then Edge turn set apart by a
+  rule and greyed rather than hidden when a mode has no use for a number; Orientation output
+  (pose source, rotation scale, drift and auto re-center) and Invert Axes (Gyro and Accel side
+  by side while the width holds them), set up once and folded to start with; and Lean - the
+  threshold with its live reading, and the Lean Left and Right lists in the Remapper's style,
+  each with a bar under it that sets its height. The live readings are painted rather than laid
+  out, so the module doesn't twitch as the pad moves; its gamepad-navigation elements and
+  their order are unchanged.
 - **3DOF to 2D's gyro inputs are Roll, Pitch and Yaw,** the turn each axis is, and its
   Orientation output is "Orient", which no longer widens the module. Saved patches are
   renamed when they load; the wires stay.
-- **The 3D viewer's colours are pills that wrap,** each with the part's controller icon (or a
-  word) and its swatch, outlined so it shows on the pill, inside the module's width - the
-  Buttons row of seven swatches widened the module when Colours unfolded. Colours folds by a
-  section heading now, saved with the patch.
-- **Colour presets for the 3D viewer.** A preset picks the model's own colours, a plain grey,
-  or one you saved: Save… opens in the user models folder, under the model's `presets`, and
-  what is saved there is listed. The models' own colours are their launch colourways now -
-  Jet Black DualShock 4, Indigo GameCube, grey WaveBird, neon Joy-Con, black Switch Pro,
-  white Xbox 360, black Xbox One, and the Steam Controller's grey body with a black d-pad,
-  face buttons and sticks - where most were a dark grey stand-in.
-- **The 3D viewer has no background by default,** on the module and on a pin: the pad stands
-  on whatever is behind it. A pin's style can still give it one.
+- **RWS Aim's settings are in categories,** each folded and unfolded by its heading: "Real
+  world calibration and scale" - the calibration values (mouse scale, stick speed, gyro scale)
+  under one caption, the output sensitivity under another, Real World Scale with its name in
+  full sharing its row with the gyro and stick V/H biases where the module is wide enough, and
+  the calibrate button; "Heading rotation preview" (folded until wanted), whose ruler takes the
+  width the module has - its end labels anchored inside the edge, where they were cut in half -
+  and which always draws its degree labels; and "Flick stick". The constants are value pills in
+  groups that share a row while the width holds them. The folds save with the patch, and the
+  header controls sit at the module's right end, as every module's do.
+- **JSM Config's tabs are tabs.** They are drawn the way the app's own tab bar draws its tabs,
+  the one in front joined to the editor under it; when there are more than fit, the strip
+  scrolls - by its scroll bar, the wheel or a trackpad's two-finger scroll, on the canvas and
+  in Easy mode - and fades out at the end that has more, and with the last tab in front the
+  `+` after it shows. The active tab's name, load and save and the tune switch are a row above
+  them, the name field taking the row's spare width. A bar between the editor and the tune
+  panel shares the room between them - dragged, it keeps its share when the module is resized;
+  double-click resets it - whether the panel is below or beside the editor, and the panel's
+  placement is one pill with its dropdown, `Hide` among the choices. A tune panel with more
+  faders than room scrolls. With a gamepad, the pane being driven wears an accent frame and
+  the other is dimmed; only a word in the toolbar said which before.
 - **JSM Config is calibrated on the overlay too, the way RWS Aim is.** The tune panel's
   "Calibrate RWC" section, a smaller copy of the same procedure, is a button now that pins
   the Real World Calibration widget to the config overlay, or says it is already there. The
   overlay offers Mouse and Stick, named as the config names them, and a Finish rewrites
   `REAL_WORLD_CALIBRATION` or `VIRTUAL_STICK_CALIBRATION` in the active tab.
-- **Real World Calibration hands the camera over before the turn.** While you choose what to
-  calibrate, the pad's aim reaches the game - only the four face buttons are held back - and
-  the prompt asks you to aim straight ahead, level with the horizon, so the 360° turn starts
-  from a level view and lines up against a level snapshot.
-- **JSM Config's tabs sit on the editor.** The active tab's name, load and save and the tune
-  switch are a row above them; the name field takes the row's spare width, the tune word and
-  its dropdown are the same height, and the bar beside a tune panel can no longer squeeze
-  that row narrower than it fits.
-- **3DOF to 2D:** the inversions are "Invert Axes", with Gyro and Accel side by side while the
-  width holds them, and the 3D preview folds away like the other sections.
-- **A value pill says its whole name when it has the room.** Pills that abbreviate - `stab`,
-  `fwd±`, `dz`, `ctr`, `mix`, `out` - show `stabilise`, `forward deadzone`, `deadzone`,
-  `recenter`, `roll mix`, `flick output` once the pill is wide enough for the name and its
-  value, and the short name when it isn't. Nothing is sized for the long name, so it only
-  ever fills room that is already there.
-- **Gyro to Stick Rotation was rebuilt in the house style.** Its live circle is the module's
-  surface, sized by the corner grip, and the settings under it are strips and value pills:
-  the stick and the turn as two strips, Absolute and Relative as one, Sens with an `invert`
-  switch, and Takeover's speed and outer zone greyed while it is off. Each group still pins on
-  its own.
-- **AutoMap Splitter and Collector add pins from an `add pin` pill,** the width of their rows,
-  and an Inlet or Outlet sets its type from a `type` pill.
-- **JSM Config's tabs are tabs.** They are drawn the way the app's own tab bar draws its tabs,
-  the one in front joined to the editor under it; when there are more than fit, the strip
-  scrolls and fades out at the end that has more. The config's name and its load and save
-  buttons moved up beside them. The bar between the editor and the tune panel starts in the
-  middle and keeps its share when the module is resized, and the panel's placement is one pill
-  with its dropdown, `Hide` among the choices.
-- **The scopes' setting rows were rebuilt** as value pills and switches in groups that share a
-  row while the width holds them. The time window is a slider that takes the room its group
-  has, and never gets shorter than the length it is set to.
-- **Remapper's and Map Action's Learn, Choose and Add buttons are bigger,** a size a finger or
-  a pad's highlight can find, sharing the row's width between them.
-- **The Two-way curve's interpolation time wears a stopwatch and `⇌`** instead of a word.
-- **AutoMap pins carry no label,** except on the device modules, where the pin is the device.
-  Hovering one still says what it is and what is on the other end.
-- **A device module's header is a whole number of blocks tall,** with its rows centred in it.
-- **RWS Aim's settings are in categories,** each folded and unfolded by its heading:
-  Sensitivity (the constants and the calibrate button), View (the ruler and room view, folded
-  until wanted - it rarely is) and Flick stick. The folds save with the patch.
-- **3DOF to 2D's settings are in categories under its viewport:** Mode (Pointer and Steering,
-  the neutral hold, roll mix, the steering options and Edge turn), Orientation output (pose
-  source, rotation scale, drift and auto re-center), Axes (the gyro and accel inversions) and
-  Lean (the threshold with its live reading, and the Lean Left and Right lists). Orientation
-  output and Axes are set up once and start folded.
-- **3DOF to 2D grew a viewport, and its settings stopped being a pile of boxes.** The viewport
-  is a picture of what the module is doing: the pad's axes on a gimbal of the three rings they
-  sweep, the neutral hold as a ghost under the live outline, the Edge-turn zone as a dashed
-  ring, and beside it the output plane - one arrow per turn rate, pointing where the current
-  mode, roll share and invert flags put it, with the live output drawn over them. The pose is
-  the module's own Orientation output, so it is the same pose a wired 3D model viewer draws.
-  Drag it to look round the pad; double-click puts the view back. The header's `model` switch
-  puts the pad's mesh where the axes are, on the viewer's model, palette and quaternion: the
-  3D viewer stays what it was - a pad to pin to an overlay or a stream - and this is what you
-  look at while setting the module up. The viewport is sized by the module's corner grip like
-  every other surface, and the settings under it are value pills in bands: Pointer/Steering
-  and the axis and pose-source choices as strips of cells, the Edge block rebuilt the same way
-  and greyed rather than hidden when a mode has no use for a number. The live Lean reading, the
-  output numbers in the plane and the pose are painted rather than laid out, so the module
-  doesn't twitch as the pad moves. Its gamepad-navigation elements and their order are
-  unchanged.
 - **The Controller 3D settings stopped taking six rows of slider.** The drawing numbers -
   view angle, alpha, highlight fade, touch sensors, motion cue and x-ray - are value pills in
   bands, the model picker sits on a painted caption at the row's width, and the palette fold no
-  longer wears an emoji: `keep colours` is a two-state button, like every other setting with
-  two values. What the rows used to take in height, the pad now has.
-- **RWS Aim's four constants are value pills,** in groups that share a row while the width
-  holds them and take a row each when it doesn't, and its calibration ruler takes the width the
-  module has instead of a width of its own: the grip that makes the module wider makes the ruler
-  longer, and the two labels at the ends of the visible span are anchored inside the edge, where
-  they used to be cut in half by it.
-- **The Response Curve family's settings were rebuilt.** The Log/Exp slider stretches with
-  the graph, with Abs and Snap as icon switches at its right end (the Two-way curve also has
-  a small `vec` button there). Range, grid and trail numbers are value pills like the
-  Envelope's - drag across or double-click to type - in groups that share a row while the
-  width holds them and wrap when it doesn't. In Abs mode only the upper ends of the ranges
-  are shown.
-- **`Scale grid` is in the curve's header:** `grid` and `scaled` are the two halves of one
-  pill, with `labels` a switch of its own beside it.
-- **Moving Log/Exp no longer changes the curve you set.** The slider used to leave the points
-  where they were on the graph, which changed the input/output pair each stood for. Each
-  point now moves on the graph so it keeps the same input and output; only the shape between
-  points follows the scale, and setting the slider back returns them to where they were.
-- **Curve pins read `i1 o1`, `i2 o2`,** the same width on both sides, instead of `In 1` and
-  `Out 1`. Hovering any pin label on any module shows the pin's full name and the module and
-  pin at the other end of each wire on it.
-- **Remapper and Map Action can be resized with the corner grip.** The width sets the scale
-  of the mapping cards. The height is a window onto the list, which is cropped and scrolls
-  with the wheel, touch or gamepad like a pinned Remapper widget.
-- **Vectorscope stays square, with no padding round the scope.** The corner grip scales it,
-  dragged along either edge.
-- **The Oscilloscope's plot can no longer be squeezed narrower than the controls under it,**
-  and it has a `Sync` button next to Freeze: the view starts where the first channel rises
-  through its middle level - taken from the recent signal, so a wave riding on an offset
-  syncs too - and a repeating wave stands still instead of running across the plot.
-- **JSM Config shares its size between the editor and the tune panel.** A bar between them
-  can be dragged to give either more room (double-click it to reset), whether the panel is
-  below or beside the editor. With a gamepad, the pane being driven wears an accent frame and
-  the other is dimmed; only a word in the toolbar said which before. A tune panel with more
-  faders than room scrolls.
-- **Network Send and Receive use compact rows:** small labels in one column, and port, rate,
-  failsafe and feedback as value pills the width of the row.
-- **A module has one resize grip.** The second grip inside Oscilloscope, Trigger Scope,
-  Vectorscope, the Response Curve family (and the AutoMap curves), Vec Reshaper, Controller 3D,
-  Audio Stream Haptics, JSM Config, Touch Zones, Virtual Menu and Area Mapper is gone: the
-  module's own corner grip sizes the graph, scope, pad or editor, which takes whatever the frame
-  leaves after the rows of settings. The size is saved in the patch with the module. Sizes set
-  with the old inner grips are not carried over, so these modules open at a default size.
-- **Vec Reshaper stacks its curve and its preview pad.** They are one surface, one above the
-  other, with a bar between them that can be dragged to share the height.
-- **Vectorscope and the Area Mapper field stay square,** in the middle of the room they have.
-  Touch Zones in split mode shares the width between its two pads.
-- **Scope and curve channels come from the header.** Oscilloscope, Trigger Scope, Vectorscope,
-  Response Curve, Vec Response Curve and Two-way Response Curve use the `- n +` stepper in the
-  header, like Delay, Average and DC Filter. The `Ch + -` row under their graphs is gone.
-- **AutoMap Fork has `select` as its first input,** as on Split and Selector; it was the second.
-  Patches saved before are converted when they load: the two pins change places and each keeps
-  its wires.
-- **Map Range says which end of which range.** Its four range pins read `in↓ in↑ out↓ out↑` on
-  the canvas; cut to four letters they were `in_m in_m out_ out_`. The stored names are unchanged.
-- **The Combiner's Motion "Section" dropdown lines up.** It is as wide as the two dropdowns on
-  the pin rows under it and ends at the same edge. In Correlate mode the noise gate has a row
-  of its own.
-- **Hovering a module's name says what the module is.** The tooltip shows the name - for a
-  renamed module, your name and then the module's own - and under a line what it does. It was
-  written long ago and could never appear: the name is painted, and the area that was meant to
-  be hovered was nothing wide.
-- **Highlighting a module's wires fades the rest instead of darkening it.** The other wires
-  and the modules not wired to it go part-way transparent, half at most, so everything can
-  still be read. Wires used to fade almost to nothing and modules were covered with a shade.
-- **Lists of ports sit in the middle of their module.** A Macro Output, Split, Selector and
-  the AutoMap Combiner, Fork and Selector had a thin margin over their first row and a wide
-  one under the last; the slack is now shared between the two.
-- **An AutoMap Combiner is a block taller per port, always.** Its rows are on the same pitch
-  as every other list (they had their own, and with the Resolution header under them the
-  module grew by one block for some ports and two for others); closed, Resolution is one
-  more row of that height. Inside it, the rule and port dropdowns line up with the right
-  edge of the port strips on every row, and the list of ports offering a pin moved from the
-  end of the row to its hover text.
-- **AutoMap Fork and AutoMap Selector list their ports as strips,** like Split and Selector:
-  a row level with each socket, a handle to reorder, `x` on the row, `+` in the header. They
-  were a stack of labels over a "+ output" / "+ input" button.
-- **A port's name opens for editing with its text in it.** On a Macro Output, Selector or
-  Split, renaming opened an empty field, so changing one letter meant typing the name
-  again. It opens on the current name, selected: type to replace it, or click / arrow into
-  it. The module also widens as a long name is typed (up to ten blocks; it stopped at five).
-- **A folded Constant or Readout shows its number,** in the band under its header, as a
-  folded Knob does.
-- **Delay says what it is.** Its header had no room for its name beside the channel
-  stepper; it wears a stopwatch there and the word "Delay" over its number, the way Average
-  and DC Filter caption theirs.
-- **A module's name never runs under the buttons beside it.** Every header applies one rule:
-  the name is drawn whole if it fits before the control at the header's right edge, cut with
-  an ellipsis if it nearly does, and left out if it doesn't (it is always in the hover
-  text). A Selector's name ended under its `+`, and a Response Curve's sat under Save / Load
-  / Reset.
-- **A Response Curve's graph switches are in its header.** `grid` (new: takes the grid lines
-  off) and `labels` sit at the header's right edge as on the Envelope, with Save, Load and
-  Reset beside them as drawings. A pinned copy of the graph can set grid and labels for
-  itself in the inspector - follow the module, on, or off.
-
-- **A ComboBox, a strip and a pill label each measured themselves wider than the row they were
-  drawn in.** Three ways the same thing went wrong on the screenshots. A ComboBox takes
-  `Spacing::combo_width` - 150 points - as its minimum whatever sits inside it, so the Macro
-  Output's one-letter signal-type button and the Dropdown menu's reading both reached past their
-  row and under the pin labels beside it, and the Dropdown grew with the longest option instead
-  of cutting it at its edge; both ask for their cell's width now, and the popup still sizes
-  itself to its entries. A strip adds its own spacing between its cells on top of the style's,
-  so the Oscillator's fourth shape cell landed on the output label: its rows take a child with
-  no extra spacing and come out exactly as wide as the wave band under them. A pill's label cell
-  was measured in the proportional small font and painted in the monospace the pill uses, so the
-  blue block behind `min`, `max` and `step` on the Counter was narrower than the word standing on
-  it. It's measured in the font it's painted with. A Macro Output's list also stopped being
-  centred on its frame - it has no input pins, so centring left dead margin on the left and
-  pushed the rows into the output labels on the right; the column runs the width the body has.
-- **The Envelope follows the frame its corner grip is dragged to.** It carried a resizable box of
-  its own with a saved size, inside a module that was already resizable, with six stacked rows
-  under it costing the same height whatever the frame looked like. The graph now takes whatever
-  the rows don't need and the whole width, the sustain slider is a row of the graph's width under
-  it, and the four groups of settings - the unit and the length it counts, the three behaviours,
-  the grid divisions and snap, and what the grid shows - fill the width evenly: one band with
-  hairline separators in a wide frame, wrapped into more bands in a narrow one, where the module
-  takes the height for them rather than losing the curve. It starts at the 280 by 308 it was, and
-  every pinned piece keeps the id it was pinned by.
-- **A Knob says what it's set to wherever that costs nothing to drag.** Any frame taller than the
-  two-block floor has a line the round face can't use, so the number goes under the face instead
-  of being left out. At the floor itself - a strip of track one row tall - the number starts at
-  four blocks of width and up, because below that the track left over is short enough to matter.
-  A 56 by 56 knob shows the face and where it points, as before.
-
-
-- **The Auto-Map splitter and collector list their ports the way the port strips do.** Each
-  row used to lead with its `×`, so the names started behind a column of buttons and staggered;
-  the list also set its own floor at 170 points and asked its dropdown for 150 more. The name
-  comes first now, cut only at the row's edge with the whole of it on hover, the `×` sits at the
-  right edge like every other list's, and adding one is a `+` whose dropdown can be as wide as
-  it likes because it's a popup. Each row carries a drag handle, and a port moved to another row
-  takes its wire and its entry in the layout's id list with it, because the engine reads these
-  pins by position. Their names are never shortened the way a small module's `in_2` is - which
-  port feeds what is the thing these modules are read for, as with a device module's pins - so a
-  long learned name makes the module wide instead.
-- **The Counter's settings are cells, not a column of labelled rows.** Its four settings were
-  a mode strip, an "Output" row, a "Step" row and a "Range" row with two captioned boxes: 336
-  points across, most of that the words "Output", "Step" and "Range" sitting beside the things
-  they named. The cells are the module now - the mode two per row so the words stay whole, the
-  output pair with its reset at the end of the row, the range and the step as pills - and it
-  comes to 196 wide by 168 tall: two blocks narrower than the labelled rows, and a third
-  narrower than the first cut of this redesign, which was still being held open by the width it
-  happened to be handed at birth rather than the one its cells ask for. Its six pin words are
-  drawn short on the canvas like the other small modules' (`inc`, `dec`, `rst`, `step`, `min`,
-  `max`): they're fixed by the module and the same on every patch. Its reset button is at the end
-  of the step row now - on the output row it stood on top of the `0..1` cell - and a pill's label
-  cell is the word plus a little air, measured, where a fixed 26 points cut into `step` while
-  the number's box took three times the room any count needs. With it the body-kit's
-  labelled rows are gone from the app entirely; what's left of the kit is the option strip and
-  the width and height a grip can set.
-- **Delay, Average and DC Filter are pills now.** Each one was a label, a slider rail and a
-  value box per setting, with a "Channels" row across the body on top: 252 points of module to
-  hold one or two numbers, of which most was the words beside them. The settings are pills you
-  drag across or double-click to type into, each with its word written above it - Window, Spikes,
-  Decay - rather than three letters inside it (`win`, `spk`, `dec`), and a channel - always an In
-  and its matching Out - is added from the header's `− +` the way the variadic operations add a
-  pin. The group is centred in the space under the header: the box it sits in carries a two-row
-  floor so one setting doesn't make a module shallower than its neighbours, and centring the
-  floor rather than the controls left Delay's single pill against the header with all the room
-  below it. Delay is 112 by 112; Average and DC Filter 140 by 112.
-- **A module's name no longer decides how wide it is.** The name in a header was laid out in the
-  row like a control, so it added its own width to the module: "DC Filter" needed a 168-point
-  module for two numbers where the same module called "Average" managed with 140, and at a
-  28-point step three letters cost a whole block. It's painted where the fold chevron leaves off
-  now, the room the control at the right edge needs comes off what it has to fit in, and it is
-  still left out rather than cropped when it doesn't fit - the module keeps its identity in its
-  shape and its hover text, and widening the frame brings the name back. Delay came down to 112
-  by 112 with it. An empty Readout was being held at two blocks by the word "Readout" the same
-  way, so it asks for that size by name, as a knob's dial does, and its floor is still whatever
-  its number needs.
-- **The Oscillator is a shape, a wave and two numbers.** It was three rows of small controls -
-  four shape buttons, a unit toggle and a DragValue, a "Phase" label with a DragValue and a
-  Bi/Uni pair split by a separator - and then a waveform stretched across whatever width that
-  left: 224 points of module for a shape and two numbers, most of it words and separators. The
-  shape is one strip of four cells, the wave a painted band between the shape and the numbers
-  (painting it costs no width), and the frequency and the phase are pills you drag across or
-  double-click to type into, each with the toggle that says how to read it beside it - hertz or
-  the period in milliseconds, -1..1 or 0..1. A pill whose pin is wired takes no drags: the wire's
-  value is what the module shows. 196 by 140.
-- **A Macro Output lists its ports like every other list.** Each port row used to measure itself
-  out as an icon button, a 96-point name field, a 58-point dropdown spelling out Bool / Float /
-  Vec2 / Any, a `✕`, and a button named "+ Add output" underneath: 308 points of module to name a
-  pin. It's handle, icon, name, the type as one letter with the names in the popup, and the `×` at
-  the right edge - in a column of a constant width centred on the module - with the `+` at the
-  right of the header beside the other lists'. Dragging a port past half a row moves it, and its
-  wires and its entry in `output_pin_ids` move with it, because the row order is the node's pin
-  order. 224 by 84.
-- **The Dropdown menu is a column of its options under its reading.** It sized itself from a
-  `box_width` parameter the user could dial up to 600 points, wrapped its reading in a resize
-  frame, led every row with its own `×`, and drew its handle as a monospace `≡` that nothing
-  else in the app uses. One constant column centred on the module decides its width now: the
-  current option as the reading on top, then a row per option - handle, the option's text cut at
-  the column's edge with the whole of it on hover, the `×` at the right edge - and the `+` that
-  adds one at the right of the header with the other lists' controls, where it can't be read as
-  one more option. 196 by
-  140. A patch that had set `box_width` keeps the parameter, which no longer moves anything, and
-  a dropdown pinned into a sub-patch layout still fills its container. Dragging a handle two
-  rows used to bounce the option back where it started, because the second step was counted from
-  the row the finger was on rather than from the option; the selection now follows the option,
-  not the slot, since the engine outputs whatever sits at the selected index.
-- **Every list of ports moves the same way.** Dragging a row of an AutoMap Combiner or a
-  Macro Output now does what a Selector's or a Split's strip does: the row rides under the
-  finger and the rows it passes slide into the gap it left, before you let go. The Combiner
-  used to stand still and draw a line where the row would land. A row dragged onto its
-  neighbour also moves that neighbour aside straight away - it sat on top of it until release.
-- **The grid's block is 28 points instead of 56, and the modules are the same size.** The
-  finer step is for the port lists: a strip row - a 25-point strip and the pin column's
-  3-point spacing - is now exactly one block, so a Selector's rows land on the grid at every
-  port count and the body left under the last strip is the same 26 points whether it has
-  three ports or seven. On the old block that space alternated between 26 and 55 depending
-  on whether the port count was odd. Nothing else moves: the floors and starting sizes that
-  were written as two blocks are four of these now, so a small module still starts 112
-  points square, a knob 112 wide, a note 168 by 112, and a small module's minimum had to be
-  written down where before the coarse grid supplied it for free. What does get finer is the
-  fit between those: a long number in a Constant now costs a 140-point width instead of
-  jumping to 168, and a sixth input on an Add takes a fifth block rather than a third. The
-  grid looks the same as it did - the brighter line now falls on every second block, where
-  the old block used to be, so the 28-point lines read as subdivisions of it. A setting saved
-  before this keeps its number, which now counts the smaller blocks - "brighter every 8"
-  brightens twice as many lines as it used to; the canvas grid menu sets it again.)
-- **Six modules came down to two blocks square: Switch, Knob, Inverse, Logic Delay, Has
-  Changed and Vec to Deflection.** They were two, three, five and six blocks wide, and in
-  every case the extra was a label rather than a control: rows that spelled out "Delay",
-  "Time", "Hysteresis" or "Angle" beside their values, or a name in the header wider than
-  the pins underneath. Inverse is `±` with a small sign/range button and a max pill; Logic
-  Delay is three rows in a box as wide as two blocks allow; Has Changed has its hysteresis
-  pill between the pin labels; Vec to Deflection is `∠` with one pill for the angle unit;
-  Switch's button is painted across the bottom of the frame instead of widening the column
-  between its pins; Knob is a dial filling the body, with no output label, its number in the
-  middle of the face and the Uni/Bi range switch in the header.
-- **Pin labels are short on the canvas and full on hover.** `out_0` and `in_11` come down
-  to their number, the kit's common words have fixed short forms (`dir`, `lat`, `sel`,
-  `chg`, `inc`, `dec`, `def`, `ang`…), and anything else longer than four letters loses its
-  tail — with the real name in the hover text. Only modules small enough for a block to
-  matter do this; a Remapper keeps its labels spelled out. The names stored in a patch are
-  untouched, so nothing that is already wired breaks.
-- **Quantize went from four blocks to two, and took the staircase mark.** Its body was a
-  Factor drag box and a Rounding choice with four words spelled out, one per row, which made
-  it wider than most modules that do far more. The mark now sits across the pin rows as it
-  does on every other operation, and the two settings are pills in the empty band under the
-  rows: a `÷` pill (the number counts subdivisions per unit, and the word "step" barely
-  fitted its own cell) dragged through doublings (1, 2, 4 … 1k), and the rounding word,
-  which opens a short list when clicked rather than being dragged through four words. The
-  corner grip is gone from it too: a body that allocates nothing has no room to ask for, so
-  the handle was a thing to grab that did nothing. Nothing in the body is allocated, so the
-  module's width is its pins' business; a factor coming down a wire shows on the pill and
-  the pill stops pretending to control it, and exact factors that aren't doublings are still
-  typed in the pinned field.
-- **Sample and Hold shows its numbers instead of a drawing.** The body now carries two
-  readings: what the wire is bringing in, in the header's strong colour, and what the
-  module is handing out — dim while the trigger or gate is idle, amber while it's doing
-  something, so *holding* and *following* look different without reading a tooltip. The
-  stepped curve that was there went to Quantize, which is what it always described. The mode stays a body
-  control, at the smaller size of the two-state button — this module's pins take 47 of the
-  98 points a two-block frame has inside its margins, and the house 52-point size would cost
-  it a third block — and the header's name gives way to an `S/H` mark for the same sums. The
-  second pin is `Trig`. The module is two blocks square, and a nine-figure value doesn't
-  change that: the readings fit themselves to the space rather than asking the module to grow.
-- **The Readout starts at two blocks and makes its number fill whatever it's given.** Three
-  was wider than any ordinary value needed. The type is what flexes, from 34 points down to
-  ten, and a value too large for four meaningful decimals is written in scientific notation,
-  so a reading keeps roughly the width the box was sized for; the box's floor is that
-  reading at the smallest size worth showing, so a long number asks for a wider module
-  instead of a squint. It takes the corner grip, in both directions, and comes back to its
-  floor when the grip is dragged in.
-- **A note's text field covers the body it was given.** No inner border a few points inside
-  the module's own frame, no padding that shifts with how much happens to be written: the
-  field spans what's inside the frame, and its height floor is filled in points rather than
-  in a guessed number of rows. More lines than fit still take the module another block.
-- **Selector and Split are columns of port strips.** Their ports are a list, so they are
-  drawn as one: a strip per port, each carrying the port's name — the field edits the pin's
-  own name, which is what the patch stores — a handle that drags the port up or down the
-  list, taking its wire with it because the engine reads these by position, and a `×` that
-  appears once there are more than two to choose between. `+` lives in the header at the
-  right of the name, the same square the `−`/`+` pair uses. A strip is drawn at the pitch
-  the pin rows are laid out at, and a numbered port draws no label beside its socket, so a
-  socket and the strip naming it are one row: adding a port moves the module by one row on
-  both sides, and a longer name takes the width it needs and hands it back when it goes. The
-  strips are one width, and they end at the edge their sockets are on — flush right for a
-  Split's outputs, flush left for a Selector's inputs — so the list fills the column instead
-  of leaving a gutter beside it. The one setting, interpolate, sits on the row its own pin is
-  on — alone above the strips for a Selector, at the left of the first strip for a Split,
-  whose strips own the top row and start after it. The port the selection is pointing at
-  wears a glowing edge; interpolating splits the glow between the two ports the value sits
-  between, so the light slides along the list instead of jumping. The
-  AutoMap Combiner's port rows wear the same strip, and its `+ input` moved to the header
-  with the others. Dropping a port leaves its neighbours' names as they were (`in_0`, `in_2`),
-  because that is what the patch stores; the strip shows it instead of renumbering behind
-  your back, and says the name in full on hover.
-- **A module's title no longer decides how wide it is.** A name too long for the frame is
-  left out rather than cut in half, and the header then reports only what it actually holds.
-  That used to matter only in theory: Quantize, Axis to Vec and their siblings reached their
-  two blocks because the word in their header was wide, not because anything in them was, so
-  those bodies now reserve a constant box and ask for their two blocks out of their own
-  content. Measured with the grid's sizing switched off, where nothing rounds anything up.
-- **The Knob fills whatever frame its corner grip gives it.** The face was a fixed 56-point
-  dial in a module that could not be resized at all: two blocks square, the rest of the frame
-  empty, and its name cropped by an edge it couldn't move away from. It takes the corner grip
-  in both directions now, like a note or a Readout, and the face takes the body: dragged wide
-  it becomes a horizontal fader, dragged tall a vertical one. The reading sits in the middle
-  of a dial and under a fader with a line to spare, so the control keeps all the room it can.
-  It draws in the same layout as every other module;
-  the stacked one it used is what let its body's height feed back into its own size.
-- **Settings you can drag can now be typed into.** The Inverse max, the Logic Delay time, the
-  Has Changed hysteresis and the Quantize `÷` answered a drag and nothing else: a drag can't
-  land on 250 ms or on 7 subdivisions, and the pinned field was the only way to get there. A
-  double-click — or Ctrl-click — opens a text field in the pill's own value cell, which
-  starts empty with the current value as its hint so what you type is what you get; Enter
-  commits, Escape drops it. The drag still works, and the hover text now says both.
-- **Vec to Deflection has a mark of its own:** a vector bent away from straight ahead with
-  the arc that says by how much, on the same lead stub as its Converters siblings. It also
-  holds its two blocks by its own content now; it was coming out one block wide, too narrow
-  to paint its unit pill in, so it showed nothing but pins.
-- **Four controls moved to the middle line.** Inverse's mode button and max, Logic Delay's
-  three rows, Has Changed's hysteresis pill and Switch's button were anchored to the top or
-  the bottom of the space under the header, which reads as off-centre however the arithmetic
-  comes out. They are centred in that space, and on the module, as the Constant's value and
-  resolution already were. The modules whose mark fills the frame keep their pill row along
-  its bottom: centring the pill there leaves the mark too short a band to read.
-- **The Switch makes room for the label you give it.** Its caption and icon are set from the
-  module's context menu, and the button was a fixed 64 points with the caption shrunk to fit
-  inside them — a two-word label came out at eight points. The button is now measured from
-  the stored caption at the size it's painted at, with the icon taking a square beside it or
-  above it wherever it was put, and that width is what the module reserves: a long caption
-  takes another block and hands it back.
-- **A knob shows its number, and goes slim.** A dial keeps its reading in its middle and
-  takes the whole body for itself — giving a dial up a line of frame for the text just makes
-  the thing you drag smaller — and its indicator now stops short of the middle so the two
-  don't cross. A fader with height to spare writes the number under its track; a strip a block
-  tall has nothing under, and takes it at the end of the track. A fader is thin by design, so
-  the grip can take a knob to one block in either direction; a knob starts two blocks square.
-  **Collapsed, a knob draws no face and shows just its number** in the band under its header,
-  which the frame keeps: collapsing one is how the user keeps it from being nudged while
-  moving other things about it, and a folded knob that still reads is worth having.
-- **Inverse wears its name again.** `±` reads as arithmetic rather than as "negate", and the
-  word fits the two blocks its pins need anyway.
-- **The Combiner's port rows are one strip wide.** Each row carries a port name, a device
-  label and a dropdown; with different devices attached the rows came out at different widths
-  and the list read as a stack of separate controls. Every row is now as wide as the longest
-  name and label in the list, and the resolution dropdown is pinned to the strip's right edge
-  instead of trailing wherever the port name happened to end. Its drag handle gives the same
-  grab cursor the Selector's and Split's handles give.
-- **A port row is half a block tall.** A strip is 25 points and the pin column adds its
-  row spacing, so a row advances exactly 28: two rows to a 56-point block with nothing left
-  over. At 27 the list gained two points on the block every two ports, which is why the empty
-  band under the last strip slid around — 28 points of margin at one port count, 36 at another
-  — instead of being the same margin every time. It is now the same margin at every count:
-  about 26 points under an even number of rows, about 55 under an odd one, because the header
-  band the list starts under isn't a whole number of rows deep. Closing that last step is a
-  decision about the header's margins, not about the strips.
-- **A port list fills its module, and its module stops at three blocks.** The handle and the
-  `×` are 13 and 14 points rather than 16 and 18, and a name cell opens at 28 instead of 40, so
-  a list of short names — a Split out to `1`, `3`, `5`, `6` — asks for three blocks wide at any
-  number of ports. The ask is content: the parts of a row plus the longest name. The strips are
-  then drawn as wide as the column the frame leaves, which is what stops them ending in the
-  middle of the body.
-- **Header names are cut to fit instead of vanishing.** One rule on every module: measure the
-  room between where the name starts and whatever sits at the frame's edge, draw the name whole
-  if it fits, the start of it with dots if only part of it does, and nothing at all if the room
-  is smaller than a word worth reading. It used to be all-or-nothing; and on the modules with a
-  control against the header's right edge the room was estimated from the frame's width rather
-  than measured from where the name lands, which is how half a letter came to stand under a
-  stepper.
-- **The Counter lost its corner grip.** Its cells ask for one size - a count, a pill, two
-  buttons - and a grip let the same module stand at four sizes in one patch with nothing between
-  the cells to show for it. It stays 196x168, and a width an older patch wrote into it is
-  ignored.
-- **A dial says its value once.** A knob with height to spare under its face wrote the number
-  both in the middle of the dial and under it. Now it goes under, and inside the face only when
-  there is nowhere else for it.
-- **A Macro Output spells its port types out** - Bool, Float, Vec2, Any - rather than a letter
-  you had to open a menu to read, on the one module whose rows are its pins. The module pays a
-  block of width for the row: 224x84 becomes 252x84.
-- **A Dropdown's choice is green.** The `shift` inlet is drawn green rather than the blue a
-  Float pin wears, and so is the option currently coming out of the module - which with that
-  pin wired is not necessarily the one the module was set to. Type colours say what kind of
-  number a pin carries; this one says which pin is deciding.
-- **The grid's brighter line starts off, and the choices are odd.** A bright line every second
-  block was the old 56-point grid showing through a 28-point one. It isn't needed, and an even
-  step puts the bright lines through a module four blocks across rather than around it: the menu
-  offers no highlight - what ships - or every 3, 5, 7 or 9 blocks, and 5 brackets a 4x4 module.
-- **The grid stays when you zoom out.** Past the point where 28-point blocks crowd together it
-  draws those same lines every second, fourth, eighth block, at a floor of brightness, so a
-  zoomed-out patch still says how big a module is. It used to fade to nothing by about 50%.
-- **An Envelope spends the width it is given on its length.** The number saying how long one
-  pass takes sat in a box that never grew while the `ms | s | Hz` buttons beside it did. It is
-  a pill like every other setting now - the rest of its row, dragging and taking typing - and
-  the unit buttons went down to the three two-letter words they are. A row's share of a band
-  is now what it asks for rather than an equal split, so the row carrying a strip and a number
-  is not left shorter than the row carrying two grid numbers.
-- **The Envelope's behaviour switches are drawn, not written.** A magnet for snapping to the
-  grid, the flat-topped shape the curve makes while it holds, an arrow out and one back for
-  bouncing, a ring with its head at the gap for looping - drawings in the module glyphs' idiom
-  (`app/assets/{magnet,hold_env,bounce,loop}.svg`, painted by `viewer/glyphs.rs`, for the
-  response-curve family to borrow too), each on a button plate whether it is on or off. Unicode
-  characters were not an option: the fonts a build happens to carry have no magnet, and an emoji
-  codepoint arrives as a colour bitmap or a box. The words are in the tooltip, each next to the
-  sentence that says what the switch does.
-- **An Envelope's graph reads out under the pointer.** With `labels` on, the pointer (or the
-  gamepad cursor) over the graph shows when that is and the level that comes out then, as on a
-  Response Curve. The times along the grid moved to the bottom edge, where a peak's own number
-  doesn't land on them, and the curve is one joined line that reaches the tip of every point.
-- **A Macro's ports are a strip column, like a Split's.** The rows sit on the pitch its
-  sockets are laid out at, so a port's socket is level with the row that names it and adding a
-  port moves the module by one row on both sides. The name beside the socket is gone - it was
-  the same word twice, and it was what held the module wide - and the rows run the body's full
-  width, so three ordinary ports take 196 points rather than 252.
-- **A Macro Output's rows are as wide as the names on them.** The list asked for a constant 180
-  points whatever its ports were called: an ordinary two-port Macro stood a block wider than its
-  rows needed, and a port with a real name was cut at a 68-point cell. The name's share is
-  measured now, clamped to the same 28..140 a port strip clamps to, so `On` and `Off` come out
-  seven blocks across and a port called "Right Trigger, half pressed" takes the width it costs to
-  read it - which is the point of the module, since these rows are its pins.
-- **A Readout is no longer a big module.** It starts three blocks across by two down rather than
-  four by four, and the corner grip takes it down to one block by two - enough for a row of
-  readings along a patch, each showing its number as large as the box allows. A long value at
-  that size is cut at the edge rather than widening the module, which is the same bargain the
-  type already made: the reading gives way, the module does not.
-- **A pinned Envelope graph can be drawn differently from the module it came from.** The overlay
-  inspector's graph row - the one that already carries a copy's colours - now also offers
-  `grid`, `labels` and `snap`, each with `module` (follow the module on the canvas), `on` and
-  `off`. `module` is the default, so every copy saved until now looks exactly as it did. The
-  switches are no longer something to pin: the module keeps them in its header, and a copy sets
-  its own in the inspector, which is where a widget's settings were always going to live.
-- **The Envelope got compact, and its graph switches moved up.** Its rows are one block of the
-  grid tall, so every block the corner grip hands the module goes to the graph; the default is
-  280x252 instead of 280x308, and a frame too short for its rows grows taller rather than
-  eating the curve. `grid` and `labels` are two small switches against the header's right edge,
-  where the pin stepper and the `+` live - they were a row of two full-size buttons costing a
-  quarter of the module's height for two switches - and the element the Properties shelf can
-  pin keeps its id. The sustain rail takes the row it is given instead of egui's 96 points, so
-  widening the module buys a level you can set precisely. Its pins are drawn short on the
-  canvas - Trig, the full word on hover - as the other small modules' are.
-- **An Envelope's curve says what its points are.** Each point paints its level beside the
-  dot, the way the Response Curve's points do, and hovering one gives the level and where
-  along the envelope's length it falls, in the unit the module is timed in. Until now the
-  graph was the only place any of that was written, and it wrote none of it.
-- **Reordering a Dropdown menu or a Macro Output fought the list.** The dots at a row's end
-  were the only place a drag could start, so the same gesture on the word beside them - where a
-  finger actually lands - did nothing at all. The row being dragged now comes with the finger
-  and the rows it passes step aside a row, the way the Split and Selector strips do; the
-  distance travelled is carried while the button is down rather than only while egui still
-  reports that row as dragged, which is what made a long drag land somewhere other than where
-  it was picked up; and a drag is never also a click, so passing an option no longer chooses it.
-- **A drag of a Dropdown option or a Macro port stopped at its neighbour and flickered on the
-  way.** The move was committed a row at a time while the same move was also being drawn as an
-  offset from the row's slot, so the list jumped back and forth under the finger; the grip was
-  a label, so it took on the list's selection colours mid-drag. The list holds still while you
-  drag - the picked row follows the finger, the rows it passes slide aside - and the move lands
-  as one move, to wherever the row was held, when the finger leaves. The grip is painted, and
-  brightens only for the row being held.
+  longer wears an emoji: `keep colours` is a two-state button. What the rows used to take in
+  height, the pad now has. Its Orientation input reads "Orient".
+- **The 3D viewer's colours are pills that wrap,** each with the part's controller icon (or a
+  word) and its swatch, outlined so it shows on the pill, inside the module's width - the
+  Buttons row of seven swatches widened the module when Colours unfolded. Colours folds by a
+  section heading, saved with the patch.
+- **Colour presets for the 3D viewer, and the pads in their own colours.** A preset picks the
+  model's own colours, a plain grey, or one you saved: Save… opens in the user models folder,
+  under the model's `presets`, and what is saved there is listed. The models' own colours are
+  their launch colourways, where most were a dark grey stand-in: Jet Black DualShock 4,
+  Indigo GameCube with its stick rims in their sticks' colours, the WaveBird in the GameCube's
+  colours, neon blue and red Joy-Cons (on the grip too), black Switch Pro, a soft off-white
+  Xbox 360, black Xbox One, and the Steam Controller (2026) matte black with the Steam Deck's
+  grey-on-black buttons. Face buttons are black under their coloured letters and symbols; a
+  Joy-Con's SL and SR and any pad's paddles are the bumpers' colour; the Xbox One's battery
+  cover is shell, where it was taken for a white LED strip.
+- **The 3D viewer has no background by default,** on the module and on a pin: the pad stands
+  on whatever is behind it. A pin's style can still give it one.
 
 ### Fixed
 
-- **JSM Config's tabs sit on the editor and scroll when there are more than fit.** A band of
-  the body's colour separated the tab in front from the editor under it; now the tab is the
-  top of the editor, outlined in its frame. Tabs that overflow get the scroll bar the patch
-  tabs have, over their bottom edge while the pointer is on them, and the wheel or a
-  trackpad's two-finger scroll over them runs along them, on the canvas and in Easy mode.
-  Pinned, the editor scrolls with the wheel or a trackpad too (only its scroll bar moved it),
-  its text stays inside it rather than showing over the tabs, and beside the faders it runs
-  their whole height - it stopped short by up to a line and a line of counts that wasn't
-  there. With the last tab in
-  front, the strip shows the `+` after it too - it was left off the end.
 - **Zoomed-in text and icons are sharp.** Easy mode draws its layout bigger to fill the panel
   and the canvas zooms by scaling what's drawn, and both stretched text and icons rasterized
   for their size in points: twice the size was twice as blurry, worst on a 1080p screen at
@@ -1101,68 +678,31 @@ All notable changes to FlexInput are documented here. This project adheres to
   rasterized for the size it's drawn at, in steps of an eighth of an octave up to four times,
   and so are the button glyphs, module marks, icons and Switch pictures (a Switch's picture
   was rasterized at its size in points even at 100%).
-- **Pinching a touchpad over a knob or fader zooms the canvas and leaves the knob alone.**
-  Windows sends a touchpad pinch as the mouse wheel with Ctrl held, and a knob or fader under
-  the pointer took it as a turn of the wheel.
+- **Pinching a touchpad over a knob or a value zooms the canvas and leaves it alone.**
+  Windows sends a touchpad pinch as the mouse wheel with Ctrl held, and a knob or value box
+  under the pointer took it as a turn of the wheel.
 - **Pinching a touchpad zooms the canvas on Linux (Wayland).** Only two-finger scrolling came
   through before; the pinch is now read from the compositor's pointer gestures.
-- **The grid doesn't go out between its zoom steps.** Zoomed out, it draws every second,
-  fourth, eighth line, but it used to fade the whole grid to nothing just before each step,
-  so at some zooms there was next to no grid. Now the lines a step keeps stay as they are and
-  only the ones it drops fade out, all the way by the time it's taken.
-- **3DOF to 2D's preview draws a Joy-Con at a pad's size.** The pad was sized by its width
-  across the grips, and a single Joy-Con is narrow across and long nose to back: its icon came
-  out over twice the sphere's size and its model nearly the sphere's. Both are now sized by
-  their longer side, so every pad takes the same room.
-- **Two-way Response Curve shows the crossover.** After a lane switch the output crosses from
-  one lane to the other over the crossover time, but the graph's point jumped there at once;
-  it now crosses with the output, dashed on to where it is going.
-- **Auto-Map sockets and their wires no longer jump when a module folds or unfolds.** A
-  socket on the header took its place from last frame's distance to the pin column, which
-  folding moves for a few frames; it now hangs off the module's top.
 - **A big tooltip in a small window no longer blinks.** One too big to fit beside what it
   explains is pushed back over it, and egui keeps such a tooltip open while the pointer is on
   its widget - but on the canvas it compared the screen's pointer with the widget's place on
   the zoomed canvas, so it closed and reopened every other frame. egui is vendored for the
   one line (`vendor/egui`).
+- **Two-way Response Curve shows the crossover.** After a lane switch the output crosses from
+  one lane to the other over the crossover time, but the graph's point jumped there at once;
+  it now crosses with the output, dashed on to where it is going.
 - **Two-way Response Curve's trail outlasts a lane switch.** It was wiped the moment the
   signal flipped lanes, whatever the trail time; each lane now keeps its own, fading on its
   own clock.
-- **Pinned 3DOF to 2D Pointer and Steering rows both answer the mouse.** Pinned side by side
-  in Style 2, their cells had the same ids (one field each, on the same node), and a click
-  on either went to whichever row was drawn last - the top of the layout's order. The pad
-  reached both all along. Every Style 2 row's controls are now told apart by the row.
-- **Action buttons stay on one line at any control font size.** At 16 points and up the
-  AutoMap Collector's "MIDI…" broke onto two lines, its dots under its letters; a word now
-  comes a size down to fit its button instead, and a row's buttons share one size.
-- **A Log/Exp scale set with a pad moves the curve's points with it,** every lane's, as the
-  slider does: the pad's field editor wrote the scale alone, which left the points where
-  they were on the graph and changed what each one stood for - most noticeable on a pinned
-  Two-way curve, where the pad is how it is edited. Reset to default (North) does the same.
-- **The Easy panel's mouse speed box stays inside its card** at a larger font: it was a fixed
-  56 points, and its number ran past the card's right edge.
-
+- **A bipolar curve's Log/Exp grid was off-centre with an odd number of lines.** The lines are
+  spaced out from the centre, so the middle one sits on zero whatever the count.
 - **An AutoMap Two-way curve's pinned rows can be edited with a pad on a layout.** Nav
   looked a layout's pin up under the AutoMap curve's own id, which no row table knows, so
   the pad reached the graph and none of the rows - while on the config overlay, which
   names it as the plain curve it runs, they worked. The AutoMap Response Curve's rows had
   the same trouble.
-- **The 3DOF preview draws the Xbox pad when nothing names one**, as an icon and as a model,
-  and so does the 3D viewer's model. It drew the generic gamepad glyph, and the model that sorted
-  first, the DualSense. And a sub-patch's layout traces the pad it is wired to while it is
-  being edited too, where the preview lost it and fell back.
-
-- **The AutoMap Combiner no longer widens without end** with its Resolution tree open on a
-  category. Each row put its two dropdowns against the edge the port strips end at, and that
-  edge followed the module's frame: a dropdown came out wider than it was asked to be (its
-  text more than fitted beside its arrow), ended past the edge, the frame grew to hold it,
-  the edge moved out with it, and so on every frame. The dropdowns now have a cell of their
-  own that can't widen the row, and a dropdown's text is fitted to the room its arrow and
-  padding really leave.
-- **Pill dropdowns fill their cell.** Every `add pin`-style dropdown ended a little short of
-  where it was meant to - under the AutoMap Splitter's strips, beside the pills of a row -
-  having taken its padding off twice.
-
+- **The 3D viewer draws the Xbox pad when nothing names one.** It drew the model that sorted
+  first, the DualSense.
 - **Gravity is JoyShockMapper's own estimate, everywhere it is measured against.** The JSM
   module (its gravity gyro spaces, motion stick, lean and steering), 3DOF to 2D's Player and
   World, and Gyro to Stick Rotation's World each low-passed the accelerometer on its own -
@@ -1182,31 +722,10 @@ All notable changes to FlexInput are documented here. This project adheres to
   how far gravity has swung about the wheel's axis since the last Reset: the pad's own down
   in Pitch+Yaw, held upright and turned in its face like a wheel, its forward in Pitch+Roll,
   held flat and rolled. Player, World and Orient turn the wheel about gravity itself, which
-  gravity can't see, so only a Reset centres them; `ctr` greys out there. The Steering row's
-  modes have tooltips of their own (they said what the Pointer row's do, JoyShockMapper and
-  all - JoyShockMapper has no added-up steering; its lean steering is a tilt read off
-  gravity).
-- **A pinned 3DOF mode row in Style 1 holds its size.** With Orient's fifth choice it had no
-  slack, and the frame and the row chased each other between two sizes (fonts round to half
-  points, so the row measured differently at each scale); it now sizes from its words.
-- **Feedback Control's override switch** shortens to "override" in a narrow header, where its
-  phrase wrapped onto two lines inside the button.
-- **Pads' 3D models in their stock colours.** The Steam Controller (2026) is black - its one
-  colour, matte, with the Steam Deck's grey-on-black buttons - where its shell, trackpads,
-  bumpers and triggers were light grey. The Xbox One's battery cover was taken for an LED
-  strip and drawn white; it is shell. Its face buttons and the DualShock 4's are black under
-  their coloured letters and symbols (each tinted toward its colour, the letters having no
-  mesh of their own), where they were solid colour. A Joy-Con's SL and SR, and any pad's
-  paddles, are buttons the bumpers' colour; on a neon Joy-Con they came out neon.
+  gravity can't see, so only a Reset centres them; `ctr` greys out there.
 - **3DOF to 2D's Reset goes all the way.** Its ease took a fixed share of what was left each
   tick and stopped when its time ran out, a third of the way short: a pose Reset from 90°
   stopped at 33°, and Steering's X and Y kept a third of what they had. Both land on zero.
-- **3DOF to 2D's preview shows the 3D model** when its look is "3D model": the model was
-  rendered and then composited at zero opacity, so the sphere stood empty. It is drawn
-  half see-through now.
-- **A module scrolled off the canvas left its Auto-Map socket, and the wire, on the canvas
-  edge.** A socket drawn on the header row took its height from the clip, and a node partly
-  out of view has its clip cut to the canvas. The socket now follows the header as laid out.
 - **A Steam Controller hidden by FlexInput reached Steam Input again after a restart.**
   Hiding a controller stops programs opening it, not ones that already had - and Steam opens
   a Steam Controller the moment FlexInput's exit unhides it, so the next start's hide left
@@ -1221,184 +740,29 @@ All notable changes to FlexInput are documented here. This project adheres to
   buttons, the bumpers, Back and Start, and whichever stick is walking or editing - is now
   kept from the game while it does, passthrough or not. A calibration sweep still lets the
   stick and the pad's turn through; only its Finish and Cancel are held back.
-- **A module whose header was wider than its body could be narrowed below its own header.**
-  The body took the width the grip asked for and the header stuck out of it; a Response Curve
-  or a Remapper dragged narrow drew its rows across the frame's edge. The body now never goes
-  narrower than its header holds.
-- **A bipolar curve's Log/Exp grid was off-centre with an odd number of lines.** The lines are
-  spaced out from the centre, so the middle one sits on zero whatever the count.
-- **A Vectorscope flickered while it was resized.** It holds still under the grip now.
-- **A Macro Output port with a long name painted over its own row.** The name was a text field
-  open in every row, and an open field lays itself out at whatever width its text wants: a port
-  called "Right Trigger, half pressed" drew across the signal-type dropdown, the `×` and the
-  module's own edge, while the row's clamp only ever bounded what the row *asked for*. The name
-  is painted now, cut with an ellipsis at the cell's edge and the whole name in the hover text;
-  a click opens the field in place, empty with the old name as its hint - egui has no
-  select-all-on-focus, so a prefilled field is a field that appends, and typing `Kick` at a port
-  called `Left` used to leave it called `LeftKick`. The word is a grab as much as the dots
-  beside it are, so a finger that lands on a port's name reorders it, wires and all.
-- **A Macro row's type dropdown and `×` trailed its name.** They sat wherever the row's flow
-  left the cursor, so the column of `×`s was a column only by accident and stopped some fifteen
-  points short of the edge its sockets hang off. Both are pinned to the row's right edge, and
-  the names of all the rows start at the same x whatever they say.
-- **An Envelope's setting rows spent their width on planks.** The grid divisions across time and
-  value were bare drag boxes with " H" and " V" stuck on the end - widgets in a style nothing
-  else on the module wears, hugging the left of a row often twice as wide as they were - and the
-  snap button took whatever was left over, 111 points of it at the widest frame measured. The
-  behaviour buttons divided their cell by three, which made a default-width row carry three
-  69-point buttons with a 16-point glyph lost in the middle of each. The divisions are two pills
-  and a square at the row's right edge now, the behaviour switches stay squares the height of
-  the row, and what a wider row buys them is air between them, capped so each group still reads
-  as one control.
-- **An Envelope's sustain rail stopped 79 points short of its own number.** The rail's width was
-  worked out from a guessed 62 points of label and a guessed 58 points of reading; the label is
-  28 points in the font it's painted in and the reading is 18, so the track ended in the middle
-  of the row with the percentage at its far edge. The row measures what it paints now and the
-  rail runs up to the number it sets.
-- **A folded module drew its own body across its name.** Snarl runs the body of a collapsed node
-  and shifts it up under the header's clip, so a folded Macro Output painted its first port -
-  icon, name, signal type, `×` - straight over the words "Macro Output", a folded Dropdown put an
-  option over "Dropdown", a folded Oscillator its phase number over "Oscillator". Worse, what is
-  drawn is also clicked: a folded Envelope's graph handles and a folded Selector's strip rows sat
-  in the space above the frame, out of sight, and answered the pointer there. A folded module
-  keeps the width its rows ask for and paints nothing but its header - every module, from one
-  place, rather than each body remembering to. The words beside its
-  sockets go with the body - they were already being painted in the clipped column, and were what
-  made a folded module a block wider than the header it had become.
-- **A Dropdown menu saved before it had a `shift` pin now gets one.** A node's pins are stored
-  with the patch rather than read back from the module registry, so menus drawn before the pin
-  were added stayed unshiftable - the control was in the registry and nowhere on the canvas. The
-  module gives itself the missing pin the first time it draws.
-- **A knob narrowed to 84 points lost its reading.** When a fader strip has no room under it,
-  its number goes at the end of the track and the track shortens for it — but it only did that
-  while at least 36 points of track were left, and below that the reading was simply not drawn.
-  The finer grid makes an 84-point-wide knob reachable, where 27 points of track remain: the
-  track now gives way to 24 points rather than the number giving way altogether.
+- **A pinned JSM editor scrolls with the wheel or a trackpad.** Only its scroll bar moved it.
+- **A folded module drew its own body across its name.** A collapsed node's body still runs,
+  shifted up under the header's clip, so a folded Dropdown put an option over "Dropdown", a
+  folded Oscillator its phase number over "Oscillator", a folded knob a slice of its dial
+  across the header - and what is drawn is also clicked: a folded Envelope's graph handles
+  sat in the space above the frame, out of sight, and answered the pointer there. A folded
+  module paints nothing but its header (and, for a Knob, Constant or Readout, its number
+  under it) - every module, from one place.
 - **Dragging a Combiner's row moved the port but left its settings behind.** Two of the
   Combiner's settings are stored by port number — the merge policy a port's pins follow unless
   a pin says otherwise, and a pin pinned to one particular port. The engine reads ports by
   position, the lowest one offering a pin wins, so after a row was dragged down the device
   that moved kept the policy belonging to the slot it landed in, and a stick pinned to a
   controller was suddenly pinned to whatever took its place. Both now follow the port.
-- **The strips and their sockets were on two grids again, three points apart per row.** The
-  body placed its strips at one pitch while the pin column advanced its rows by another: in a
-  `Coil` layout the column adds its own row spacing, and takes row heights from the other side,
-  so asking both sides for the same number doesn't make them advance the same amount. Each port
-  moved a socket a little further off the strip naming it, and the pins' column — taller than
-  the list the body had reserved — set the module's height, so the empty band under the last
-  strip grew with every port added. One pitch, two numbers: a row is allocated `STRIP_H`, the
-  strips are painted at `STRIP_H + spacing`, and what's left under the last strip is the
-  frame's margin at every port count.
-- **A port list stopped short of its own sockets.** A strip was as wide as its longest label,
-  so a Split with short names left a gutter between the list and the output sockets and the
-  module looked twice as wide as anything in it. The list now spans the body column, flush with
-  the edge the sockets are on; the name's width is only the floor, which is what steps the
-  module a block wider when a name runs out of room.
-- **A knob stopped showing its number at most sizes.** The number was painted — with a painter
-  made for the control's own rect, and such a painter clips to that rect, so a number written
-  under a track fell outside it and was cut away. The reading gets a painter clipped to the
-  body column instead.
-- **A collapsed knob drew a slice of its dial across the header.** A collapsed node's body
-  still runs, and the fork shifts it up under the header's clip. Folded, the knob now paints
-  no face at all and writes its number in the band under the header — with a painter clipped
-  to the frame, since a collapsed body is nothing to clip against.
-- **A folded module's name sat on top of its sockets.** With no body to hang them on, a
-  collapsed node draws its sockets at the ends of the header row, while the name was measured
-  against the frame alone. The sockets' room now comes off the name's room.
-- **A long name still decided how narrow a module could be.** The header reported the name as
-  part of what it held, so the node's `max(header, pins)` width kept the frame at the name's
-  width and the name was never given the chance to hide. The header reports only its controls.
-
-- **A Sample and Hold body showed a dash where its incoming value should be, and its output
-  never changed colour with the trigger or gate.** The engine mirrors a node's input signals
-  to the display only for a named list of modules — and Sample and Hold wasn't on it, in
-  either of the two places that list is kept (top-level nodes, and nodes inside a sub-patch).
-  The output reading looked fine because a node's *outputs* are mirrored for every module,
-  so half the body was right and the other half was stuck at a dash and a resting grey. A
-  test now ticks a graph and asserts the module's two inputs reach the display.
-- **Its two readings were painted up among the pin labels.** They were divided through the
-  body column, which is only as tall as the pin rows, so the input line landed next to the
-  header like a stray mark. They are anchored to the bottom of the frame now, the part a
-  two-block Sample and Hold has nothing else in.
-- **A note could be dragged wider but never narrower.** Its header puts the font size and
-  colour against its right edge, and a block laid out right-to-left draws against the
-  frame's edge — so the header's used rect spanned the whole node, and the node's width
-  formula, `max(header, pins)`, kept it at whatever width it already had. The viewer now
-  reports what its header actually holds, and the grip's floor comes from what the body
-  needs rather than from the frame as it stands; both were ratchets, and the note goes back
-  to the size it opened at.
-
-- **Abs and NOT have their marks back.** They came out the right size — two blocks, square
-  like their siblings — with nothing painted on them. Making room for a mark and then
-  telling it to start below the room it was just given leaves six points of band and no
-  glyph, which is what happened. A test now checks the mark was drawn, not only that the
-  frame is the right shape, and it covers all 21 modules with a mark: a module can measure
-  perfectly and still show an empty body, and only one of those two facts was being
-  checked.
-
-- **A Constant stops rounding, and starts answering the drag again.** The box read its
-  value through a 32-bit float, which is what the wire carries — about seven exact digits
-  — so an eight- or nine-digit number was rounded on the way in, and then looked frozen:
-  at that size the gap between neighbouring 32-bit floats is wider than the drag step, so
-  every drag computed a change, stored nothing, and only typing a smaller value brought the
-  box back to life. The box now keeps the number as it is stored, moves it in whole
-  resolution steps — tenths where it reads tenths — and clamps at ±1e12, far inside what
-  the wire can carry, with the limit and the 32-bit reality spelled out in the hover text
-  instead of being discovered by watching digits misbehave. A test puts in a nine-digit
-  number, checks it comes back unchanged, drags the box and checks the value moved, and
-  checks a hundred-digit one is clamped.
-
-- **The value and resolution pair sits where it should.** They were centred on the module,
-  which includes its header, so the stack hung high with all the empty space beneath it and
-  read as off-centre no matter how the arithmetic came out. They're centred in the space
-  under the header now, horizontally on the module as before.
-
-- **Four values that had become drag-only.** The Inverse max, the Logic Delay time, the Has
-  Changed hysteresis and the Quantize factor were moved from a value box into a pill when
-  those bodies came down to two blocks, and the pill only answered a drag: no click, no
-  typing, no way to set an exact number from the canvas. It does all three now, and a test
-  types `250` into one and `7` into another and reads them back.
-
-- **Quantize's `÷` pill was cut off by its own frame.** The two pills measured 102 points
-  across a body 100 wide, so each side ran a point past the clip and the division sign lost
-  its edge. The label cell is 14 points instead of 18 and the pills are 44 and 40, which
-  leaves six points of air either side with both values still legible.
-
-- **The value pills in the small modules had a square left end.** A pill is painted as two
-  cells, the label with its left corners rounded and the value with its right ones. When the
-  label is empty — which is how Inverse, Logic Delay, Has Changed and Vec to Deflection paint
-  theirs now — nothing rounded the pill's left side, so it looked clipped by the frame edge.
-  An empty label cell isn't painted at all now, and the value cell takes all four corners.
-
-- **The AutoMap Combiner's port rows and its sockets were on two different grids.** The rows
-  are laid out in the body and the sockets in the pin column, and the column was told to use
-  a fixed 28-point row while the rows themselves came out whatever the dropdowns happened to
-  measure. They now share one expression — the style's widget height plus the frame's padding
-  — which each side computes from the same style, since the pins are laid out before the body
-  and neither can measure the other.
-
-- **A Split's first port was set in from the others, and its name ran out of the strip.** The
-  interpolate toggle was sharing the first strip's band, which made that strip narrower than
-  the ones under it and left its name no room, so the column looked like a ladder and the text
-  hung past the edge. The toggle has its own band now, above the strips, as it does on the
-  Selector; every strip is the same width from the same edge, and a name too long for its cell
-  is cut with an ellipsis with the whole name in the hover text.
-
-- **A port name the user typed could outgrow the strip that shows it.** The strip's width is
-  measured from the name and capped, so a name past the cap painted over the strip's right
-  edge. It is cut to fit, and the full name is in the hover text.
-
-- **Has Changed's and Vec to Deflection's pills sat under their own pin labels.** The pill is
-  painted across the frame rather than into the column between the labels, which is what keeps
-  those modules two blocks wide — but the label column (`chg`/`inc`/`dec`) is wide, and a
-  56-point pill centred on the module ran into it. The drawn width is now capped to the space
-  between the labels; the module's size is unchanged.
-- **A value pill opened empty.** The field a pill opens painted the current number behind it in
-  grey and gave the caret nowhere to go, so a pill could be reset but never edited: a new value
-  could be typed, a digit in the old one could not. It opens holding the value with all of it
-  selected, so typing replaces it and Backspace and the arrows do what they say. The grey hint
-  stays for the case where the field has been cleared, and committing an empty field still
-  leaves the value alone.
+- **Dragging a Dropdown option two rows bounced it back where it started,** because the second
+  step was counted from the row the finger was on rather than from the option; and the
+  selection now follows the option, not the slot, since the engine outputs whatever sits at
+  the selected index.
+- **A Constant kept a long number.** The box read its value through a 32-bit float, so an
+  eight- or nine-digit number was rounded on the way in and then looked frozen: at that size
+  the gap between neighbouring 32-bit floats is wider than the drag step, so every drag stored
+  nothing. The box now keeps the number as it is stored, moves it in whole resolution steps,
+  and clamps at ±1e12, with the limit and the 32-bit reality in the hover text.
 
 ## [0.17.1] - 2026-11-10
 

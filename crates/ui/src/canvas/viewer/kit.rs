@@ -84,6 +84,9 @@ pub(crate) fn surface_spec(module_id: &str) -> Option<SurfaceSpec> {
         | "module.automap_twoway_response_curve" => spec((120.0, 100.0), (12.0, 13.0)),
         "module.vec_reshape" => spec((140.0, 160.0), (11.0, 15.0)),
         "display.controller3d" => spec((80.0, 60.0), (11.0, 14.0)),
+        // The Input Viewer's board, scaled by the grip to keep its shape: half its drawn
+        // size at the least, and the size it was always drawn at to start with.
+        "module.input_viewer" => spec((210.0, 100.0), (16.0, 9.0)),
         // The 3DOF module's viewport: the gimbal and the output plane. Its rows of settings
         // and its two Lean card lists are what the surface shares the frame with.
         "processing.gyro_3dof" => spec((112.0, 84.0), (18.0, 26.0)),
@@ -107,7 +110,7 @@ pub(crate) fn surface_spec(module_id: &str) -> Option<SurfaceSpec> {
 
 /// Modules whose surface has one shape whatever the frame: their width is their size.
 pub(crate) fn keeps_aspect(module_id: &str) -> bool {
-    matches!(module_id, "display.vectorscope")
+    matches!(module_id, "display.vectorscope" | "module.input_viewer")
 }
 
 /// The surface of a [`surface_spec`] module, this frame: as wide as the body it was handed
@@ -174,7 +177,8 @@ pub(crate) fn body_height(
     min_h: f32,
     block: Option<f32>,
     default: Option<f32>,
-) -> f32 {
+    ease: Option<SizeEase<'_>>,
+) -> (f32, bool) {
     let whole = |w: f32| block.map_or(w, |b| ((w - 0.5) / b).ceil().max(1.0) * b);
     let wanted = node
         .params
@@ -182,10 +186,11 @@ pub(crate) fn body_height(
         .and_then(|v| v.as_f64())
         .map(|h| whole(h as f32))
         .or_else(|| default.map(whole));
-    let Some(frame_h) = frame_h else { return wanted.unwrap_or(avail).max(min_h).floor() };
+    let Some(frame_h) = frame_h else { return (wanted.unwrap_or(avail).max(min_h).floor(), false) };
+    let (wanted, easing) = eased_wanted(wanted, ease, "h");
     let around = frame_h - avail;
     let frame = wanted.unwrap_or(frame_h).max(min_h);
-    (frame - around).max(min_h).floor()
+    ((frame - around).max(min_h).floor(), easing)
 }
 
 /// Bodies that are a mark and a couple of pills, painted across the frame and reserving
@@ -478,6 +483,104 @@ pub(crate) fn toggle_outline(v: &egui::Visuals, on: bool, hovered: bool) -> egui
     egui::Stroke::new(1.0_f32, color)
 }
 
+// ── Two columns side by side ──────────────────────────────────────────────────
+
+/// How wide the bar between a body's two columns is, laid side by side ([`beside`]).
+pub(crate) const BESIDE_BAR_W: f32 = 8.0;
+
+/// Where a body laid out side by side splits its width: the left column, the right one, and
+/// what the split was worked out from (for the bar to move it).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Beside {
+    pub left_w: f32,
+    pub right_w: f32,
+    avail: f32,
+    param: &'static str,
+}
+
+/// Whether a body `total_w` wide has room for its two columns side by side - the left at
+/// least `left_min`, the right at least `right_min`, and the bar between - and if so how
+/// it splits: the right column's share as its bar was last dragged (`param` on the node),
+/// else `default_right`.
+pub(crate) fn beside(
+    snarl: &Snarl<NodeData>,
+    node_id: NodeId,
+    total_w: f32,
+    left_min: f32,
+    right_min: f32,
+    param: &'static str,
+    default_right: f32,
+) -> Option<Beside> {
+    if total_w < left_min + BESIDE_BAR_W + right_min {
+        return None;
+    }
+    let avail = total_w - BESIDE_BAR_W;
+    let frac = snarl
+        .get_node(node_id)
+        .and_then(|n| n.params.get(param))
+        .and_then(|v| v.as_f64())
+        .map_or(default_right, |f| f as f32);
+    let right_w = (avail * frac).max(right_min).min(avail - left_min);
+    Some(Beside { left_w: avail - right_w, right_w, avail, param })
+}
+
+/// Lay a body out as `b` splits it: `left` in a column `b.left_w` wide, then the bar, then
+/// `right` in a column `b.right_w` wide, told how tall the left one came out (a card list
+/// there runs that height). The columns sit flush with the bar; inside each the spacing is
+/// the body's own - set to nothing for the row, it was every row in them too, and a card
+/// list's rows closed up. Dragging the bar shares the width out; double-clicking it resets.
+pub(crate) fn show_beside(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    b: Beside,
+    hover: &str,
+    left: impl FnOnce(&mut egui::Ui, &mut Snarl<NodeData>),
+    right: impl FnOnce(&mut egui::Ui, &mut Snarl<NodeData>, f32),
+) {
+    let spacing = ui.spacing().item_spacing;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let left_rect = ui
+            .vertical(|ui| {
+                ui.set_min_width(b.left_w);
+                ui.set_max_width(b.left_w);
+                ui.spacing_mut().item_spacing = spacing;
+                left(ui, snarl);
+            })
+            .response
+            .rect;
+        let (bar, _) = ui.allocate_exact_size(egui::vec2(BESIDE_BAR_W, left_rect.height()), egui::Sense::hover());
+        beside_bar(ui, snarl, node_id, b, bar, hover);
+        ui.vertical(|ui| {
+            ui.set_max_width(b.right_w);
+            ui.spacing_mut().item_spacing = spacing;
+            right(ui, snarl, left_rect.height());
+        });
+    });
+}
+
+/// The bar between two columns laid side by side, at `rect`: dragged, it shares the width
+/// out (the right column's share, on the node as `b`'s param); double-clicked, it resets.
+pub(crate) fn beside_bar(
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    node_id: NodeId,
+    b: Beside,
+    rect: egui::Rect,
+    hover: &str,
+) {
+    let (dx, reset) = resize_bar(ui, rect, ("beside_bar", b.param, node_id.0), false, hover);
+    if let Some(n) = snarl.get_node_mut(node_id) {
+        if reset {
+            n.params.remove(b.param);
+        } else if dx != 0.0 {
+            let f = ((b.right_w - dx) / b.avail.max(1.0)).clamp(0.1, 0.9);
+            n.params.insert(b.param.into(), serde_json::json!(f));
+        }
+    }
+}
+
 /// Two switches that belong together, as the two halves of one pill at `rect`: the left
 /// half `left_w` wide, each lit while its switch is on and each outlined as a toggle is
 /// ([`toggle_outline`]). Returns whether each was clicked.
@@ -559,6 +662,42 @@ pub(crate) fn pin_hides_outputs(module_id: &str) -> bool {
 /// frame, filled, rather than a body squeezed inside a frame that can't shrink.
 /// The body reports exactly this width whatever its rows draw (see [`body`]),
 /// so the node settles on it.
+/// Easing the size a module's grip asked for, so its contents grow and shrink smoothly
+/// with the transition time rather than a block at a time - its frame follows them
+/// (`SnarlViewer::node_size_easing`). Per node, under `key`; `seconds` 0 is no easing.
+#[derive(Clone, Copy)]
+pub(crate) struct SizeEase<'a> {
+    pub ctx: &'a egui::Context,
+    pub key: egui::Id,
+    pub seconds: f32,
+}
+
+impl SizeEase<'_> {
+    /// `wanted` along `axis` as laid out this frame - on its way to it from what it was - and
+    /// whether it's still on its way. The same answer however often it's asked in a frame.
+    pub(crate) fn ease(&self, axis: &str, wanted: f32) -> (f32, bool) {
+        if self.seconds <= 0.0 {
+            return (wanted, false);
+        }
+        let v = egui_snarl::ui::ease_toward(self.ctx, self.key.with(axis), egui::pos2(wanted, 0.0), self.seconds).x;
+        (v, (v - wanted).abs() > 0.25)
+    }
+}
+
+/// The size a grip-sized body asks for along one axis (`wanted`, whole blocks), as `ease`
+/// lays it out this frame, and whether it's easing.
+fn eased_wanted(wanted: Option<f32>, ease: Option<SizeEase<'_>>, axis: &str) -> (Option<f32>, bool) {
+    match (wanted, ease) {
+        (Some(w), Some(e)) => {
+            let (v, easing) = e.ease(axis, w);
+            (Some(v), easing)
+        }
+        (w, _) => (w, false),
+    }
+}
+
+/// How wide a kit or stretchy body is this frame, the floor the grip is held to, and whether
+/// the width is easing to the grip's (`ease`).
 pub(crate) fn body_width(
     node: &NodeData,
     avail: f32,
@@ -566,8 +705,9 @@ pub(crate) fn body_width(
     min_w: f32,
     block: Option<f32>,
     default: Option<f32>,
-) -> (f32, f32) {
-    let Some(frame_w) = frame_w else { return (avail.max(min_w).floor(), min_w) };
+    ease: Option<SizeEase<'_>>,
+) -> (f32, f32, bool) {
+    let Some(frame_w) = frame_w else { return (avail.max(min_w).floor(), min_w, false) };
     let whole = |w: f32| block.map_or(w, |b| ((w - 0.5) / b).ceil().max(1.0) * b);
     // Everything around the body: the pin columns, their spacing, the frame.
     let around = frame_w - avail;
@@ -581,6 +721,7 @@ pub(crate) fn body_width(
         .and_then(|v| v.as_f64())
         .map(|w| whole(w as f32))
         .or_else(|| default.map(whole));
+    let (wanted, easing) = eased_wanted(wanted, ease, "w");
     // A kit module nobody has dragged starts at its own floor, not at the frame size it was
     // handed. The body reports back the width it's given, so a body born into a default frame
     // keeps that frame for ever: the Counter came out 252 points wide for a strip of words and
@@ -591,7 +732,7 @@ pub(crate) fn body_width(
     // The second value is the floor the *grip* is held to. It's worked out from what the
     // body needs, never from the frame as it stands — a floor that follows the current
     // size is a ratchet: the node grows and can never come back.
-    ((frame - around).max(min_w).floor(), narrowest)
+    ((frame - around).max(min_w).floor(), narrowest, easing)
 }
 
 /// Where a group of controls `h` tall starts, so it reads as centred.

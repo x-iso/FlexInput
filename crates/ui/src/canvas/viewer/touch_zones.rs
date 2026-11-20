@@ -2387,8 +2387,6 @@ fn touch_zones_body(
         .filter(|n| n.params.contains_key("highlight_color"))
         .map(|n| crate::canvas::menu_body::ZoneColors::read(n).accent)
         .unwrap_or(visuals.selection.bg_fill);
-    let split = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
     let mapping = snarl.get_node(node_id)
         .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
 
@@ -2448,111 +2446,184 @@ fn touch_zones_body(
         }
     }
 
+    // Wide enough, the zone's name and icon and its cards go in a column of their own beside
+    // the settings and the field, as tall as they are (mapping mode: ports mode has no cards).
+    let rows_min = TZ_ROWS_MIN_W * super::simple_bodies::control_width_factor();
+    let wide = if mapping {
+        super::kit::beside(
+            snarl, node_id, field.x.max(rows_min), rows_min,
+            crate::canvas::area_body::CARDS_MIN_W, crate::canvas::area_body::CARDS_FRAC,
+            crate::canvas::area_body::CARDS_FRAC_DEFAULT,
+        )
+    } else {
+        None
+    };
+    if let Some(b) = wide {
+        super::kit::show_beside(
+            ui,
+            snarl,
+            node_id,
+            b,
+            "Drag to share the width between the zones and their mappings. Double-click to reset.",
+            |ui, snarl| {
+                tz_settings_and_field(node_id, ui, snarl, egui::vec2(b.left_w, field.y), b.left_w, &zone_live, &visuals, accent, out_skin);
+            },
+            |ui, snarl, h| {
+                let top = ui.cursor().top();
+                tz_zone_icon_row(node_id, ui, snarl, b.right_w);
+                ui.add_space(6.0);
+                let used = ui.cursor().top() - top;
+                tz_cards_window(node_id, ui, snarl, b.right_w, live_signals, automap_parent, Some((h - used).max(0.0)));
+            },
+        );
+        return;
+    }
+
     ui.vertical(|ui| {
-        // ── Mode, the second pad, the colours: a band of pills, as the other modules'
-        // bodies have their settings ──
-        let rows_w = field.x.max(TZ_ROWS_MIN_W * super::simple_bodies::control_width_factor());
-        {
-            use super::curve_rows::{pill_bands, segmented, word_toggle, word_w};
-            const SWATCHES_W: f32 = 76.0;
-            let cells = pill_bands(ui, rows_w, &[150.0, word_w(ui, "split pads"), SWATCHES_W]);
-            // Ports ⇄ Mapping. Ports = typed per-zone outputs. Mapping = inject per-zone
-            // behaviours onto the AutoMap bus (Remapper-style).
-            const MODE_TIP: &str = "Ports: typed X / Y / Active outputs per zone. Mapping: each zone mapped to gamepad / key / stick inputs on the AutoMap bus.";
-            if let Some(want_mapping) = segmented(ui, cells[0], &mapping, &[(false, "ports", MODE_TIP), (true, "mapping", MODE_TIP)], ("tz_mode_seg", node_id.0)) {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("zone_mode".to_string(),
-                        Value::String(if want_mapping { "mapping" } else { "ports" }.to_string()));
-                }
-                regenerate_touch_zone_ports(node_id, snarl);
-            }
-            let mut split_v = split;
-            if word_toggle(ui, cells[1], &mut split_v, "split pads",
-                "Track touch 1 and touch 2 on separate fields, each with its own click (e.g. Steam Controller).", ("tz_split", node_id.0))
-            {
-                if let Some(node) = snarl.get_node_mut(node_id) {
-                    node.params.insert("field_mode".to_string(),
-                        Value::String(if split_v { "split" } else { "single" }.to_string()));
-                    // Initialise the second field's grid on first enable.
-                    if split_v && !node.params.contains_key("col_edges1") {
-                        tz_write_field_edges(node, 1, "col_edges", &[0.5]);
-                        tz_write_field_edges(node, 1, "row_edges", &[0.5]);
-                    }
-                }
-                regenerate_touch_zone_ports(node_id, snarl);
-            }
-            let mut swatches = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(cells[2])
-                    .layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .id_salt(("tz_colours", node_id.0)),
-            );
-            crate::canvas::menu_body::show_zone_color_row(node_id, &mut swatches, snarl);
-        }
-        ui.add_space(4.0);
-
-        // Re-read mode flags AFTER the toggles (regen already ran) so the rest of
-        // this frame renders consistently in the new mode — never a mixed frame
-        // where the field/cards run with stale `mapping` while the ports/params
-        // already flipped.
-        let split = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
-        let single = !split;
-        let mapping = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
-
-        // Two pads share the surface's width, with the gap between them.
-        const PAD_GAP: f32 = 16.0;
-        let two = tz_n_fields(snarl, node_id) == 2;
-        let field_w = if two { ((field.x - PAD_GAP) * 0.5).max(100.0) } else { field.x };
-        let field_h = field.y;
-        // Field area(s); the union is registered as the pinnable "field" element.
-        let field_area = if two {
-            // Split: two pads side by side with a gap. Only the RIGHT pad shows the
-            // resize grip; it writes the shared size so both resize symmetrically.
-            ui.horizontal_top(|ui| {
-                let a = ui.vertical(|ui| {
-                    render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
-                }).inner;
-                ui.add_space(PAD_GAP - ui.spacing().item_spacing.x);
-                let b = ui.vertical(|ui| {
-                    render_touch_field(node_id, 1, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
-                }).inner;
-                a.union(b)
-            }).inner
-        } else {
-            render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
-        };
-
-        // Pinnable to a sub-patch/Easy-mode layout (ports mode = move-only field).
-        register_exposable_element(ui, node_id, "field", field_area);
-
-        // Confirm popup for a divider removal that would drop mapped zones.
-        if mapping { tz_render_merge_popup(ui, snarl, node_id); }
-
+        let rows_w = field.x.max(rows_min);
+        let mapping = tz_settings_and_field(node_id, ui, snarl, field, rows_w, &zone_live, &visuals, accent, out_skin);
         // ── Mapping mode: per-zone icon/name override + zone-tab card list ──
         if mapping {
             tz_zone_icon_row(node_id, ui, snarl, rows_w);
             ui.add_space(6.0);
-            // The zone tabs and Learn row stay put, the cards scroll in a window under them
-            // (`card_window`), as a Remapper's do.
-            let band = super::curve_rows::band_h(ui);
-            let cards_area = super::pinned::card_window(
-                ui, snarl, node_id, "tz_cards", rows_w, "cards_h", band,
-                live_signals, &crate::app::PanicShortcut::default(), automap_parent,
-                |id, _ins, ui, sn, sigs, _panic, am| {
-                    let visuals = ui.visuals().clone();
-                    let accent = visuals.selection.bg_fill;
-                    ui.vertical(|ui| {
-                        render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
-                    });
-                },
-                super::pinned::tz_cards_hash_map,
-                super::pinned::tz_cards_hash_draft,
-            );
-            register_exposable_element(ui, node_id, "cards", cards_area);
+            tz_cards_window(node_id, ui, snarl, rows_w, live_signals, automap_parent, None);
         }
     });
+}
+
+/// The Touch Zones body's settings - mode, the second pad, the colours: a band of pills, as
+/// the other modules' bodies have their settings - and its field or two, `field` big, the
+/// band `rows_w` wide. Returns whether it's in mapping mode, as the settings left it.
+#[allow(clippy::too_many_arguments)]
+fn tz_settings_and_field(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    field: egui::Vec2,
+    rows_w: f32,
+    zone_live: &std::collections::HashMap<(usize, usize), (f32, f32, bool)>,
+    visuals: &egui::Visuals,
+    accent: egui::Color32,
+    out_skin: crate::canvas::remapper_icons::Skin,
+) -> bool {
+    let zone_live = zone_live.clone();
+    let split = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
+    let mapping = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+    let visuals = visuals.clone();
+    {
+        use super::curve_rows::{pill_bands, segmented, word_toggle, word_w};
+        const SWATCHES_W: f32 = 76.0;
+        let cells = pill_bands(ui, rows_w, &[150.0, word_w(ui, "split pads"), SWATCHES_W]);
+        // Ports ⇄ Mapping. Ports = typed per-zone outputs. Mapping = inject per-zone
+        // behaviours onto the AutoMap bus (Remapper-style).
+        const MODE_TIP: &str = "Ports: typed X / Y / Active outputs per zone. Mapping: each zone mapped to gamepad / key / stick inputs on the AutoMap bus.";
+        if let Some(want_mapping) = segmented(ui, cells[0], &mapping, &[(false, "ports", MODE_TIP), (true, "mapping", MODE_TIP)], ("tz_mode_seg", node_id.0)) {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("zone_mode".to_string(),
+                    Value::String(if want_mapping { "mapping" } else { "ports" }.to_string()));
+            }
+            regenerate_touch_zone_ports(node_id, snarl);
+        }
+        let mut split_v = split;
+        if word_toggle(ui, cells[1], &mut split_v, "split pads",
+            "Track touch 1 and touch 2 on separate fields, each with its own click (e.g. Steam Controller).", ("tz_split", node_id.0))
+        {
+            if let Some(node) = snarl.get_node_mut(node_id) {
+                node.params.insert("field_mode".to_string(),
+                    Value::String(if split_v { "split" } else { "single" }.to_string()));
+                // Initialise the second field's grid on first enable.
+                if split_v && !node.params.contains_key("col_edges1") {
+                    tz_write_field_edges(node, 1, "col_edges", &[0.5]);
+                    tz_write_field_edges(node, 1, "row_edges", &[0.5]);
+                }
+            }
+            regenerate_touch_zone_ports(node_id, snarl);
+        }
+        let mut swatches = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(cells[2])
+                .layout(egui::Layout::left_to_right(egui::Align::Center))
+                .id_salt(("tz_colours", node_id.0)),
+        );
+        crate::canvas::menu_body::show_zone_color_row(node_id, &mut swatches, snarl);
+    }
+    ui.add_space(4.0);
+
+    // Re-read mode flags AFTER the toggles (regen already ran) so the rest of
+    // this frame renders consistently in the new mode — never a mixed frame
+    // where the field/cards run with stale `mapping` while the ports/params
+    // already flipped.
+    let split = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("field_mode").and_then(|v| v.as_str())) == Some("split");
+    let single = !split;
+    let mapping = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+
+    // Two pads share the surface's width, with the gap between them.
+    const PAD_GAP: f32 = 16.0;
+    let two = tz_n_fields(snarl, node_id) == 2;
+    let field_w = if two { ((field.x - PAD_GAP) * 0.5).max(100.0) } else { field.x };
+    let field_h = field.y;
+    // Field area(s); the union is registered as the pinnable "field" element.
+    let field_area = if two {
+        // Split: two pads side by side with a gap. Only the RIGHT pad shows the
+        // resize grip; it writes the shared size so both resize symmetrically.
+        ui.horizontal_top(|ui| {
+            let a = ui.vertical(|ui| {
+                render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
+            }).inner;
+            ui.add_space(PAD_GAP - ui.spacing().item_spacing.x);
+            let b = ui.vertical(|ui| {
+                render_touch_field(node_id, 1, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
+            }).inner;
+            a.union(b)
+        }).inner
+    } else {
+        render_touch_field(node_id, 0, single, false, mapping, ui, snarl, &zone_live, &visuals, accent, field_w, field_h, out_skin)
+    };
+
+    // Pinnable to a sub-patch/Easy-mode layout (ports mode = move-only field).
+    register_exposable_element(ui, node_id, "field", field_area);
+    super::simple_bodies::trace_rect(ui, node_id, "tz_field", field_area);
+
+    // Confirm popup for a divider removal that would drop mapped zones.
+    if mapping { tz_render_merge_popup(ui, snarl, node_id); }
+
+    mapping
+}
+
+/// The zones' cards: the zone tabs and Learn row stay put, the cards scroll in a window under
+/// them (`card_window`), as a Remapper's do. `w` wide; `fixed_h` tall beside the field, else
+/// as tall as its own bar was dragged.
+#[allow(clippy::too_many_arguments)]
+fn tz_cards_window(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    w: f32,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    fixed_h: Option<f32>,
+) {
+    let band = super::curve_rows::band_h(ui);
+    let cards_area = super::pinned::card_window(
+        ui, snarl, node_id, "tz_cards", w, "cards_h", band,
+        live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+        |id, _ins, ui, sn, sigs, _panic, am| {
+            let visuals = ui.visuals().clone();
+            let accent = visuals.selection.bg_fill;
+            ui.vertical(|ui| {
+                render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
+            });
+        },
+        super::pinned::tz_cards_hash_map,
+        super::pinned::tz_cards_hash_draft,
+        fixed_h,
+    );
+    register_exposable_element(ui, node_id, "cards", cards_area);
+    super::simple_bodies::trace_rect(ui, node_id, "tz_cards", cards_area);
 }
 
 /// Per-zone icon + name override row for the Touch Zones and Virtual Menu bodies — reuses the SAME

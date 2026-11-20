@@ -580,6 +580,9 @@ pub(crate) fn render_asth_pinned_scope(
     }
 }
 
+/// The narrowest the capture mode and the rows get beside the scope.
+const ASTH_ROWS_MIN_W: f32 = 240.0;
+
 /// rumble modulator slider. All persisted into `params` (`asth_*`) which the
 /// engine reads (see `eval::loopback_request_from_params` + the eval block).
 pub(crate) fn show_audio_stream_haptics_body(
@@ -621,12 +624,50 @@ pub(crate) fn show_audio_stream_haptics_body(
     // rows above it are as wide as it is. It had a grip of its own in its corner.
     let surface = super::kit::Surface::begin(ui, node_id, frame_w, frame_h, egui::vec2(180.0, 90.0));
     let scope_size = surface.size;
-    let body_w = scope_size.x.clamp(180.0, 900.0);
+    // Wider than it's tall, with room for both, the scope goes in a column of its own on the
+    // right, as tall as the module, the capture mode and the rows in a column beside it, a
+    // bar between the two sharing the width out. Else the scope is under the rows.
+    let wide = if scope_size.x > frame_h {
+        super::kit::beside(snarl, node_id, scope_size.x, ASTH_ROWS_MIN_W, 180.0, "view_frac", 0.5)
+    } else {
+        None
+    };
+    let body_w = wide.map_or(scope_size.x.clamp(180.0, 900.0), |b| b.left_w);
 
-    ui.vertical(|ui| {
+    // The scope - the EF oscilloscope over the spectrum/EQ - under its caption: `scope_size`
+    // big, or beside the rows as wide as its column and down to `bottom`.
+    let scope_block = |ui: &mut egui::Ui, bottom: Option<f32>, a: &AsthParams, eq: &mut Vec<[f32; 2]>| {
+        ui.label(egui::RichText::new("Scope — drag EQ pts · dbl-click add · right-click remove").small().weak());
+        let scope_top = ui.cursor().top();
+        let scope_left = ui.min_rect().left();
+        let size = match bottom {
+            Some(b) => egui::vec2(ui.available_width(), (b - scope_top).max(90.0)),
+            None => scope_size,
+        };
+        let new_sc = ui
+            .allocate_ui(size, |ui| {
+                // Top ~40% = EF oscilloscope, bottom ~60% = spectrum/EQ.
+                let total_h = ui.available_height().max(80.0);
+                let ef_h = (total_h * 0.4).clamp(28.0, total_h - 50.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), ef_h), |ui| {
+                    draw_asth_ef_scope(uid, ui, a);
+                });
+                ui.add_space(3.0);
+                let ch = draw_asth_spectrum_eq(node_id, uid, ui, eq, a);
+                changed_inner.set(changed_inner.get() || ch);
+                ui.min_rect().size()
+            })
+            .inner;
+        // The scope (EF + spectrum/EQ) is pinnable as one element too.
+        let scope_rect = egui::Rect::from_min_size(egui::pos2(scope_left, scope_top), new_sc);
+        register_exposable_element(ui, node_id, "asth_scope", scope_rect);
+        super::simple_bodies::trace_rect(ui, node_id, "asth_scope", scope_rect);
+    };
+
+    let top_left = ui.cursor().min;
+    let rows = ui.vertical(|ui| {
         ui.set_min_width(body_w);
         ui.set_max_width(body_w);
-
         // ── Capture mode ──────────────────────────────────────────────────────
         // Drawn by the SHARED `asth_draw_mode_block` (so it renders identically
         // inline and when pinned to a sub-patch body). Registered as a pinnable
@@ -646,32 +687,41 @@ pub(crate) fn show_audio_stream_haptics_body(
             changed |= ch;
             register_exposable_element(ui, node_id, row.element_id(), rect);
         }
+        super::simple_bodies::trace_rect(ui, node_id, "asth_rows", ui.min_rect());
 
         // ── Combined 2-part scope: EF oscilloscope (top) + spectrum/EQ (bottom),
-        //    one resizable handle for both. ─────────────────────────────────────
-        ui.add_space(6.0);
-        ui.label(egui::RichText::new("Scope — drag EQ pts · dbl-click add · right-click remove").small().weak());
-        let scope_top = ui.cursor().top();
-        let scope_left = ui.min_rect().left();
-        let new_sc = ui
-            .allocate_ui(scope_size, |ui| {
-                // Top ~40% = EF oscilloscope, bottom ~60% = spectrum/EQ.
-                let total_h = ui.available_height().max(80.0);
-                let ef_h = (total_h * 0.4).clamp(28.0, total_h - 50.0);
-                ui.allocate_ui(egui::vec2(ui.available_width(), ef_h), |ui| {
-                    draw_asth_ef_scope(uid, ui, &a);
-                });
-                ui.add_space(3.0);
-                let ch = draw_asth_spectrum_eq(node_id, uid, ui, &mut asth_eq_points, &a);
-                changed_inner.set(changed_inner.get() || ch);
-                ui.min_rect().size()
-            })
-            .inner;
-        // The scope (EF + spectrum/EQ) is pinnable as one element too.
-        let scope_rect = egui::Rect::from_min_size(egui::pos2(scope_left, scope_top), new_sc);
-        register_exposable_element(ui, node_id, "asth_scope", scope_rect);
+        //    one resizable handle for both - under the rows unless it's beside them. ──
+        if wide.is_none() {
+            ui.add_space(6.0);
+            scope_block(ui, None, &a, &mut asth_eq_points);
+        }
     });
-    surface.end(ui);
+    // Beside the rows, the scope's column runs the body's height - the grip's, or the rows'
+    // if that's more - and the body takes in both columns and the bar; the surface's own
+    // sizing is the stacked layout's, so it measures this as all rows.
+    if let Some(b) = wide {
+        let rows_rect = rows.response.rect;
+        let mut col = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(top_left.x + b.left_w + super::kit::BESIDE_BAR_W, top_left.y),
+                    egui::vec2(b.right_w, 1.0e5),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        let bottom = rows_rect.bottom().max(top_left.y + frame_h);
+        scope_block(&mut col, Some(bottom), &a, &mut asth_eq_points);
+        let all = rows_rect.union(col.min_rect());
+        ui.allocate_rect(all, egui::Sense::hover());
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(top_left.x + b.left_w, top_left.y),
+            egui::pos2(top_left.x + b.left_w + super::kit::BESIDE_BAR_W, all.bottom()),
+        );
+        super::kit::beside_bar(ui, snarl, node_id, b, bar, "Drag to share the width between the settings and the scope. Double-click to reset.");
+        surface.end_folded(ui);
+    } else {
+        surface.end(ui);
+    }
     changed |= changed_inner.get();
 
     if changed {

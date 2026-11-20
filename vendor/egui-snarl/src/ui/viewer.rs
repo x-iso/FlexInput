@@ -303,6 +303,19 @@ pub trait SnarlViewer<T> {
         None
     }
 
+    /// FLEXINPUT PATCH: how the node's frame is sized this frame along each axis (width,
+    /// height), asked before anything of the node is laid out: as snarl sizes it, or - while
+    /// the viewer eases the node to the size its grip asked for - at the size the viewer is
+    /// easing through, or as what it holds takes this frame (the height of a module that
+    /// keeps its shape, which follows its width). On the viewer's axes the frame isn't
+    /// rounded to the grid or eased again here: the frame, its pins and what it holds move
+    /// together, a frame at a time, and end on whole blocks.
+    #[inline]
+    fn node_frame_now(&mut self, node: NodeId, snarl: &Snarl<T>) -> [crate::ui::FrameNow; 2] {
+        let _ = (node, snarl);
+        [crate::ui::FrameNow::Snarl, crate::ui::FrameNow::Snarl]
+    }
+
     /// FLEXINPUT PATCH: whether the corner grip scales the node by one amount in both
     /// directions (a node whose content has one shape), rather than each way on its own.
     #[inline]

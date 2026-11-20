@@ -67,6 +67,8 @@ pub(crate) const SMOOTH_TIP: &str = "Stabilise the stick's direction against a s
 
 /// The narrowest the rows read at: the stick and mode strips side by side.
 const SR_MIN_W: f32 = 208.0;
+/// The narrowest the circle's column gets beside the settings.
+const SR_FIELD_MIN_W: f32 = 96.0;
 const SR_STICK_W: f32 = 76.0;
 const SR_MODE_W: f32 = 120.0;
 const SR_SENS_W: f32 = 168.0;
@@ -110,6 +112,47 @@ pub(crate) fn show_stick_rotation_body(
         surface.need(SR_MIN_W);
         let band = super::curve_rows::band_h(ui);
         let ctrl = band - 4.0;
+
+        // Wider than it's tall, with room for both, the circle goes in a column of its own on
+        // the left, as tall as the module, and the settings in a column beside it, a bar
+        // between the two sharing the width out. Else the settings are under the circle.
+        let wide = if w > body_h {
+            super::kit::beside(snarl, node_id, w, SR_FIELD_MIN_W, SR_MIN_W, "view_frac", 0.5)
+        } else {
+            None
+        };
+        // The live circle, `size` big: the stick where the thumb has it and where the gyro
+        // turned it to. Beside the settings it sits in the middle of its column's height.
+        let draw_field = |ui: &mut egui::Ui, snarl: &Snarl<NodeData>, size: egui::Vec2, middle: bool| {
+            let (field, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            let side = field.width().min(field.height());
+            let room = if middle { egui::Rect::from_center_size(field.center(), egui::vec2(field.width(), side)) } else { field };
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(room).layout(egui::Layout::top_down(egui::Align::Center)));
+            let circle = render_stick_rotation_field(node_id, &mut child, snarl, egui::vec2(side, side));
+            register_exposable_element(ui, node_id, "field", circle);
+            super::simple_bodies::trace_rect(ui, node_id, "sr_field", circle);
+        };
+        let top_left = ui.cursor().min;
+        let parent: &mut egui::Ui = ui;
+        let column = |parent: &mut egui::Ui, x: f32, cw: f32| {
+            parent.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_size(egui::pos2(x, top_left.y), egui::vec2(cw, 1.0e5)))
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            )
+        };
+        let mut columns = wide.map(|b| {
+            (column(parent, top_left.x, b.left_w), column(parent, top_left.x + b.left_w + super::kit::BESIDE_BAR_W, b.right_w))
+        });
+        if wide.is_none() {
+            draw_field(parent, snarl, surface.size, false);
+        }
+        let (ui, w): (&mut egui::Ui, f32) = match (columns.as_mut(), wide) {
+            (Some((_, right)), Some(b)) => (right, b.right_w),
+            _ => (&mut *parent, w),
+        };
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        let settings_top = ui.cursor().min.y;
         let lay = |ui: &mut egui::Ui, mins: &[f32]| -> Vec<egui::Rect> {
             let (cells, h) = super::curve_rows::bands(w, mins, band, 3.0 * super::kit::GAP);
             let (area, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
@@ -122,13 +165,6 @@ pub(crate) fn show_stick_rotation_body(
                 .collect()
         };
         let word_w = super::curve_rows::word_w;
-
-        // The live circle: the stick where the thumb has it and where the gyro turned it to.
-        let (field, _) = ui.allocate_exact_size(surface.size, egui::Sense::hover());
-        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(field).layout(egui::Layout::top_down(egui::Align::Center)));
-        let side = field.width().min(field.height());
-        let circle = render_stick_rotation_field(node_id, &mut child, snarl, egui::vec2(side, side));
-        register_exposable_element(ui, node_id, "field", circle);
 
         // Which stick, and which turn.
         let cells = lay(ui, &[SR_STICK_W, SR_MODE_W]);
@@ -199,7 +235,26 @@ pub(crate) fn show_stick_rotation_body(
             set.extend(number(STICK_ROT_SMOOTH_PARAM, smooth));
         }
         register_exposable_element(ui, node_id, "stabilise", cells[3]);
-        surface.end(ui);
+        let settings = egui::Rect::from_min_max(egui::pos2(ui.min_rect().left(), settings_top), ui.min_rect().max);
+        super::simple_bodies::trace_rect(ui, node_id, "sr_settings", settings);
+
+        // Beside the settings, the circle's column runs the body's height - the grip's, or
+        // the settings' if that's more - and the body takes in both columns and the bar;
+        // the surface's own sizing is the stacked layout's, so it measures this as all rows.
+        if let (Some((mut left, right)), Some(b)) = (columns, wide) {
+            let bottom = right.min_rect().bottom().max(top_left.y + body_h);
+            draw_field(&mut left, snarl, egui::vec2(b.left_w, bottom - top_left.y), true);
+            let all = left.min_rect().union(right.min_rect());
+            parent.allocate_rect(all, egui::Sense::hover());
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(top_left.x + b.left_w, top_left.y),
+                egui::pos2(top_left.x + b.left_w + super::kit::BESIDE_BAR_W, all.bottom()),
+            );
+            super::kit::beside_bar(parent, snarl, node_id, b, bar, "Drag to share the width between the circle and the settings. Double-click to reset.");
+            surface.end_folded(parent);
+        } else {
+            surface.end(parent);
+        }
     });
 
     if set.is_empty() {

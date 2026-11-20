@@ -155,6 +155,23 @@ impl NodeState {
         .round_ui()
     }
 
+    /// FLEXINPUT PATCH: [`Self::node_rect`] for a node drawn at `size` rather than the size
+    /// it has - on its way there while it eases to a size it changed to.
+    pub fn node_rect_sized(&self, pos: Pos2, openness: f32, size: Vec2) -> Rect {
+        Rect::from_min_size(pos, egui::vec2(size.x, f32::max(self.header_height, size.y * openness))).round_ui()
+    }
+
+    /// FLEXINPUT PATCH: the node's size as last laid out.
+    pub const fn size(&self) -> Vec2 {
+        self.size
+    }
+
+    /// FLEXINPUT PATCH: right after [`Self::load`], whether nothing was stored for the node
+    /// - it's being drawn for the first time, and its size is a placeholder.
+    pub const fn fresh(&self) -> bool {
+        self.dirty
+    }
+
     pub fn payload_offset(&self, openness: f32) -> f32 {
         ((self.size.y) * (1.0 - openness)).round_ui()
     }

@@ -402,84 +402,54 @@ fn menu_body(
     // Configurable theme: the zone painters take the full `colors`; the grid
     // field editor + cards take the crisp opaque `accent` for their affordances.
     let colors = snarl.get_node(node_id).map(ZoneColors::read).unwrap_or_else(ZoneColors::fallback);
-    let accent = colors.accent;
 
     let zone_live = snarl.get_node(node_id).map(menu_zone_live).unwrap_or_default();
 
     let (field_w, field_h) = (field.x, field.y);
 
-    let rows_w = field_w.max(MENU_ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
+    let rows_min = MENU_ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor();
+    let rows_w = field_w.max(rows_min);
+    // Wide enough, the zone's name and icon and its cards go in a column of their own beside
+    // the settings and the field, as tall as they are (mapping mode: there are no cards else).
+    let mapping_now = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+    let wide = if mapping_now {
+        super::viewer::kit::beside(
+            snarl, node_id, rows_w, rows_min,
+            crate::canvas::area_body::CARDS_MIN_W, crate::canvas::area_body::CARDS_FRAC,
+            crate::canvas::area_body::CARDS_FRAC_DEFAULT,
+        )
+    } else {
+        None
+    };
+    if let Some(b) = wide {
+        super::viewer::kit::show_beside(
+            ui,
+            snarl,
+            node_id,
+            b,
+            "Drag to share the width between the menu and its mappings. Double-click to reset.",
+            |ui, snarl| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let w = field_w.min(b.left_w);
+                menu_settings_and_field(node_id, ui, snarl, automap_parent, &zone_live, &visuals, colors, w, field_h, b.left_w);
+            },
+            |ui, snarl, h| {
+                let top = ui.cursor().top();
+                super::viewer::tz_zone_icon_row(node_id, ui, snarl, b.right_w);
+                ui.add_space(6.0);
+                let used = ui.cursor().top() - top;
+                menu_cards_window(node_id, ui, snarl, b.right_w, live_signals, automap_parent, Some((h - used).max(0.0)));
+            },
+        );
+        return;
+    }
     ui.vertical(|ui| {
         // Bounded to the frame: a heading takes the width it is offered, and a body is
         // offered last frame's - a frame dragged wide would never come back.
         ui.set_max_width(rows_w);
         ui.spacing_mut().item_spacing.y = 2.0;
-        // ── What the menu is (its identity is in the header), then how it is pointed at
-        //    and picked from - the pinnable "options" element - in categories that fold,
-        //    as the other modules' bodies have their settings ──
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "menu", "Menu", true) {
-            menu_mode_rows(node_id, ui, snarl, automap_parent, rows_w);
-        }
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "pointer", "Pointer and selection", true) {
-            let opts_area = ui.vertical(|ui| {
-                menu_options_pills(node_id, ui, snarl, rows_w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "options", opts_area);
-        }
-        ui.add_space(4.0);
-
-        // Re-read after header toggles so this frame renders consistently.
-        let mapping = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
-
-        // ── The zone field: TZ machinery for the grid, sector ring for radial ──
-        let radial = snarl.get_node(node_id).map(|n| pbool(n, "menu_radial", false)).unwrap_or(false);
-        let field_area = if radial {
-            render_radial_field(
-                node_id, mapping, ui, snarl, &zone_live, colors, field_w, field_h,
-            )
-        } else {
-            render_touch_field(
-                node_id, 0, true, false, mapping, ui, snarl,
-                &zone_live, &visuals, accent, field_w, field_h,
-                super::viewer::remapper_out_skin(snarl, node_id, automap_parent),
-            )
-        };
-        register_exposable_element(ui, node_id, "field", field_area);
-        // Zone-name labels over the grid field (the radial ring paints its
-        // own; the grid field's TZ painter predates `zone_meta`). Drawn
-        // before the cursor so the indicator stays on top.
-        if !radial {
-            let metas = snarl.get_node(node_id).map(menu_zone_meta).unwrap_or_default();
-            if !metas.is_empty() {
-                let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
-                let p = ui.painter_at(field_area);
-                for (zid, [x0, _y0, x1, y1]) in tree.zones() {
-                    let Some(m) = metas.get(&zid) else { continue };
-                    if m.label.is_empty() { continue; }
-                    let cx = field_area.left() + (x0 + x1) * 0.5 * field_area.width();
-                    let by = field_area.top() + y1 * field_area.height();
-                    let (f, txt) = fit_zone_label(
-                        &p, &m.label, 11.0, (x1 - x0) * field_area.width() - 6.0);
-                    p.text(egui::pos2(cx, by - 3.0), egui::Align2::CENTER_BOTTOM, txt,
-                        f, crate::settings::tinted_gray(210));
-                }
-            }
-        }
-        // Cursor-deflection indicator over the grid field (the radial field
-        // paints its own inside paint_radial_ring).
-        if !radial {
-            if let Some(c) = snarl.get_node(node_id).and_then(menu_pointer) {
-                let pos = egui::pos2(
-                    field_area.left() + c.x.clamp(0.0, 1.0) * field_area.width(),
-                    field_area.top() + c.y.clamp(0.0, 1.0) * field_area.height(),
-                );
-                paint_menu_cursor(&ui.painter_at(field_area), field_area.center(), pos, accent);
-            }
-        }
-
-        if mapping && !radial { tz_render_merge_popup(ui, snarl, node_id); }
-
+        let mapping = menu_settings_and_field(node_id, ui, snarl, automap_parent, &zone_live, &visuals, colors, field_w, field_h, rows_w);
         // ── Per-zone icon + name override: the icon replaces the zone's mapping icons
         // everywhere it's painted (field, pinned widget, menu overlay) — keyboard bindings
         // rarely read as "what this zone does"; the name draws alongside whatever icons
@@ -489,26 +459,129 @@ fn menu_body(
         // ── Mapping mode: zone-tab card list (TZ machinery, separately pinnable) ──
         if mapping {
             ui.add_space(6.0);
-            // The zone tabs and Learn row stay put, the cards scroll in a window under them
-            // (`card_window`), as a Remapper's do.
-            let band = super::viewer::curve_rows::band_h(ui);
-            let cards_area = super::viewer::card_window(
-                ui, snarl, node_id, "menu_cards", rows_w, "cards_h", band,
-                live_signals, &crate::app::PanicShortcut::default(), automap_parent,
-                |id, _ins, ui, sn, sigs, _panic, am| {
-                    let visuals = ui.visuals().clone();
-                    let accent = visuals.selection.bg_fill;
-                    ui.vertical(|ui| {
-                        render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
-                    });
-                },
-                super::viewer::tz_cards_hash_map,
-                super::viewer::tz_cards_hash_draft,
-            );
-            register_exposable_element(ui, node_id, "cards", cards_area);
+            menu_cards_window(node_id, ui, snarl, rows_w, live_signals, automap_parent, None);
         }
-
     });
+}
+
+/// The menu's settings - what it is, how it's pointed at and picked from - in categories that
+/// fold, and its field, `field_w` by `field_h`, the settings `rows_w` wide. Returns whether
+/// it's in mapping mode, as the settings left it.
+#[allow(clippy::too_many_arguments)]
+fn menu_settings_and_field(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    zone_live: &HashMap<(usize, usize), (f32, f32, bool)>,
+    visuals: &egui::Visuals,
+    colors: ZoneColors,
+    field_w: f32,
+    field_h: f32,
+    rows_w: f32,
+) -> bool {
+    let zone_live = zone_live.clone();
+    let visuals = visuals.clone();
+    let accent = colors.accent;
+    // ── What the menu is (its identity is in the header), then how it is pointed at
+    //    and picked from - the pinnable "options" element - in categories that fold,
+    //    as the other modules' bodies have their settings ──
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "menu", "Menu", true) {
+        menu_mode_rows(node_id, ui, snarl, automap_parent, rows_w);
+    }
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "pointer", "Pointer and selection", true) {
+        let opts_area = ui.vertical(|ui| {
+            menu_options_pills(node_id, ui, snarl, rows_w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "options", opts_area);
+    }
+    ui.add_space(4.0);
+
+    // Re-read after header toggles so this frame renders consistently.
+    let mapping = snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_mode").and_then(|v| v.as_str())) == Some("mapping");
+
+    // ── The zone field: TZ machinery for the grid, sector ring for radial ──
+    let radial = snarl.get_node(node_id).map(|n| pbool(n, "menu_radial", false)).unwrap_or(false);
+    let field_area = if radial {
+        render_radial_field(
+            node_id, mapping, ui, snarl, &zone_live, colors, field_w, field_h,
+        )
+    } else {
+        render_touch_field(
+            node_id, 0, true, false, mapping, ui, snarl,
+            &zone_live, &visuals, accent, field_w, field_h,
+            super::viewer::remapper_out_skin(snarl, node_id, automap_parent),
+        )
+    };
+    register_exposable_element(ui, node_id, "field", field_area);
+    super::viewer::simple_bodies::trace_rect(ui, node_id, "menu_field", field_area);
+    // Zone-name labels over the grid field (the radial ring paints its
+    // own; the grid field's TZ painter predates `zone_meta`). Drawn
+    // before the cursor so the indicator stays on top.
+    if !radial {
+        let metas = snarl.get_node(node_id).map(menu_zone_meta).unwrap_or_default();
+        if !metas.is_empty() {
+            let tree = super::viewer::tz_field_tree(snarl, node_id, 0);
+            let p = ui.painter_at(field_area);
+            for (zid, [x0, _y0, x1, y1]) in tree.zones() {
+                let Some(m) = metas.get(&zid) else { continue };
+                if m.label.is_empty() { continue; }
+                let cx = field_area.left() + (x0 + x1) * 0.5 * field_area.width();
+                let by = field_area.top() + y1 * field_area.height();
+                let (f, txt) = fit_zone_label(
+                    &p, &m.label, 11.0, (x1 - x0) * field_area.width() - 6.0);
+                p.text(egui::pos2(cx, by - 3.0), egui::Align2::CENTER_BOTTOM, txt,
+                    f, crate::settings::tinted_gray(210));
+            }
+        }
+    }
+    // Cursor-deflection indicator over the grid field (the radial field
+    // paints its own inside paint_radial_ring).
+    if !radial {
+        if let Some(c) = snarl.get_node(node_id).and_then(menu_pointer) {
+            let pos = egui::pos2(
+                field_area.left() + c.x.clamp(0.0, 1.0) * field_area.width(),
+                field_area.top() + c.y.clamp(0.0, 1.0) * field_area.height(),
+            );
+            paint_menu_cursor(&ui.painter_at(field_area), field_area.center(), pos, accent);
+        }
+    }
+
+    if mapping && !radial { tz_render_merge_popup(ui, snarl, node_id); }
+
+    mapping
+}
+
+/// The menu zones' cards: the zone tabs and Learn row stay put, the cards scroll in a window
+/// under them (`card_window`), as a Remapper's do. `w` wide; `fixed_h` tall beside the field,
+/// else as tall as its own bar was dragged.
+fn menu_cards_window(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    w: f32,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    fixed_h: Option<f32>,
+) {
+    let band = super::viewer::curve_rows::band_h(ui);
+    let cards_area = super::viewer::card_window(
+        ui, snarl, node_id, "menu_cards", w, "cards_h", band,
+        live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+        |id, _ins, ui, sn, sigs, _panic, am| {
+            let visuals = ui.visuals().clone();
+            let accent = visuals.selection.bg_fill;
+            ui.vertical(|ui| {
+                render_touch_zone_cards(id, ui, sn, &visuals, accent, sigs, am);
+            });
+        },
+        super::viewer::tz_cards_hash_map,
+        super::viewer::tz_cards_hash_draft,
+        fixed_h,
+    );
+    register_exposable_element(ui, node_id, "cards", cards_area);
+    super::viewer::simple_bodies::trace_rect(ui, node_id, "menu_cards", cards_area);
 }
 
 // ── Radial field ──────────────────────────────────────────────────────────────

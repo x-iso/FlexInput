@@ -884,6 +884,38 @@ const MOVED_FROM_KEY: &str = "flexinput-wire-moved-from";
 // FLEXINPUT PATCH: the node being drawn, and how far from its `pos` it's drawn.
 const DRAWN_OFFSET_KEY: &str = "flexinput-drawn-offset";
 
+// FLEXINPUT PATCH: the node being laid out, and the size of the frame it's laid out in.
+const LAID_OUT_KEY: &str = "flexinput-laid-out-frame";
+/// FLEXINPUT PATCH: see [`drawn_frame`].
+const DRAWN_FRAME_KEY: &str = "flexinput-drawn-frame";
+
+/// FLEXINPUT PATCH: how a node's frame is sized along one axis this frame - see
+/// `SnarlViewer::node_frame_now`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum FrameNow {
+    /// As snarl sizes it: the size it had last frame, rounded to the grid, easing to a new one.
+    #[default]
+    Snarl,
+    /// At this size, margins included: the viewer is easing it to the size its grip asked
+    /// for. Never narrower than what it holds: contents that didn't fit hold the frame at
+    /// their size until the viewer asks for at least as much (the grip dragged in past them).
+    Eased(f32),
+    /// As what it holds takes this frame (heights only): an axis that follows one the viewer
+    /// is easing, the height of a module that keeps its shape.
+    Contents,
+}
+
+/// Inside the `SnarlViewer` calls that draw a node: the size of the frame (margins
+/// included) it's laid out in this frame - last frame's, or the one it's easing through
+/// (`SnarlViewer::node_frame_now`). A body measuring the room around it measures against
+/// this, not against last frame's size.
+#[must_use]
+pub fn laid_out_frame(ctx: &egui::Context, node: NodeId) -> Option<Vec2> {
+    ctx.data(|d| d.get_temp::<(NodeId, Vec2)>(egui::Id::new(LAID_OUT_KEY)))
+        .filter(|(n, _)| *n == node)
+        .map(|(_, v)| v)
+}
+
 /// Inside the `SnarlViewer` calls that draw a node: how far from its `pos` the node is drawn
 /// this frame - on its way to `pos` while it eases there, [`Vec2::ZERO`] once it's there. Its
 /// top, and anything kept as a distance from it, is `pos` plus this.
@@ -892,6 +924,14 @@ pub fn drawn_offset(ctx: &egui::Context, node: NodeId) -> Vec2 {
     ctx.data(|d| d.get_temp::<(NodeId, Vec2)>(egui::Id::new(DRAWN_OFFSET_KEY)))
         .filter(|(n, _)| *n == node)
         .map_or(Vec2::ZERO, |(_, v)| v)
+}
+
+/// The frame a node was last drawn at - on its way to its size while that eases, else what
+/// it holds - in graph space. Keyed by node only, so a canvas showing two snarls answers
+/// for whichever drew the node last.
+#[must_use]
+pub fn drawn_frame(ctx: &egui::Context, node: NodeId) -> Option<Rect> {
+    ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(DRAWN_FRAME_KEY).with(node.0)))
 }
 
 /// Inside `SnarlViewer::connect`: the pin the wires being dropped were picked up from, when
@@ -2046,13 +2086,15 @@ where
 
 /// FLEXINPUT PATCH: the grip on a resizable node's bottom-right corner. Dragging it
 /// asks the viewer for a frame that size: whole blocks on the grid (Alt for any size),
-/// counted from the frame's actual size when the drag began.
+/// counted from the frame's actual size when the drag began. It sits on the corner of the
+/// frame as drawn (`drawn`), which eases to the size the grip asked for.
 #[allow(clippy::too_many_arguments)]
 fn size_grip<T, V>(
     ui: &mut Ui,
     node: NodeId,
     node_id: Id,
     frame: Rect,
+    drawn: Rect,
     narrowest: f32,
     grid: Option<GridLayout>,
     modifiers: Modifiers,
@@ -2064,7 +2106,7 @@ fn size_grip<T, V>(
     V: SnarlViewer<T>,
 {
     const GRIP: f32 = 12.0;
-    let rect = Rect::from_min_max(frame.max - vec2(GRIP, GRIP), frame.max);
+    let rect = Rect::from_min_max(drawn.max - vec2(GRIP, GRIP), drawn.max);
     let resp = ui
         .interact(rect, node_id.with("size_grip"), Sense::drag())
         .on_hover_cursor(egui::CursorIcon::ResizeNwSe)
@@ -2119,7 +2161,7 @@ fn size_grip<T, V>(
         visuals.weak_text_color().gamma_multiply(0.6)
     };
     let stroke = Stroke::new(1.0_f32, color);
-    let corner = frame.max - vec2(3.0, 3.0);
+    let corner = drawn.max - vec2(3.0, 3.0);
     for k in 1..=3 {
         let d = k as f32 * 3.0;
         ui.painter().line_segment([corner - vec2(d, 0.0), corner - vec2(0.0, d)], stroke);
@@ -2222,7 +2264,19 @@ fn glide_t(now: f64, start: f64, ease: f32) -> f32 {
 /// settled where it was that moves only a little - dragged freely, a point or two a frame -
 /// follows at once: a glide would only make it trail the pointer. At once with `ease` 0.
 fn eased_pos(ctx: &egui::Context, node_id: Id, target: Pos2, ease: f32) -> Pos2 {
-    let key = node_id.with("flexinput-glide");
+    eased_at(ctx, node_id.with("flexinput-glide"), target, ease)
+}
+
+/// FLEXINPUT PATCH: the glide nodes move with, for a viewer to ease something of its own
+/// the same way (a size its grip asked for): `target` as drawn this frame, under `key`,
+/// over `ease` seconds. See [`eased_pos`].
+pub fn ease_toward(ctx: &egui::Context, key: Id, target: Pos2, ease: f32) -> Pos2 {
+    eased_at(ctx, key, target, ease)
+}
+
+/// FLEXINPUT PATCH: [`eased_pos`] for any point kept under `key` - a node's place, or its
+/// size taken as a point.
+fn eased_at(ctx: &egui::Context, key: Id, target: Pos2, ease: f32) -> Pos2 {
     if ease <= 0.0 {
         ctx.data_mut(|d| d.remove_temp::<Glide>(key));
         return target;
@@ -2248,6 +2302,22 @@ fn eased_pos(ctx: &egui::Context, node_id: Id, target: Pos2, ease: f32) -> Pos2 
     ctx.data_mut(|d| d.insert_temp(key, g));
     shown
 }
+
+/// FLEXINPUT PATCH: a node holding more than it was laid out at, down an axis its viewer has
+/// (`snaps_down`): not, for the first frame (a row re-wrapping is measured a frame late, and
+/// spills for that frame), or on its way to the grid line above what it holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Overflow {
+    #[default]
+    None,
+    Spilled,
+    Gliding,
+}
+
+/// FLEXINPUT PATCH: how much more than it was laid out at a node can hold, down an axis its
+/// viewer has (`snaps_down`), before the frame sets off for the grid line above it: a row that
+/// re-wraps as the width eases is measured a frame late, and spills a few points for it.
+const SNAP_DOWN_SLACK: f32 = 8.0;
 
 /// FLEXINPUT PATCH: a move or a change of route this small, from where things had settled,
 /// is drawn at once rather than eased.
@@ -2954,8 +3024,6 @@ where
 
     let mut node_state = NodeState::load(ui.ctx(), node_id, ui.spacing());
 
-    let mut node_rect = node_state.node_rect(node_pos, openness);
-
     let mut node_to_top = None;
     let mut node_moved = None;
     let mut drag_released = false;
@@ -2983,29 +3051,103 @@ where
     let frame_margin = node_frame.total_margin();
     let margins = frame_margin.sum();
     let grid_snap = style.get_grid().filter(|g| g.snap);
+
+    // FLEXINPUT PATCH: the size the frame is DRAWN at eases to a size it changed to, as its
+    // place does - a module grown by what it holds - where it used to jump a block at a
+    // time. Drawn only: what the node holds is laid out at the size it has (`node_rect`).
+    // Laid out in the easing frame, a body that sizes itself to its room measured a new size
+    // every frame of the glide, which started another: modules strobed between two sizes,
+    // and a frame filled out to its old size while shrinking could ratchet one a block
+    // bigger. Not the first time a node is drawn either: its size is a placeholder then.
+    //
+    // A size the GRIP asked for is the viewer's to ease (`node_frame_now`): on those axes
+    // the node is laid out and drawn at the frame the viewer is easing through this frame,
+    // and nothing is eased here - the frame, its pins and what it holds move together.
+    let frame_now = viewer.node_frame_now(node, snarl);
+    // Width can't follow its contents within a frame (the payload is clipped to the frame's
+    // width); height can.
+    let frame_now = [
+        if frame_now[0] == FrameNow::Contents { FrameNow::Snarl } else { frame_now[0] },
+        frame_now[1],
+    ];
+    let viewers = [frame_now[0] != FrameNow::Snarl, frame_now[1] != FrameNow::Snarl];
+    let floor_key = node_id.with("flexinput-content-floor");
+    let floor: Vec2 = ui.ctx().data(|d| d.get_temp(floor_key)).unwrap_or(Vec2::ZERO);
+    let size_key = node_id.with("flexinput-size-glide");
+    let target_size = node_state.size();
+    let fresh = node_state.fresh();
+    // Across, never narrower than what it held last frame: the payload is clipped to the
+    // frame's width. Down it isn't, and the frame takes in what it holds this frame.
+    let along = |k: usize, target: f32, margin: f32| match frame_now[k] {
+        FrameNow::Eased(f) if k == 0 => (f - margin).max(floor[k]).max(0.0),
+        FrameNow::Eased(f) => (f - margin).max(0.0),
+        // As little as the header: the frame is what the contents take this frame.
+        FrameNow::Contents => node_state.header_height(),
+        FrameNow::Snarl => target,
+    };
+    let laid_out = vec2(along(0, target_size.x, margins.x), along(1, target_size.y, margins.y));
+    // Down, on an axis the viewer has, the frame is what it holds whenever that's more than
+    // the viewer laid it out at - and that's rounded onto the grid on the way, a glide kept
+    // under the same key as snarl's own (`eased_at` below, after the contents are known), so
+    // the axis carries on gliding to the same place once the viewer lets go of it. Rounded
+    // only after, the frame sat on what it held, then set off for the grid line.
+    let snaps_down = viewers[1] && !fresh && ease > 0.0 && grid_snap.is_some();
+    // How that went last frame (`Overflow`), and how tall it was laid out then.
+    let over_key = size_key.with("over");
+    let (was_over, was_laid_h): (Overflow, f32) = if snaps_down {
+        ui.ctx().data(|d| d.get_temp(over_key)).unwrap_or((Overflow::None, 0.0))
+    } else {
+        (Overflow::None, 0.0)
+    };
+    // A spill is taken at its word at once where the frame is what it holds anyway, or the
+    // frame was laid out shorter than last frame: the grip's taking it in past what it holds.
+    let spill_now = |laid_h: f32| frame_now[1] == FrameNow::Contents || laid_h < was_laid_h - 0.5;
+    let axis = |k: usize, v: f32| {
+        let key = size_key.with(k);
+        if fresh || viewers[k] {
+            if !(k == 1 && snaps_down) {
+                ui.ctx().data_mut(|d| d.remove_temp::<Glide>(key));
+            }
+            v
+        } else {
+            eased_at(ui.ctx(), key, egui::pos2(v, 0.0), ease).x
+        }
+    };
+    let shown_size = vec2(axis(0, laid_out.x), axis(1, laid_out.y));
+    let size_gliding = (shown_size - laid_out).length() > 0.5;
+    let mut node_rect = node_state.node_rect_sized(node_pos, openness, laid_out);
+    let mut shown_rect = node_state.node_rect_sized(node_pos, openness, shown_size);
+
     if let Some(g) = grid_snap
         && !open
         && openness <= 0.0
     {
         node_rect.max.y = node_rect.min.y + g.snap_len(node_rect.height() + margins.y) - margins.y;
+        shown_rect.max.y = shown_rect.min.y + g.snap_len(shown_rect.height() + margins.y) - margins.y;
     }
 
     // Rect for node + frame margin.
     let node_frame_rect = node_rect + frame_margin;
+    // FLEXINPUT PATCH: and as drawn, easing to it (the same rect once it's there).
+    let shown_frame_rect = shown_rect + frame_margin;
+    // The frame the node is laid out in, for the viewer to measure its body against
+    // (`laid_out_frame`): last frame's size, or the one it's easing through.
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(LAID_OUT_KEY), (node, node_frame_rect.size())));
 
-    if snarl_state.selected_nodes().contains(&node) {
+    // FLEXINPUT PATCH: the selection outline goes round the frame as it's drawn, which isn't
+    // known yet while it follows what it holds down (`snaps_down`): a slot for it now, filled
+    // once it is.
+    let select_slot = snarl_state.selected_nodes().contains(&node).then(|| {
         let select_style = style.get_select_style(ui.style());
-
-        let select_rect = node_frame_rect + select_style.margin;
-
-        ui.painter().rect(
+        let select_rect = shown_frame_rect + select_style.margin;
+        ui.painter().add(egui::epaint::RectShape::new(
             select_rect,
             select_style.rounding,
             select_style.fill,
             select_style.stroke,
             StrokeKind::Inside,
-        );
-    }
+        ))
+    });
 
     // Size of the pin.
     // Side of the square or diameter of the circle.
@@ -3073,11 +3215,32 @@ where
     );
 
     let mut new_pins_size = Vec2::ZERO;
+    // FLEXINPUT PATCH: what the node holds this frame, before it's rounded onto the grid.
+    let mut content_inner = Vec2::ZERO;
     // FLEXINPUT PATCH: how wide the header's contents are, which the width grip can't
     // make the node narrower than.
     let mut header_w = 0.0_f32;
 
-    let r = node_frame.show(node_ui, |ui| {
+    // FLEXINPUT PATCH: while the size eases, the frame is painted here at the size it's drawn
+    // at (`frame_backdrop`, below), and what it holds is cut to it, with room for the pins
+    // on its edges: laid out at the size it's going to, a module growing spilled past its
+    // frame until the frame got there. egui's own frame keeps its margins and draws nothing.
+    // Following what it holds down (`snaps_down`), it's painted here too, as tall as that
+    // came out or the grid line it's gliding to, whichever is more.
+    let frame_backdrop = (size_gliding || snaps_down).then(|| node_ui.painter().add(Shape::Noop));
+    let mut shown_frame = node_frame;
+    if size_gliding || snaps_down {
+        shown_frame.fill = Color32::TRANSPARENT;
+        // Its width kept: without one the frame came out a stroke smaller all round.
+        shown_frame.stroke = Stroke::new(node_frame.stroke.width, Color32::TRANSPARENT);
+        shown_frame.shadow = egui::epaint::Shadow::NONE;
+    }
+    if size_gliding {
+        let room = vec2(pin_size + 4.0, 2.0);
+        node_ui.set_clip_rect(node_ui.clip_rect().intersect(shown_frame_rect.expand2(room)));
+    }
+
+    let r = shown_frame.show(node_ui, |ui| {
         if viewer.has_node_style(node, &inputs, &outputs, snarl) {
             viewer.apply_node_style(ui.style_mut(), node, &inputs, &outputs, snarl);
         }
@@ -3105,15 +3268,16 @@ where
             PinPlacement::Outside { .. } => None,
         };
 
-        // Output pins' center side by X axis.
+        // Output pins' center side by X axis. FLEXINPUT PATCH: on the frame's edge as drawn,
+        // which eases to its size, so the pins (and their wires) ride the edge with it.
         let output_x = match pin_placement {
             PinPlacement::Inside => pin_size.mul_add(
                 -0.5,
-                node_frame_rect.right() - node_frame.inner_margin.rightf(),
+                shown_frame_rect.right() - node_frame.inner_margin.rightf(),
             ),
-            PinPlacement::Edge => node_frame_rect.right(),
+            PinPlacement::Edge => shown_frame_rect.right(),
             PinPlacement::Outside { margin } => {
-                pin_size.mul_add(0.5, node_frame_rect.right() + margin)
+                pin_size.mul_add(0.5, shown_frame_rect.right() + margin)
             }
         };
 
@@ -3649,12 +3813,62 @@ where
                 + ui.spacing().item_spacing.y
                 + new_pins_size.y,
         );
-        // FLEXINPUT PATCH: see the top of this function.
+        // FLEXINPUT PATCH: contents bigger than the frame the viewer eased to hold it at their
+        // size next frame: dragged in past what it holds, the frame stops there rather than
+        // squeezing them every frame. Their size THIS frame, measured afresh every frame - a
+        // size kept until the grip asked for as much again held the frame there after the
+        // contents had shrunk (a height squeezed straight after a width hung for the drag).
+        {
+            let mut next = floor;
+            for k in 0..2 {
+                next[k] = match frame_now[k] {
+                    FrameNow::Eased(f) if k == 0 && size[k] > f - margins[k] + 0.5 => size[k],
+                    _ => 0.0,
+                };
+            }
+            if next != floor {
+                ui.ctx().data_mut(|d| d.insert_temp(floor_key, next));
+            }
+        }
+        // FLEXINPUT PATCH: see the top of this function. An axis the viewer is easing toward
+        // the size its grip asked for isn't rounded on the way (`node_frame_now`): the frame
+        // is what it holds, and the size it ends at is whole blocks already. Down, holding
+        // more than it was laid out at (`snaps_down`), it's kept rounded: the grid line the
+        // frame is gliding to, for snarl's glide to carry on to once the viewer lets go.
+        content_inner = size;
+        let overflows_down = snaps_down
+            && size.y > node_rect.height() + SNAP_DOWN_SLACK
+            && (was_over != Overflow::None || spill_now(node_rect.height()));
         if let Some(g) = grid_snap {
-            let raw_h = size.y;
+            let raw = size;
             size = g.snap_inner_size(size, margins);
+            if viewers[0] {
+                size.x = raw.x;
+            }
             // What the rounding added, for `payload_pad` next frame.
-            ui.ctx().data_mut(|d| d.insert_temp(node_id.with("grid-slack-y"), (size.y - raw_h).max(0.0)));
+            let slack = if viewers[1] { 0.0 } else { (size.y - raw.y).max(0.0) };
+            // Following the viewer's frame, its size is that frame - or what it holds, if
+            // that came out more: stored as what it held when that came out less (a row
+            // measured a frame short), the frame let go of a block short and glided back.
+            if viewers[1] && !overflows_down {
+                size.y = raw.y.max(node_rect.height());
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(node_id.with("grid-slack-y"), slack));
+        }
+        // FLEXINPUT PATCH: grown only once it's held more two frames running: a row that
+        // re-wraps is measured a frame late, and its spill, rounded onto the grid, grew the
+        // frame a block for one frame and glided it back.
+        if !viewers[1] && !fresh {
+            let wait_key = node_id.with("flexinput-grow-wait");
+            let grows = size.y > target_size.y + 0.5;
+            let waited: bool = ui.ctx().data(|d| d.get_temp(wait_key)).unwrap_or(false);
+            if grows && !waited {
+                size.y = target_size.y;
+                ui.ctx().request_repaint();
+            }
+            if grows != waited {
+                ui.ctx().data_mut(|d| d.insert_temp(wait_key, grows));
+            }
         }
         node_state.set_size(size);
         if grid_snap.is_some() {
@@ -3670,6 +3884,77 @@ where
         return None;
     }
 
+    // FLEXINPUT PATCH: where the frame is drawn: on its way to its size while that eases,
+    // else what it holds - and following what it holds down (`snaps_down`), as tall as that
+    // or the grid line above it it's gliding to, whichever is more: never inside it, and on
+    // the grid when the viewer lets go.
+    let mut paint_rect = shown_rect;
+    if snaps_down {
+        let key = size_key.with(1);
+        let now = ui.input(|i| i.time);
+        let laid_h = node_rect.height();
+        // As tall as it was laid out, or as what it holds if that's more.
+        let mut h = laid_h.max(content_inner.y);
+        let still = |ui: &Ui, h: f32| {
+            let at = egui::pos2(h, 0.0);
+            ui.ctx().data_mut(|d| d.insert_temp(key, Glide { from: at, to: at, start: now - f64::from(ease) }));
+        };
+        let over;
+        match grid_snap {
+            // Holding more than it was laid out at - more than a row re-wrapping a frame
+            // late spills, and for longer than the frame it spills for - it glides to the
+            // grid line above what it holds.
+            Some(_) if content_inner.y > laid_h + SNAP_DOWN_SLACK && was_over == Overflow::None && !spill_now(laid_h) => {
+                still(ui, h);
+                over = Overflow::Spilled;
+            }
+            Some(g) if content_inner.y > laid_h + SNAP_DOWN_SLACK => {
+                let line = g.snap_len(content_inner.y + margins.y) - margins.y;
+                let eased = eased_at(ui.ctx(), key, egui::pos2(line, 0.0), ease).x;
+                if eased < h - 0.5 {
+                    // Behind what it holds: off again from there.
+                    ui.ctx().data_mut(|d| d.insert_temp(key, Glide { from: egui::pos2(h, 0.0), to: egui::pos2(line, 0.0), start: now }));
+                    ui.ctx().request_repaint();
+                }
+                h = h.max(eased);
+                over = Overflow::Gliding;
+            }
+            // Back inside the frame it was laid out at: down to that from where it got to.
+            _ if was_over == Overflow::Gliding => {
+                let eased = eased_at(ui.ctx(), key, egui::pos2(h, 0.0), ease).x;
+                over = if eased > h + 0.5 { Overflow::Gliding } else { Overflow::None };
+                h = h.max(eased);
+            }
+            // The frame is the viewer's, and a glide onto the grid sets off from there.
+            _ => {
+                still(ui, h);
+                over = Overflow::None;
+            }
+        }
+        if (over, laid_h) != (was_over, was_laid_h) {
+            ui.ctx().data_mut(|d| d.insert_temp(over_key, (over, laid_h)));
+        }
+        paint_rect = Rect::from_x_y_ranges(shown_rect.x_range(), shown_rect.top()..=shown_rect.top() + h);
+    }
+    if let Some(idx) = frame_backdrop {
+        node_ui.painter().set(idx, node_frame.paint(paint_rect));
+    }
+    let drawn_frame = if size_gliding || snaps_down { paint_rect + frame_margin } else { r.response.rect };
+    if let Some(idx) = select_slot {
+        let select_style = style.get_select_style(ui.style());
+        ui.painter().set(
+            idx,
+            egui::epaint::RectShape::new(
+                drawn_frame + select_style.margin,
+                select_style.rounding,
+                select_style.fill,
+                select_style.stroke,
+                StrokeKind::Inside,
+            ),
+        );
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(DRAWN_FRAME_KEY).with(node.0), drawn_frame));
+
     viewer.final_node_rect(node, r.response.rect, ui, snarl);
 
     // FLEXINPUT PATCH: the corner grip, over everything else in the node. The viewer's
@@ -3682,7 +3967,7 @@ where
             .node_narrowest(node, snarl)
             .map_or(header_w + margins.x, |n| n.max(header_w + margins.x));
         let uniform = viewer.node_resize_uniform(node, snarl);
-        size_grip(ui, node, node_id, r.response.rect, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl, uniform);
+        size_grip(ui, node, node_id, r.response.rect, drawn_frame, narrowest, grid_snap, modifiers, snarl_state, viewer, snarl, uniform);
     }
 
     node_state.store(ui.ctx());

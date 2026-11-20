@@ -2840,14 +2840,34 @@ fn area_mapper_body(
     surface: egui::Vec2,
 ) -> bool {
     let colors = sync_and_colors(snarl, node_id);
-    let visuals = ui.visuals().clone();
     let mut changed = false;
-    let size = surface.min_elem();
+    let rows_min = rows::ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor();
 
-    // The settings in categories that fold (`curve_rows::section`), as the other modules'
-    // bodies have them: what the area reads and how it shows, its layers, then the field,
-    // and under it what is selected on it - a border, a cell - and the press mode.
-    let w = surface.x.max(rows::ROWS_MIN_W * super::viewer::simple_bodies::control_width_factor());
+    // Wide enough for the mappings beside the rest, they go there: the settings and the field
+    // in a column on the left, the cards a column on the right as tall as it, and a bar
+    // between the two that shares the width out. Narrower, it's all one column, the cards at
+    // the bottom under a bar that sets their height.
+    if let Some(b) = super::viewer::kit::beside(snarl, node_id, surface.x, rows_min, CARDS_MIN_W, CARDS_FRAC, CARDS_FRAC_DEFAULT) {
+        let (mut left_changed, mut right_changed) = (false, false);
+        super::viewer::kit::show_beside(
+            ui,
+            snarl,
+            node_id,
+            b,
+            "Drag to share the width between the settings and the mappings. Double-click to reset.",
+            |ui, snarl| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let field = surface.y.min(b.left_w).clamp(FIELD_MIN, FIELD_MAX);
+                left_changed = settings_column(node_id, ui, snarl, live_signals, automap_parent, colors, b.left_w, field);
+            },
+            |ui, snarl, h| {
+                right_changed = cards_window(node_id, ui, snarl, live_signals, automap_parent, colors, b.right_w, Some(h));
+            },
+        );
+        return changed || left_changed || right_changed;
+    }
+
+    let w = surface.x.max(rows_min);
     ui.vertical(|ui| {
         // The body is as wide as the grip made it even where the square field is not: a
         // frame that snapped back to the rows' width would be a grip that didn't take.
@@ -2856,71 +2876,117 @@ fn area_mapper_body(
         // frame's - a frame dragged wide would never come back.
         ui.set_max_width(w);
         ui.spacing_mut().item_spacing.y = 2.0;
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "input", "Input and overlay", true) {
-            let opts = ui.vertical(|ui| {
-                changed |= rows::options(node_id, ui, snarl, live_signals, automap_parent, w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "options", opts);
-        }
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "layers", "Layers", true) {
-            let layers = ui.vertical(|ui| {
-                changed |= rows::layers(node_id, ui, snarl, w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "layers", layers);
-            // The layer's analog mode: a widget of its own, pinned on its own.
-            let analog = ui.vertical(|ui| {
-                changed |= rows::analog(node_id, ui, snarl, w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "analog", analog);
-        }
+        let field = surface.min_elem().clamp(FIELD_MIN, FIELD_MAX);
+        changed |= settings_column(node_id, ui, snarl, live_signals, automap_parent, colors, w, field);
         ui.add_space(4.0);
-        let (field, structural) = area_field(node_id, ui, snarl, colors, size.clamp(FIELD_MIN, FIELD_MAX), false, false);
-        changed |= structural;
-        register_exposable_element(ui, node_id, "field", field);
-        ui.add(egui::Label::new(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
-            .small().weak()).wrap());
-        let border_title = rows::border_title(snarl, node_id);
-        let heading = border_title.as_deref().map_or("Border".to_string(), |t| format!("Border: {t}"));
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "border", &heading, true) {
-            let border = ui.vertical(|ui| {
-                changed |= rows::border(node_id, ui, snarl, colors, w, true);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "border", border);
-        }
-        let cell = snarl.get_node(node_id).map_or(0, |n| selected_cell(n, &area_layout(n)));
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "cell", &format!("Cell {cell}"), true) {
-            // Its name and icon and its haptic, pinnable as one widget.
-            let cell_rect = ui.vertical(|ui| {
-                changed |= rows::cell(node_id, ui, snarl, w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "cell", cell_rect);
-        }
-        if super::viewer::curve_rows::section(ui, snarl, node_id, "press", "Press mode", false) {
-            let press = ui.vertical(|ui| {
-                changed |= rows::press(node_id, ui, snarl, w);
-            }).response.rect;
-            register_exposable_element(ui, node_id, "press", press);
-        }
-        ui.add_space(4.0);
-        // The cell's tabs and Learn row stay put, the cards scroll in a window under them
-        // (`card_window`), as a Remapper's do.
-        let _ = &visuals;
-        let band = super::viewer::curve_rows::band_h(ui);
-        let cards = super::viewer::card_window(
-            ui, snarl, node_id, "area_cards", w, "cards_h", band,
-            live_signals, &crate::app::PanicShortcut::default(), automap_parent,
-            move |id, _ins, ui, sn, sigs, _panic, am| {
-                let visuals = ui.visuals().clone();
-                ui.vertical(|ui| {
-                    render_touch_zone_cards(id, ui, sn, &visuals, colors.accent, sigs, am);
-                });
-            },
-            super::viewer::tz_cards_hash_map,
-            super::viewer::tz_cards_hash_draft,
-        );
-        register_exposable_element(ui, node_id, "cards", cards);
+        changed |= cards_window(node_id, ui, snarl, live_signals, automap_parent, colors, w, None);
     });
     changed
+}
+
+/// The narrowest the mappings column gets beside the settings; narrower than this and the
+/// body is one column again. Shared by the modules whose mapping cards go beside the rest.
+pub(crate) const CARDS_MIN_W: f32 = 280.0;
+/// The mappings column's share of the width, as its bar was dragged to.
+pub(crate) const CARDS_FRAC: &str = "cards_frac";
+pub(crate) const CARDS_FRAC_DEFAULT: f32 = 0.45;
+
+/// The settings in categories that fold (`curve_rows::section`), as the other modules'
+/// bodies have them: what the area reads and how it shows, its layers, then the field
+/// (`field` points square), and under it what is selected on it - a border, a cell - and the
+/// press mode. `w` wide.
+#[allow(clippy::too_many_arguments)]
+fn settings_column(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    colors: ZoneColors,
+    w: f32,
+    field: f32,
+) -> bool {
+    let mut changed = false;
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "input", "Input and overlay", true) {
+        let opts = ui.vertical(|ui| {
+            changed |= rows::options(node_id, ui, snarl, live_signals, automap_parent, w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "options", opts);
+    }
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "layers", "Layers", true) {
+        let layers = ui.vertical(|ui| {
+            changed |= rows::layers(node_id, ui, snarl, w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "layers", layers);
+        // The layer's analog mode: a widget of its own, pinned on its own.
+        let analog = ui.vertical(|ui| {
+            changed |= rows::analog(node_id, ui, snarl, w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "analog", analog);
+    }
+    ui.add_space(4.0);
+    let (field_rect, structural) = area_field(node_id, ui, snarl, colors, field, false, false);
+    changed |= structural;
+    register_exposable_element(ui, node_id, "field", field_rect);
+    super::viewer::simple_bodies::trace_rect(ui, node_id, "area_field", field_rect);
+    ui.add(egui::Label::new(egui::RichText::new("Drag a border to move it, double-click to centre it · click a border for its gradient · right-click to add or remove")
+        .small().weak()).wrap());
+    let border_title = rows::border_title(snarl, node_id);
+    let heading = border_title.as_deref().map_or("Border".to_string(), |t| format!("Border: {t}"));
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "border", &heading, true) {
+        let border = ui.vertical(|ui| {
+            changed |= rows::border(node_id, ui, snarl, colors, w, true);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "border", border);
+    }
+    let cell = snarl.get_node(node_id).map_or(0, |n| selected_cell(n, &area_layout(n)));
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "cell", &format!("Cell {cell}"), true) {
+        // Its name and icon and its haptic, pinnable as one widget.
+        let cell_rect = ui.vertical(|ui| {
+            changed |= rows::cell(node_id, ui, snarl, w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "cell", cell_rect);
+    }
+    if super::viewer::curve_rows::section(ui, snarl, node_id, "press", "Press mode", false) {
+        let press = ui.vertical(|ui| {
+            changed |= rows::press(node_id, ui, snarl, w);
+        }).response.rect;
+        register_exposable_element(ui, node_id, "press", press);
+    }
+    changed
+}
+
+/// The cell's mapping cards: its tabs and Learn row stay put, the cards scroll in a window
+/// under them (`card_window`), as a Remapper's do. `w` wide; `fixed_h` tall beside the
+/// settings, else as tall as its own bar was dragged.
+#[allow(clippy::too_many_arguments)]
+fn cards_window(
+    node_id: NodeId,
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    live_signals: &LiveSignals,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    colors: ZoneColors,
+    w: f32,
+    fixed_h: Option<f32>,
+) -> bool {
+    let band = super::viewer::curve_rows::band_h(ui);
+    let cards = super::viewer::card_window(
+        ui, snarl, node_id, "area_cards", w, "cards_h", band,
+        live_signals, &crate::app::PanicShortcut::default(), automap_parent,
+        move |id, _ins, ui, sn, sigs, _panic, am| {
+            let visuals = ui.visuals().clone();
+            ui.vertical(|ui| {
+                render_touch_zone_cards(id, ui, sn, &visuals, colors.accent, sigs, am);
+            });
+        },
+        super::viewer::tz_cards_hash_map,
+        super::viewer::tz_cards_hash_draft,
+        fixed_h,
+    );
+    register_exposable_element(ui, node_id, "cards", cards);
+    super::viewer::simple_bodies::trace_rect(ui, node_id, "area_cards", cards);
+    false
 }
 
 /// A row's Style 2 look, pinned: the body's own bands (`rows`), drawn inside

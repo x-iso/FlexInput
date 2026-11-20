@@ -229,12 +229,16 @@ pub(crate) fn iv_style_inspector(
 
 // ── Node body ─────────────────────────────────────────────────────────────────
 
+/// The board as a node's body, `body_w` wide - the width the module's corner grip gives it,
+/// which scales the board whole: its height is the board's own shape at that width
+/// (`kit::keeps_aspect`), never narrower than half its drawn size.
 pub(crate) fn show_input_viewer_body(
     node_id: NodeId,
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
     live_signals: &LiveSignals,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    body_w: f32,
 ) {
     // Skin is picked in the node HEADER (shared selector with the Remapper).
     // Board STYLE is a per-pin property, edited in the layout / overlay editor
@@ -249,7 +253,8 @@ pub(crate) fn show_input_viewer_body(
     let dev_id = remapper_upstream_device_id(snarl, node_id, 0, automap_parent);
 
     let style = IvStyle::default();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(BOARD_W, BOARD_H), egui::Sense::hover());
+    let w = body_w.max(BOARD_W * 0.5);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, w * BOARD_H / BOARD_W), egui::Sense::hover());
     paint_viewer_board(ui, rect, node_id.0, dev_id.as_deref(), skin, &style, live_signals);
 
     register_exposable_element(ui, node_id, "viewer", rect);

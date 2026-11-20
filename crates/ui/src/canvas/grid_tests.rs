@@ -5648,3 +5648,426 @@ fn a_dragged_pill_fills_to_its_value() {
     let share = dragged_pill_share("module.delay", "delay_ms_pill", serde_json::json!({ "delay_ms": 100.0 }));
     assert!(share > 0.3 && share < 0.6, "100 ms of a minute, on a log scale: {share}");
 }
+
+/// The Input Viewer's board scales with the module's grip and keeps its shape: dragged
+/// wider, the board is wider and taller in proportion, and it fills the body's width.
+#[test]
+fn the_input_viewer_board_scales_with_its_grip() {
+    use crate::canvas::input_viewer::{BOARD_H, BOARD_W};
+    let (mut rig, ids) = Rig::real("module.input_viewer", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    let plate = crate::canvas::input_viewer::IvStyle::default().bg;
+    let board = |rig: &Rig| {
+        painted_rects(rig)
+            .into_iter()
+            .filter(|(_, f, _)| *f == plate)
+            .map(|(r, _, _)| r)
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the board was drawn")
+    };
+    let mut widths = Vec::new();
+    for blocks in [9.0, 16.0, 26.0] {
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(blocks * B));
+        }
+        rig.idle(12);
+        let (b, frame) = (board(&rig), rig.frame_rect(n));
+        assert!((b.height() - b.width() * BOARD_H / BOARD_W).abs() < 1.0, "{blocks} blocks: the board lost its shape: {b:?}");
+        // The frame's own margins either side, and nothing more.
+        assert!(frame.width() - b.width() <= 32.0, "{blocks} blocks: the board doesn't fill the body: {b:?} in {frame:?}");
+        widths.push(b.width());
+    }
+    assert!(widths[0] < widths[1] && widths[1] < widths[2], "the board didn't scale with the grip: {widths:?}");
+    assert!(widths[0] >= BOARD_W * 0.5 - 0.5, "smaller than half its size: {widths:?}");
+}
+
+/// With a transition time, a module whose size changes - its grip dragged a block, its
+/// width set - is drawn easing to its new size rather than jumping a block at a time; it
+/// gets there once the time is up.
+#[test]
+fn a_resized_module_eases_to_its_new_size() {
+    let (mut rig, ids) = Rig::real("module.label", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.grid.ease = 0.3;
+    rig.idle(6);
+    // The frame as painted: the widest rect in the frame's own fill laid at its corner (what
+    // it holds is laid out at its new size, and some of that starts at the corner too).
+    let fill = rig.canvas.style.node_frame.map(|f| f.fill).expect("the canvas styles its frames");
+    let drawn_w = |rig: &Rig| {
+        let f = rig.frame_rect(n);
+        painted_rects(rig)
+            .into_iter()
+            .filter(|(r, c, _)| *c == fill && (r.min - f.min).length() < 1.5 && r.height() > f.height() * 0.5)
+            .map(|(r, _, _)| r.width())
+            .fold(0.0f32, f32::max)
+    };
+    let before = drawn_w(&rig);
+    if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+        node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(before + 6.0 * B));
+    }
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        rig.idle(1);
+        seen.push(drawn_w(&rig));
+    }
+    rig.idle(20);
+    let after = drawn_w(&rig);
+    assert!(after >= before + 6.0 * B - 1.0, "the module didn't take its new width: {before} -> {after}");
+    assert!(
+        seen.iter().any(|w| *w > before + 2.0 && *w < after - 2.0),
+        "it jumped rather than easing: {before} {seen:?} {after}"
+    );
+}
+
+/// Stretched wide, the Area Mapper puts its mappings in a column beside the settings and the
+/// field, as tall as they are, and the bar between the two columns shares the width out; at
+/// its usual width the mappings are under the field.
+#[test]
+fn a_wide_area_mapper_puts_its_mappings_beside_the_field() {
+    let (mut rig, ids) = Rig::real("module.area_mapper", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    rig.idle(10);
+    let (field, cards) = (rig.traced(n, "area_field"), rig.traced(n, "area_cards"));
+    assert!(cards.top() > field.bottom(), "at its usual width, under the field: {field:?} {cards:?}");
+    // The gap between the mappings' Learn and Choose buttons, for its text's size: the cards
+    // scale with their column, the gaps go with them.
+    let gap = |rig: &Rig| {
+        let (_, learn) = rig.painted_text("Learn").expect("Learn");
+        let (_, choose) = rig.painted_text("Choose").expect("Choose");
+        (choose.left() - learn.right()) / learn.height()
+    };
+    let stacked = gap(&rig);
+
+    if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+        node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(30.0 * B));
+    }
+    rig.idle(12);
+    let (field, cards) = (rig.traced(n, "area_field"), rig.traced(n, "area_cards"));
+    assert!(cards.left() > field.right() && cards.top() < field.bottom(), "wide, beside the field: {field:?} {cards:?}");
+    // Laid beside the field, the cards keep their own spacing (the row's, set to nothing to
+    // butt the columns together, closed up every row of them).
+    let beside = gap(&rig);
+    assert!((beside - stacked).abs() < 0.035 * stacked, "the mappings closed up beside the field: {beside} vs {stacked}");
+
+    // The bar is the gap just left of the mappings: dragged left, the mappings get wider.
+    let before = cards.width();
+    rig.drag(egui::pos2(cards.left() - 4.0, cards.top() + 40.0), egui::vec2(-60.0, 0.0));
+    rig.idle(4);
+    let after = rig.traced(n, "area_cards").width();
+    assert!(after > before + 30.0, "the bar didn't share the width out: {before} -> {after}");
+}
+
+/// With a transition time, every module settles at the size it has without one and stays
+/// there. Laid out inside a frame easing to its size, a body sized to its room measured a
+/// new size every frame of the glide and started another: modules strobed between two
+/// sizes, and some grew a block on their own.
+#[test]
+fn every_module_holds_still_with_transitions_on() {
+    let mut bad = Vec::new();
+    for r in flexinput_modules::all_modules() {
+        let id = r.descriptor.id;
+        let settle = |ease: f32| {
+            let (mut rig, ids) = Rig::build(r.descriptor.clone(), &[egui::pos2(100.0, 120.0)]);
+            rig.screen = egui::vec2(3200.0, 2800.0);
+            rig.grid.ease = ease;
+            rig.idle(40);
+            let n = ids[0];
+            // Something to start a glide, as hovering or a setting does in the app: a module
+            // the grip sizes, dragged two blocks wider.
+            let resizable = !crate::canvas::viewer::kit::fixed_size(id)
+                && (crate::canvas::viewer::kit::uses_kit(id) || crate::canvas::viewer::kit::stretchy(id));
+            if resizable {
+                let w = rig.frame_rect(n).width() + 2.0 * B;
+                if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+                    node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(w));
+                }
+                rig.idle(40);
+            }
+            let sizes: Vec<egui::Vec2> = (0..20)
+                .map(|_| {
+                    rig.idle(1);
+                    rig.frame_rect(n).size()
+                })
+                .collect();
+            sizes
+        };
+        let still = settle(0.0);
+        let eased = settle(0.25);
+        let moving = eased.windows(2).any(|w| (w[0] - w[1]).length() > 0.5);
+        if moving || (eased[19] - still[19]).length() > 0.5 {
+            bad.push(format!("{id}: without {:?}, with {:?}", still[19], &eased[..4]));
+        }
+    }
+    assert!(bad.is_empty(), "modules that won't hold still with transitions on:\n{}", bad.join("\n"));
+}
+
+/// Dragging a module's grip a few blocks wider with a transition time eases what it holds
+/// along with its frame: the body is part of the way there for a few frames, and the frame
+/// stays the same distance round it every one of them. The body used to jump to the new size
+/// at once and the frame trail behind it.
+#[test]
+fn a_resized_modules_contents_ease_with_its_frame() {
+    let (mut rig, ids) = Rig::real("module.label", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.grid.ease = 0.3;
+    rig.idle(6);
+    let measure = |rig: &Rig| (rig.frame_rect(n).width(), rig.traced(n, "body_fill").width());
+    let (frame0, body0) = measure(&rig);
+    let around = frame0 - body0;
+    if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+        node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(frame0 + 6.0 * B));
+    }
+    let mut seen = Vec::new();
+    for _ in 0..5 {
+        rig.idle(1);
+        seen.push(measure(&rig));
+    }
+    rig.idle(20);
+    let (frame1, body1) = measure(&rig);
+    assert!(frame1 >= frame0 + 6.0 * B - 1.0, "the module didn't take its new width: {frame0} -> {frame1}");
+    assert!(seen.iter().any(|(_, b)| *b > body0 + 2.0 && *b < body1 - 2.0), "the contents jumped: {body0} {seen:?} {body1}");
+    for (f, b) in &seen {
+        assert!((f - b - around).abs() < 1.5, "the frame and its contents parted: {f} round {b}, {around} apart at rest");
+    }
+}
+
+/// A module that keeps its shape - the Input Viewer's board - scaled by its grip with a
+/// transition time: the frame stays the same distance round the board, across and down,
+/// every frame of the way. Its height followed the grid in steps of its own and raced the
+/// board.
+#[test]
+fn a_shape_keeping_module_scales_in_unison_with_its_frame() {
+    let (mut rig, ids) = Rig::real("module.input_viewer", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.grid.ease = 0.3;
+    rig.idle(8);
+    let plate = crate::canvas::input_viewer::IvStyle::default().bg;
+    let measure = |rig: &Rig| {
+        let board = painted_rects(rig)
+            .into_iter()
+            .filter(|(_, f, _)| *f == plate)
+            .map(|(r, _, _)| r)
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the board was drawn");
+        (rig.frame_rect(n).size(), board.size())
+    };
+    let (frame0, board0) = measure(&rig);
+    let around = frame0 - board0;
+    if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+        node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(frame0.x + 8.0 * B));
+    }
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        rig.idle(1);
+        seen.push(measure(&rig));
+    }
+    assert!(seen.iter().any(|(_, b)| b.x > board0.x + 2.0), "the board didn't grow: {seen:?}");
+    // Down, the frame isn't rounded to the grid on the way (it is at rest, the board centred
+    // in what the rounding added), so the gap is the header and the margins alone - the same
+    // every frame from the one after the rest's centring lets go.
+    let down = seen[1].0.y - seen[1].1.y;
+    for (k, (f, b)) in seen.iter().enumerate() {
+        let gap = *f - *b;
+        assert!(gap.y > 0.0 && gap.y <= around.y + 0.5, "the board isn't inside the frame: {f:?} round {b:?}");
+        if k == 0 {
+            continue;
+        }
+        assert!((gap.x - around.x).abs() < 1.5, "the frame and the board parted across: {f:?} round {b:?}, {around:?} at rest");
+        assert!((gap.y - down).abs() < 1.5, "the frame and the board parted down: {f:?} round {b:?}, {down} at first");
+    }
+}
+
+/// A module's grip dragged in past what it holds - the 3DOF's rows of buttons are wider than
+/// its grip's floor - stops where they need it, with a transition time as without one, and
+/// stays there: the frame used to squeeze them back every frame while they pushed it out.
+#[test]
+fn a_grip_dragged_past_the_contents_stops_there_without_a_tug_of_war() {
+    let settle = |ease: f32| {
+        let (mut rig, ids) = Rig::real("processing.gyro_3dof", &[egui::pos2(40.0, 40.0)]);
+        let n = ids[0];
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        rig.grid.ease = ease;
+        rig.idle(10);
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(4.0 * B));
+        }
+        // Every frame from the drag on: on the way, and once it has settled.
+        (0..42)
+            .map(|_| {
+                rig.idle(1);
+                rig.frame_rect(n).width()
+            })
+            .collect::<Vec<f32>>()
+    };
+    let still = settle(0.0);
+    let eased = settle(0.25);
+    let (end, rest) = (eased[41], &eased[30..]);
+    assert!(rest.windows(2).all(|w| (w[0] - w[1]).abs() < 0.5), "it won't hold still: {rest:?}");
+    assert!((end - still[41]).abs() <= B, "it stopped somewhere else with a transition time: {} vs {end}", still[41]);
+    // On the way it's the contents' own width, not yet rounded up to the grid: never more than
+    // that rounding under where it ends. Squeezed, it went down to a fraction of it.
+    assert!(eased.iter().all(|w| *w >= end - B), "the frame squeezed in past its contents on the way: {eased:?}");
+}
+
+/// The grip taken quickly round a square - wider, taller, narrower, shorter - with a
+/// transition time: the frame's bottom keeps to what the module holds every frame of it.
+/// Contents that once overflowed the easing frame used to leave it held at that size until
+/// the grip asked for as much again, so a squeeze of the height straight after a squeeze
+/// of the width left the frame hanging below the contents for as long as the drag went on.
+#[test]
+fn a_quick_square_round_the_grip_keeps_the_frame_on_the_contents() {
+    use crate::canvas::viewer::kit::{HEIGHT_PARAM, WIDTH_PARAM};
+    let (mut rig, ids) = Rig::real("module.area_mapper", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    rig.grid.ease = 0.3;
+    rig.idle(10);
+    let gap = |rig: &Rig| rig.frame_rect(n).bottom() - rig.traced(n, "area_cards").bottom();
+    let rest = gap(&rig);
+    let (w0, h0) = (rig.frame_rect(n).width(), rig.frame_rect(n).height());
+    let set = |rig: &mut Rig, key: &str, v: f32| {
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(key.into(), serde_json::json!(v));
+        }
+    };
+    let mut seen = Vec::new();
+    for (key, v) in [(WIDTH_PARAM, w0 + 2.0 * B), (HEIGHT_PARAM, h0 + 6.0 * B), (WIDTH_PARAM, w0 - 4.0 * B), (HEIGHT_PARAM, h0 - 6.0 * B)] {
+        set(&mut rig, key, v);
+        for _ in 0..3 {
+            rig.idle(1);
+            seen.push(gap(&rig));
+        }
+    }
+    for _ in 0..12 {
+        rig.idle(1);
+        seen.push(gap(&rig));
+    }
+    assert!(
+        seen.iter().all(|g| *g <= rest + B),
+        "the frame hung below what the module holds: {rest} at rest, then {seen:?}"
+    );
+}
+
+/// Stretched wide, the modules with a field or a view and a column of settings or mappings
+/// lay the two side by side; at their usual width one is under the other. Touch Zones and
+/// the Virtual Menu put their mappings beside the field, 3DOF to 2D its settings beside the
+/// preview, Controller 3D its view beside the settings, Gyro to Stick Rotation its settings
+/// beside the circle, Audio Stream Haptics its scope beside the rows.
+#[test]
+fn wide_modules_lay_their_parts_side_by_side() {
+    let cases: [(&'static str, serde_json::Value, &str, &str); 6] = [
+        ("module.touch_zones", serde_json::json!({ "zone_mode": "mapping" }), "tz_field", "tz_cards"),
+        // These two go side by side once they're wider than they're tall.
+        ("module.stick_rotation", serde_json::json!({}), "sr_field", "sr_settings"),
+        ("module.audio_stream_haptics", serde_json::json!({}), "asth_rows", "asth_scope"),
+        ("module.menu", serde_json::json!({}), "menu_field", "menu_cards"),
+        ("processing.gyro_3dof", serde_json::json!({}), "gyro_view", "gyro_lean"),
+        // The view's first part is the settings column: its top-left is the body's.
+        ("display.controller3d", serde_json::json!({}), "c3d_view", "c3d_view"),
+    ];
+    for (id, params, first, second) in cases {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(40.0, 40.0)]);
+        let n = ids[0];
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        if let (Some(node), serde_json::Value::Object(extra)) = (rig.canvas.snarl.get_node_mut(n), params) {
+            node.params.extend(extra);
+        }
+        rig.idle(12);
+        let frame = rig.frame_rect(n);
+        let (a, b) = (rig.traced(n, first), rig.traced(n, second));
+        if first == second {
+            assert!(a.left() < frame.left() + frame.width() * 0.3, "{id}: at its usual width the view is across the body: {a:?} in {frame:?}");
+        } else {
+            assert!(b.top() > a.bottom() - 1.0, "{id}: at its usual width, one under the other: {a:?} {b:?}");
+        }
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(crate::canvas::viewer::kit::WIDTH_PARAM.into(), serde_json::json!(34.0 * B));
+        }
+        rig.idle(16);
+        let frame = rig.frame_rect(n);
+        let (a, b) = (rig.traced(n, first), rig.traced(n, second));
+        if first == second {
+            assert!(a.left() > frame.left() + frame.width() * 0.3, "{id}: wide, the view isn't beside the settings: {a:?} in {frame:?}");
+            assert!(a.top() < frame.top() + 3.0 * B, "{id}: wide, the view starts at the top: {a:?} in {frame:?}");
+        } else {
+            assert!(b.left() > a.right() - 1.0 && b.top() < a.bottom(), "{id}: wide, side by side: {a:?} {b:?}");
+        }
+    }
+}
+
+/// 3DOF to 2D side by side: the preview runs the whole height of the body - the grip's, or
+/// the settings' beside it when the grip asks for less, never squeezed in under them - and
+/// stretched wider still, Lean takes a third column on the right.
+#[test]
+fn the_3dof_preview_runs_the_height_of_its_column() {
+    use crate::canvas::viewer::kit::{HEIGHT_PARAM, WIDTH_PARAM};
+    let (mut rig, ids) = Rig::real("processing.gyro_3dof", &[egui::pos2(40.0, 40.0)]);
+    let n = ids[0];
+    rig.screen = egui::vec2(4000.0, 3200.0);
+    let set = |rig: &mut Rig, key: &str, v: f32| {
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(key.into(), serde_json::json!(v));
+        }
+    };
+    set(&mut rig, WIDTH_PARAM, 34.0 * B);
+    for h in [4.0 * B, 40.0 * B] {
+        set(&mut rig, HEIGHT_PARAM, h);
+        rig.idle(16);
+        let (frame, view, lean) = (rig.frame_rect(n), rig.traced(n, "gyro_view"), rig.traced(n, "gyro_lean"));
+        assert!(lean.left() > view.right(), "not side by side: {view:?} {lean:?}");
+        assert!(view.bottom() > lean.bottom(), "grip {h}: the preview stopped short of the settings beside it: {view:?} {lean:?}");
+        assert!(frame.bottom() - view.bottom() < 1.5 * B, "grip {h}: the preview doesn't reach the bottom: {view:?} in {frame:?}");
+    }
+    // Wider: the settings in the middle, Lean on the right, level with the preview's top.
+    set(&mut rig, WIDTH_PARAM, 64.0 * B);
+    set(&mut rig, HEIGHT_PARAM, 4.0 * B);
+    rig.idle(16);
+    let (frame, view, lean) = (rig.frame_rect(n), rig.traced(n, "gyro_view"), rig.traced(n, "gyro_lean"));
+    assert!(lean.left() > view.right() + 300.0, "Lean isn't in a column of its own: {view:?} {lean:?} in {frame:?}");
+    assert!(lean.top() < view.top() + 3.0 * B, "Lean isn't at the top of its column: {view:?} {lean:?}");
+    assert!(frame.right() - lean.right() < 1.5 * B, "Lean's column doesn't reach the right: {lean:?} in {frame:?}");
+    assert!(frame.bottom() - view.bottom() < 1.5 * B, "the preview doesn't reach the bottom: {view:?} in {frame:?}");
+}
+
+/// The bottom edge of a module being resized eases straight onto the grid: as tall as what it
+/// holds on the way, never waiting there first. It sat on what it held - a board keeping its
+/// shape as its width eased, a height squeezed in past the rows - for as long as the other
+/// glide took, then set off for the grid line.
+#[test]
+fn the_bottom_edge_never_waits_before_it_eases_onto_the_grid() {
+    use crate::canvas::viewer::kit::{HEIGHT_PARAM, WIDTH_PARAM};
+    for (id, key, by) in [
+        ("module.input_viewer", WIDTH_PARAM, -3.0 * B),
+        ("module.input_viewer", WIDTH_PARAM, 3.0 * B),
+        ("module.area_mapper", HEIGHT_PARAM, -3.0 * B),
+        ("processing.gyro_3dof", HEIGHT_PARAM, -3.0 * B),
+        ("module.stick_rotation", HEIGHT_PARAM, -3.0 * B),
+        ("module.stick_rotation", WIDTH_PARAM, 3.0 * B),
+    ] {
+        let (mut rig, ids) = Rig::real(id, &[egui::pos2(40.0, 40.0)]);
+        let n = ids[0];
+        rig.screen = egui::vec2(3200.0, 2800.0);
+        rig.grid.ease = 0.2;
+        rig.idle(12);
+        let f0 = egui_snarl::ui::drawn_frame(&rig.ctx, n).expect("drawn");
+        let now = if key == WIDTH_PARAM { f0.width() } else { f0.height() };
+        if let Some(node) = rig.canvas.snarl.get_node_mut(n) {
+            node.params.insert(key.into(), serde_json::json!(now + by));
+        }
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            rig.idle(1);
+            seen.push(egui_snarl::ui::drawn_frame(&rig.ctx, n).expect("drawn").height());
+        }
+        let end = *seen.last().unwrap();
+        assert!((end - (end / B).round() * B).abs() < 0.5, "{id} {key} {by:+}: ended off the grid: {seen:?}");
+        // Once it has set off: never two frames still and then off again.
+        let moved = seen.iter().position(|h| (h - f0.height()).abs() > 0.5).unwrap_or(0);
+        for i in moved..seen.len().saturating_sub(2) {
+            let held = (seen[i + 1] - seen[i]).abs() < 0.5;
+            let later = seen[i + 1..].iter().any(|h| (h - seen[i]).abs() > 1.5);
+            assert!(!(held && later), "{id} {key} {by:+}: the bottom edge waited at {} before easing on: {seen:?}", seen[i]);
+        }
+    }
+}
