@@ -1432,7 +1432,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         }
         // And every MIDI In in the patch: play a message to learn it as the
         // output, as a Remapper card does.
-        for port in midi_learn_ref_ports(ui.ctx(), "") {
+        for port in midi_learn_ports(ui.ctx()) {
             for p in remapper_midi_pressed_now(ui, live_signals, &port) {
                 if !pressed_now.iter().any(|q| q == &p) { pressed_now.push(p); }
             }
@@ -1532,7 +1532,6 @@ pub(crate) fn show_gyro_lean_mapping_section(
             node.params.insert(ck.to_string(), Value::from(false));
         }
     }
-    let mut midi_rect = egui::Rect::NOTHING;
 
     // The section's name and its card count, over everything else in it.
     ui.label(egui::RichText::new(format!("{title}  ({})", mappings.len())).small().weak());
@@ -1568,7 +1567,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
         || new_phase == "learning" || new_phase == "ready";
     // The section's name and its card count, then the action row the way the Remapper's
     // is: buttons a finger or a pad's highlight can find, sharing the row's width.
-    let btn_w = super::remapper_bodies::action_width(ui, (BODY_W - 18.0).min(358.0), 4 + usize::from(has_draft));
+    let btn_w = super::remapper_bodies::action_width(ui, (BODY_W - 18.0).min(358.0), 3 + usize::from(has_draft));
     ui.horizontal(|ui| {
         let in_learning = new_phase == "learning";
         let learn_label = if in_learning { "Stop" } else { "Learn" };
@@ -1625,23 +1624,6 @@ pub(crate) fn show_gyro_lean_mapping_section(
                         exclude_pin_prefix: None,
                         ..Default::default()
                     });
-            }
-        }
-
-        // MIDI… — build a message for this lean to play, in the MIDI editor.
-        {
-            let midi_btn = ui.add(super::remapper_bodies::action_button(ui, "MIDI…", btn_w))
-                .on_hover_text("Build a MIDI message for this lean to play.");
-            midi_rect = midi_btn.rect;
-            if midi_btn.clicked() {
-                crate::canvas::viewer::request_midi_modal(ui.ctx(), crate::canvas::viewer::MidiModalRequest {
-                    inner: node_id,
-                    path: crate::canvas::viewer::subpatch_path(automap_parent),
-                    purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
-                        draft_key: draft_key.to_string(),
-                        phase_key: Some(phase_key.to_string()),
-                    },
-                });
             }
         }
 
@@ -1704,7 +1686,7 @@ pub(crate) fn show_gyro_lean_mapping_section(
     // Choose, MIDI…, Clear(has_draft), Add((learning||ready) && draft). Use the
     // cards' scope.
     publish_nav_action_rects_scoped(ui, node_id, key,
-        &[learn_rect, special_rect, midi_rect, clear_rect, add_rect]);
+        &[learn_rect, special_rect, clear_rect, add_rect]);
     remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
         armed_key, phase_key, &["learning"]);
 

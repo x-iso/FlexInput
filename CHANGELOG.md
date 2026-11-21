@@ -319,6 +319,16 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Changed
 
+- **A MIDI message is chosen in Choose's MIDI tab.** Beside Keyboard & Mouse, Gamepad and
+  Macros, it builds the message from its type, channel and number - the D-pad's Up / Down
+  walk them and Left / Right change them - and adds it to the side being chosen, as an
+  input on any channel or an output on one, South from any row. It replaces the MIDI…
+  button and its window on the Remapper, a Lean section and Touch Zones, Virtual Menu and
+  Area Mapper zones, which crowded their action rows. A card's MIDI chip still opens the
+  window to tune it, and so does JSM's MIDI… command.
+- **Learning a MIDI output hears every MIDI In,** as learning an input does. The dropdown
+  that asked which one, shown while learning, pushed the action row past the card - with
+  no MIDI In to choose from as well.
 - **Layout editing in Easy mode is a mode of the window, not a strip under the bar.** 🎨 and
   🔧 sit at the right end of the header row. Editing, the preset bar and its Save and Load
   give way to the layout editor's tools in the same row, and the Devices panel becomes the
@@ -671,7 +681,7 @@ All notable changes to FlexInput are documented here. This project adheres to
   keeps its icon and name; Ports / Mapping, suppression, Radial, its colours and Position
   on screen are its body's first band, under "Menu", then "Pointer and selection". Touch
   Zones' mode, Split pads and colours share one band. The mapping cards' Learn / Choose… /
-  MIDI… / Add row on all three has the Remapper's full-size buttons. Pinned rows look as
+  Add row on all three has the Remapper's full-size buttons. Pinned rows look as
   they did.
 - **The Area Mapper's analog mode is a widget of its own,** pinned apart from the layer tabs
   and colour. Its settings always take their room - two bands, the ramp's cell too under
@@ -765,6 +775,23 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Gunfire no longer turns the camera by itself through the click-jolt filter.** Each click
+  of a button the filter holds the gyro for holds it at the turn from just before, and a
+  click while a hold still ran made it one long hold at the turn from before the first: a
+  burst of fire, every shot inside the last one's hold, held the camera turning at whatever
+  rate it had when the first shot went, with the gyro dead, for as long as the trigger kept
+  clicking. Holds still join for a press and its release, but a run of them lasts at most
+  twice the longest hold, and the next click holds the turn the pad has by then. A digital
+  trigger made from the analog one at its point (the Steam Controller's and every SDL pad's)
+  flipping on every report with a finger resting there is no longer taken for clicks.
+- **The Steam Controller (2026) stays out of Lizard mode.** FlexInput turns it off every
+  three seconds, through a handle of its own that never opened again when the pad's
+  reading handle did - after HidHide cloaked the dongle under them, writes to the old one
+  could go nowhere, and the pad went back to moving the mouse until the puck was replugged.
+  The settings handle now opens again with the reading one, and sends both settings at once.
+- **No console windows flash up as FlexInput starts.** Clearing up the virtual devices a
+  previous run left behind, and installing or removing the HIDMaestro driver, ran `pnputil`
+  in a window of its own each time; it runs in the background now.
 - **A stick's or the D-pad's AutoMap response curve answers the pad.** Its graph is drawn by
   the two-axis curve body, which neither said where it was nor showed the pad's selection: a
   dot picked with the pad wasn't ringed, and the triggers added and took off no dots - on the

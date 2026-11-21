@@ -38,7 +38,7 @@ impl FlexInputApp {
         // overlay is visible, so this is the only place it can be driven.
         if self.gamepad_nav.kbm_picker_open {
             let step = self.picker_step(nav, dt);
-            self.drive_kbm_picker(step, nav);
+            self.drive_kbm_picker(ctx, step, nav);
             return;
         }
         // The other modals a pad can open from a pinned body. Until these were

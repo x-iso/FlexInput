@@ -767,31 +767,7 @@ impl FlexInputApp {
                     "_nav_act_special_right" => Some("_lean_right_draft"),
                     _ => None,
                 };
-                // A Lean section's MIDI…: the MIDI editor, adding to its draft.
-                let lean_midi = match action {
-                    "_nav_act_midi_left" => Some("left"),
-                    "_nav_act_midi_right" => Some("right"),
-                    _ => None,
-                };
-                if let Some(side) = lean_midi {
-                    self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
-                        inner,
-                        path: nav_path(outer_id),
-                        purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
-                            draft_key: format!("_lean_{side}_draft"),
-                            phase_key: Some(format!("_lean_{side}_phase")),
-                        },
-                    }, None);
-                } else if action == crate::canvas::viewer::NAV_ACT_MIDI {
-                    // The MIDI editor window, opened on this card's draft. Its
-                    // surface is resolved when it draws: over the game while the
-                    // config overlay is up, the main window otherwise.
-                    self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
-                        inner,
-                        path: nav_path(outer_id),
-                        purpose: crate::canvas::viewer::MidiModalPurpose::Add,
-                    }, None);
-                } else if action == "_nav_act_special" || lean_draft.is_some() {
+                if action == "_nav_act_special" || lean_draft.is_some() {
                     use crate::canvas::viewer::SpecialPickerRequest;
                     let path = nav_path(outer_id);
                     let req = if let Some(draft) = lean_draft {
@@ -1270,7 +1246,32 @@ impl FlexInputApp {
             tabs.push(PickerTab::Gamepad);
         }
         tabs.push(PickerTab::Macros);
+        if self.picker_takes_midi() {
+            tabs.push(PickerTab::Midi);
+        }
         tabs
+    }
+
+    /// Whether the open session's mapping takes a MIDI message: a Remapper card on either
+    /// side, a Lean section's or a Touch Zones / Virtual Menu / Area Mapper zone's output.
+    /// (A Map Action and JSM's key names don't.)
+    pub(crate) fn picker_takes_midi(&self) -> bool {
+        if self.gamepad_nav.kbm_picker_use != crate::gamepad_nav::PickerUse::Chord || self.gamepad_nav.kbm_picker_kbm_only {
+            return false;
+        }
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return false };
+        self.picker_node(&self.gamepad_nav.kbm_picker_path, inner)
+            .is_some_and(|n| n.module_id != "module.map_action")
+    }
+
+    /// The MIDI message the picker's MIDI tab builds, as a pin for the side being chosen -
+    /// or why it can't be added there.
+    pub(crate) fn picker_midi_pin(&self, ctx: &egui::Context) -> Result<String, &'static str> {
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else { return Err("") };
+        crate::kbm_picker::midi_tab_pin(
+            crate::canvas::viewer::midi_pick_built(ctx, inner),
+            self.gamepad_nav.kbm_picker_stage,
+        )
     }
 
     /// The tab showing: the session's, or its first when it hasn't that one.
@@ -1593,12 +1594,11 @@ impl FlexInputApp {
             // has_draft mirrors the body: any captured/picked output OR mid-learn.
             let has_draft = draft || matches!(phase.as_str(), "learning" | "ready");
             // Visual order (must match the body + published rects):
-            // Learn (always), Special (always), MIDI… (always), Clear(has_draft),
-            // Add ((learning||ready) && draft non-empty). MIDI… opens the MIDI
-            // editor straight from the nav driver, as the Remapper's does.
+            // Learn (always), Choose (always), Clear(has_draft),
+            // Add ((learning||ready) && draft non-empty). A MIDI message is
+            // chosen in Choose's MIDI tab.
             let mut v = vec![if side == "left" { "_nav_act_learn_left" } else { "_nav_act_learn_right" }];
             v.push(if side == "left" { "_nav_act_special_left" } else { "_nav_act_special_right" });
-            v.push(if side == "left" { "_nav_act_midi_left" } else { "_nav_act_midi_right" });
             if has_draft {
                 v.push(if side == "left" { "_nav_act_clear_left" } else { "_nav_act_clear_right" });
             }
@@ -1617,10 +1617,9 @@ impl FlexInputApp {
         match mid.as_deref() {
             Some("module.remapper") => {
                 // Visual order (must match the body + published rects): Learn,
-                // MIDI…, Choose, Clear(has_draft), Add(in+out drafts && latched).
-                // MIDI… opens the MIDI editor window, which has its own rows —
-                // they are never threaded through this row.
-                let mut v = vec!["_nav_act_learn", crate::canvas::viewer::NAV_ACT_MIDI, "_nav_act_special"];
+                // Choose, Clear(has_draft), Add(in+out drafts && latched). A MIDI
+                // message is chosen in Choose's MIDI tab.
+                let mut v = vec!["_nav_act_learn", "_nav_act_special"];
                 if has_draft { v.push("_nav_act_clear"); }
                 if in_draft && out_draft && latched { v.push("_nav_act_add"); }
                 v

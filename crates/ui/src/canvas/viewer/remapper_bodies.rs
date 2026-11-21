@@ -25,7 +25,7 @@ pub(crate) fn action_button(ui: &egui::Ui, label: &str, w: f32) -> egui::Button<
 
 /// The action rows' words, whichever a row carries: what every action button at a width is
 /// fitted against, so a row's buttons come out in one size.
-const ACTION_WORDS: [&str; 5] = ["Learn", "MIDI…", "Choose…", "Clear", "Add"];
+const ACTION_WORDS: [&str; 4] = ["Learn", "Choose…", "Clear", "Add"];
 
 /// The font of a row of action buttons `w` wide carrying `labels`: the control font a point
 /// larger than the pills beside them (Settings → Display), or as much smaller as the widest
@@ -94,15 +94,10 @@ pub(crate) fn show_remapper_body(
             }
         }
         // Learning a MIDI OUTPUT: play the message on a MIDI controller and the
-        // card captures what it sent. The reference is every MIDI In port in
-        // the patch (they are only open while a node uses one), or the single
-        // port this card picked — not the wired upstream, which is the pad the
-        // mapping is FROM.
-        let picked = snarl.get_node(node_id)
-            .and_then(|n| n.params.get("midi_learn_ref").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_string();
-        for dev in midi_learn_ref_ports(ui.ctx(), &picked) {
+        // card captures what it sent. Every MIDI In port in the patch is heard
+        // (they are only open while a node uses one) - not the wired upstream,
+        // which is the pad the mapping is FROM.
+        for dev in midi_learn_ports(ui.ctx()) {
             for p in remapper_midi_pressed_now(ui, live_signals, &dev) {
                 if !pressed_now.iter().any(|q| q == &p) {
                     pressed_now.push(p);
@@ -546,9 +541,8 @@ pub(crate) fn show_remapper_body(
         let mut special_rect = egui::Rect::NOTHING;
         let mut add_rect = egui::Rect::NOTHING;
         let mut clear_rect = egui::Rect::NOTHING;
-        let mut midi_rect = egui::Rect::NOTHING;
         // The action buttons share the row the cards span, each as wide as the others.
-        let btn_w = action_width(ui, (BODY_W - 18.0).min(358.0), 4 + usize::from(has_draft));
+        let btn_w = action_width(ui, (BODY_W - 18.0).min(358.0), 3 + usize::from(has_draft));
         ui.horizontal(|ui| {
             let learn_label = if in_learning { "Stop" } else { "Learn" };
             let learn_btn = ui.add_enabled(
@@ -587,62 +581,6 @@ pub(crate) fn show_remapper_body(
                 let _ = need_input_arm;
             }
 
-            // Which MIDI In to learn a MIDI output from. Only worth asking
-            // when there is more than one — with a single controller the
-            // answer is never in doubt.
-            if in_learning {
-                let ports = crate::canvas::viewer::midi_in_registry(ui.ctx());
-                if ports.len() > 1 {
-                    let picked = snarl.get_node(node_id)
-                        .and_then(|n| n.params.get("midi_learn_ref").and_then(|v| v.as_str()))
-                        .unwrap_or("")
-                        .to_string();
-                    let label = ports.iter()
-                        .find(|(id, _)| id == &picked)
-                        .map(|(_, name)| name.as_str())
-                        .unwrap_or("All MIDI");
-                    let mut chosen: Option<String> = None;
-                    egui::ComboBox::from_id_salt((node_id, "midi_learn_ref"))
-                        .selected_text(egui::RichText::new(label).size(crate::settings::ui_size(12.0)))
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            if ui.selectable_label(picked.is_empty(), "All MIDI").clicked() {
-                                chosen = Some(String::new());
-                            }
-                            for (id, name) in &ports {
-                                if ui.selectable_label(&picked == id, name).clicked() {
-                                    chosen = Some(id.clone());
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text("Which MIDI input this card learns its MIDI output from.");
-                    if let Some(pick) = chosen {
-                        if let Some(node) = snarl.get_node_mut(node_id) {
-                            node.params.insert("midi_learn_ref".to_string(), Value::String(pick));
-                        }
-                    }
-                }
-            }
-            // MIDI… — pick a message by hand instead of playing it, on EITHER
-            // side: an input for a controller that isn't plugged in (or a note
-            // at the far end of an 88-key board), an output for a synth that
-            // isn't either. It opens the app's MIDI editor WINDOW: a popup
-            // closed on its own dropdowns, an inline row broke the action row's
-            // left-to-right walk, and either drew behind the game when opened
-            // from the config overlay.
-            {
-                let midi_btn = ui.add(action_button(ui, "MIDI…", btn_w))
-                    .on_hover_text("Add a MIDI message to this mapping by hand.");
-                midi_rect = midi_btn.rect;
-                if midi_btn.clicked() {
-                    request_midi_modal(ui.ctx(), MidiModalRequest {
-                        inner: node_id,
-                        path: crate::canvas::viewer::subpatch_path(automap_parent),
-                        purpose: MidiModalPurpose::Add,
-                    });
-                }
-            }
             // Choose… — the alternative to Learn, on either side: opens the
             // shared picker (mouse, or gamepad South via `_nav_act_special`) on
             // the side Learn would capture next. A pad button, stick direction
@@ -724,7 +662,7 @@ pub(crate) fn show_remapper_body(
         // layout: Learn, MIDI…, Choose, Clear, Add (entries NOTHING where
         // absent, which the publisher drops — so each of these must be absent
         // under exactly the condition its nav item is).
-        publish_nav_action_rects(ui, node_id, &[learn_rect, midi_rect, special_rect, clear_rect, add_rect]);
+        publish_nav_action_rects(ui, node_id, &[learn_rect, special_rect, clear_rect, add_rect]);
         remapper_hold_nav_while_capturing(ui.ctx(), snarl, node_id, nav_active_for_device,
             "_nav_capture_armed", "ui_phase", &["capturing", "learning"]);
 

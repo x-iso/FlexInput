@@ -3,12 +3,16 @@
 
 use super::*;
 
+/// The picker's MIDI tab's rows: type, channel, number, then Add.
+const MIDI_TAB_ROWS: usize = 4;
+
 impl FlexInputApp {
 
     /// `step` walks the board 8-way (`picker_step`): its pad cluster is a
     /// diamond and a plus, laid out the way the pad is.
     pub(crate) fn drive_kbm_picker(
         &mut self,
+        ctx: &egui::Context,
         step: Option<crate::gamepad_nav::NavStep>,
         nav: &crate::gamepad_nav::NavInput,
     ) {
@@ -41,6 +45,11 @@ impl FlexInputApp {
             let tabs = self.picker_tabs();
             let at = tabs.iter().position(|t| *t == self.picker_tab()).unwrap_or(0) as i32;
             self.picker_select_tab(tabs[(at + tab_step).rem_euclid(tabs.len() as i32) as usize]);
+            return;
+        }
+        // The MIDI tab is rows, not cells.
+        if self.picker_tab() == crate::kbm_picker::PickerTab::Midi {
+            self.drive_picker_midi(ctx, step_dir, nav);
             return;
         }
         // Spatial navigation over the cells actually shown on this tab for this
@@ -117,6 +126,56 @@ impl FlexInputApp {
         // excluded cells (a menu's own targets) are never appendable.
         if let Some(cell) = focused.filter(|c| nav.is_rising("btn_south") && usable(c)) {
             self.picker_append_pin(&cell.pin);
+        }
+    }
+
+    /// The MIDI tab: Up / Down walk its rows - type, channel, number, Add - and Up past the
+    /// first goes into the chord list as from the board's top; Left / Right change the
+    /// focused value; South adds the message from any row. West and North as on the board.
+    fn drive_picker_midi(
+        &mut self,
+        ctx: &egui::Context,
+        step_dir: Option<crate::gamepad_nav::NavDir>,
+        nav: &crate::gamepad_nav::NavInput,
+    ) {
+        use crate::gamepad_nav::NavDir;
+        let Some(inner) = self.gamepad_nav.kbm_picker_node else {
+            self.close_kbm_picker();
+            return;
+        };
+        let mut row = self.gamepad_nav.kbm_picker_midi_row.min(MIDI_TAB_ROWS - 1);
+        match step_dir {
+            Some(NavDir::Up) if row == 0 => {
+                let n = self.picker_chord().elems(self.picker_side_timed()).len();
+                if self.picker_list_stops() > 0 {
+                    self.gamepad_nav.kbm_picker_list = Some(n.saturating_sub(1));
+                    self.gamepad_nav.fine_increment = false;
+                }
+            }
+            Some(NavDir::Up) => row -= 1,
+            Some(NavDir::Down) => row = (row + 1).min(MIDI_TAB_ROWS - 1),
+            Some(d @ (NavDir::Left | NavDir::Right)) if row < MIDI_TAB_ROWS - 1 => {
+                crate::canvas::viewer::midi_pick_nav_adjust(ctx, inner, row, if d == NavDir::Right { 1 } else { -1 });
+            }
+            _ => {}
+        }
+        self.gamepad_nav.kbm_picker_midi_row = row;
+        if nav.is_rising("btn_west") && self.picker_has_both_stages() {
+            use crate::kbm_picker::PickStage;
+            self.picker_switch_stage(match self.gamepad_nav.kbm_picker_stage {
+                PickStage::Input => PickStage::Output,
+                PickStage::Output => PickStage::Input,
+            });
+            return;
+        }
+        if nav.is_rising("btn_north") {
+            self.picker_clear_draft();
+            return;
+        }
+        if nav.is_rising("btn_south") {
+            if let Ok(pin) = self.picker_midi_pin(ctx) {
+                self.picker_append_pin(&pin);
+            }
         }
     }
 
@@ -247,7 +306,10 @@ impl FlexInputApp {
             (PickStage::Input, PickerTab::Kbm) => PickerTab::Gamepad,
             (_, t) => t,
         };
-        self.picker_select_tab(tab);
+        // On the MIDI tab the message stays as built: only which side it goes on changes.
+        if tab != PickerTab::Midi {
+            self.picker_select_tab(tab);
+        }
     }
 
     /// Close the picker and forget whatever session it was running.
@@ -915,6 +977,34 @@ impl FlexInputApp {
                         board.min + egui::vec2(px * (UNIT + GAP), py * (UNIT + GAP)),
                         egui::Align2::LEFT_TOP, caption,
                         crate::settings::ui_font(9.0 * SCALE), crate::settings::tinted_gray(130));
+                }
+                // The MIDI tab: the message's rows and an Add, in the board's room.
+                if tab == PickerTab::Midi {
+                    if let Some(node) = self.gamepad_nav.kbm_picker_node {
+                        let mut rows_ui = ui.new_child(egui::UiBuilder::new()
+                            .max_rect(board.shrink(4.0))
+                            .layout(egui::Layout::top_down(egui::Align::Min)));
+                        let rects = crate::canvas::viewer::midi_add_rows_ui(&mut rows_ui, node, None);
+                        rows_ui.add_space(6.0);
+                        let check = self.picker_midi_pin(ctx);
+                        let word = if stage == PickStage::Input { "Add as input" } else { "Add as output" };
+                        let add = rows_ui.add_enabled(check.is_ok(), egui::Button::new(word))
+                            .on_hover_text("Add this message to the side being chosen (South on the pad, from any row).");
+                        if add.clicked() {
+                            clicked_pin = check.clone().ok();
+                        }
+                        if let Err(why) = check {
+                            if !why.is_empty() {
+                                rows_ui.label(egui::RichText::new(why).small().weak());
+                            }
+                        }
+                        if list_focus.is_none() {
+                            focus_rect = match self.gamepad_nav.kbm_picker_midi_row {
+                                r if r < rects.len() => Some(rects[r]),
+                                _ => Some(add.rect),
+                            };
+                        }
+                    }
                 }
                 // An empty Macros tab stays, and says where macros come from.
                 if tab == PickerTab::Macros && cells.is_empty() {

@@ -634,6 +634,8 @@ pub struct GamepadNav {
     pub kbm_picker_undo: Option<(usize, Box<egui_snarl::Snarl<crate::canvas::NodeData>>)>,
     /// The picker tab showing (LB/RB, or a click on its header).
     pub kbm_picker_tab: crate::kbm_picker::PickerTab,
+    /// The MIDI tab's focused row: type, channel, number, then Add.
+    pub kbm_picker_midi_row: usize,
     /// Focus in the picker's chord list (an index into `TimedChord::elems`)
     /// instead of on the board: Up past the board's top row, or a click.
     pub kbm_picker_list: Option<usize>,
@@ -856,6 +858,7 @@ impl Default for GamepadNav {
             kbm_picker_card_seen: None,
             kbm_picker_undo: None,
             kbm_picker_tab: crate::kbm_picker::PickerTab::Kbm,
+            kbm_picker_midi_row: 0,
             kbm_picker_list: None,
             kbm_picker_prev_rt: false,
             kbm_picker_touch_zones: false,

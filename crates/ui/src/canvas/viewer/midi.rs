@@ -147,9 +147,6 @@ impl Default for PickerState {
 /// The row is gone (the MIDI editor is a window now); loading still strips the
 /// key from patches saved with it — see `clear_stuck_nav_arms`.
 pub const MIDI_PICK_OPEN: &str = "_midi_pick_open";
-/// The Remapper action-row item for the MIDI… button (the nav driver opens the
-/// MIDI editor window on it).
-pub const NAV_ACT_MIDI: &str = "_nav_act_midi";
 
 /// Where a node's inline picker keeps its selection. The body and the nav
 /// driver both address it through here, so they can never drift onto two
@@ -462,17 +459,12 @@ pub(crate) fn midi_in_registry(ctx: &egui::Context) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// Which MIDI In ports a card should listen to while learning an output.
-///
-/// All of them by default — a controller is usually the only one, and asking
-/// which port a note came from before you have played it is backwards. A card
-/// that picked one in `midi_learn_ref` hears only that one.
-pub(crate) fn midi_learn_ref_ports(ctx: &egui::Context, picked: &str) -> Vec<String> {
-    midi_in_registry(ctx)
-        .into_iter()
-        .filter(|(id, _)| picked.is_empty() || id == picked)
-        .map(|(id, _)| id)
-        .collect()
+/// The MIDI In ports a card listens to while learning an output: all of them, as an
+/// input's Learn hears any - a controller is usually the only one, and asking which port
+/// a note comes from before it's played is backwards. (A card could pick one; the
+/// dropdown it took crowded the Learn row, with or without a MIDI In to pick.)
+pub(crate) fn midi_learn_ports(ctx: &egui::Context) -> Vec<String> {
+    midi_in_registry(ctx).into_iter().map(|(id, _)| id).collect()
 }
 
 /// Move the MIDI pin at `idx` of a mapping's pin list onto another channel.
@@ -520,8 +512,6 @@ pub(crate) fn midi_set_pin_channel(pins: &mut [Value], idx: usize, new_ch: Chann
 /// What the editor is for.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MidiModalPurpose {
-    /// Build a message and add it to the card being drafted.
-    Add,
     /// Tune a MIDI chip already on mapping card `card` of the node's
     /// `cards_key` list (`mappings` for a Remapper): the out row when
     /// `side_out`, else the in row; `pin_idx` is the chip's index in that row.
@@ -531,11 +521,6 @@ pub enum MidiModalPurpose {
     /// (something that presses). `cursor` is the pad's cursor in the editor, or
     /// `None` for a mouse, whose pick goes on a line of its own.
     JsmInsert { output: bool, cursor: Option<flexinput_engine::eval::JsmCursor> },
-    /// Build a message and add it to another mapping module's OUTPUT draft — a
-    /// Lean section's (`_lean_<side>_draft`, with its phase key) or a Touch Zones
-    /// / Virtual Menu zone's (`_tz_draft_out`). The same draft the Special picker
-    /// writes, by the same rules.
-    AddTo { draft_key: String, phase_key: Option<String> },
 }
 
 /// The command-list row that opens the MIDI editor for a JSM Config editor.
@@ -577,7 +562,7 @@ pub struct MidiModalRequest {
 
 impl Default for MidiModalRequest {
     fn default() -> Self {
-        Self { inner: NodeId(0), path: Vec::new(), purpose: MidiModalPurpose::Add }
+        Self { inner: NodeId(0), path: Vec::new(), purpose: MidiModalPurpose::JsmInsert { output: true, cursor: None } }
     }
 }
 
@@ -591,21 +576,17 @@ pub fn take_midi_modal_request(ctx: &egui::Context) -> Option<MidiModalRequest> 
     ctx.data_mut(|d| d.remove_temp::<MidiModalRequest>(egui::Id::new(MIDI_MODAL_REQ_KEY)))
 }
 
-/// A row of the Add editor, in the order a pad walks them.
+/// A value row of a message being built (the Choose picker's MIDI tab, the JSM insert
+/// editor), in the order a pad walks them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MidiAddRow {
     Type,
     Channel,
     Number,
-    AddInput,
-    AddOutput,
 }
 
 impl MidiAddRow {
-    pub const ALL: [MidiAddRow; 5] = [
-        MidiAddRow::Type, MidiAddRow::Channel, MidiAddRow::Number,
-        MidiAddRow::AddInput, MidiAddRow::AddOutput,
-    ];
+    pub const ALL: [MidiAddRow; 3] = [MidiAddRow::Type, MidiAddRow::Channel, MidiAddRow::Number];
 
     /// The picker field a value row steps (see [`midi_pick_nav_adjust`]).
     pub fn field(self) -> Option<usize> {
@@ -613,7 +594,6 @@ impl MidiAddRow {
             MidiAddRow::Type => Some(0),
             MidiAddRow::Channel => Some(1),
             MidiAddRow::Number => Some(2),
-            _ => None,
         }
     }
 }

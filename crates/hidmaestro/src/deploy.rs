@@ -22,7 +22,13 @@
 //! driver, or the same one signed by another HIDMaestro program, stays.
 
 use std::ffi::c_void;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+
+/// A console program run in the background: no window of its own. Run from the elevated
+/// helper - started hidden, with no console to share - every `pnputil` popped up a console
+/// window of its own while FlexInput started.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use windows_sys::Win32::Foundation::{GetLastError, LocalFree, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::Security::Authorization::{
@@ -527,6 +533,7 @@ fn uninstall_all_hidmaestro_packages() {
             .arg(&inf)
             .arg("/uninstall")
             .arg("/force")
+            .creation_flags(CREATE_NO_WINDOW)
             .status();
     }
 }
@@ -540,6 +547,7 @@ fn install_inf(inf: &Path) -> Result<(), DeployError> {
         .arg("/add-driver")
         .arg(inf)
         .arg("/install")
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map_err(DeployError::Pnputil)?;
     // Don't treat a non-zero rc as fatal; the DriverStore post-check is

@@ -19,6 +19,12 @@
 //! later refinement.
 
 use std::ffi::c_void;
+use std::os::windows::process::CommandExt;
+
+/// A console program run in the background: no window of its own. Run from the elevated
+/// helper - started hidden, with no console to share - every `pnputil` popped up a console
+/// window of its own while FlexInput started.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use crate::profile::Profile;
 
@@ -2084,6 +2090,7 @@ fn spawn_swd_removal(instance_id: &str) -> Option<std::process::Child> {
         .arg(instance_id)
         .arg("/subtree")
         .arg("/force")
+        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

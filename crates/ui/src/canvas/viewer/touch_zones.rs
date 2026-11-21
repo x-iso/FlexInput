@@ -2771,15 +2771,6 @@ fn area_trigger_picker(ui: &mut egui::Ui, salt: impl std::hash::Hash, current: &
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Open the MIDI editor on a Touch Zones / Virtual Menu zone's output draft.
-fn tz_request_midi(ctx: &egui::Context, node_id: NodeId, automap_parent: Option<&AutomapGlowParent<'_>>) {
-    request_midi_modal(ctx, MidiModalRequest {
-        inner: node_id,
-        path: subpatch_path(automap_parent),
-        purpose: MidiModalPurpose::AddTo { draft_key: "_tz_draft_out".to_string(), phase_key: None },
-    });
-}
-
 pub(crate) fn render_touch_zone_cards(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2865,7 +2856,7 @@ pub(crate) fn render_touch_zone_cards(
         let mut pressed_now: Vec<String> = remapper_upstream_pressed_now(ui, live_signals, &devs);
         // A MIDI controller works as the output's teacher too: play the message
         // and the zone sends it. Every MIDI In in the patch is listened to.
-        for port in midi_learn_ref_ports(ui.ctx(), "") {
+        for port in midi_learn_ports(ui.ctx()) {
             for p in remapper_midi_pressed_now(ui, live_signals, &port) {
                 if !pressed_now.contains(&p) { pressed_now.push(p); }
             }
@@ -3083,9 +3074,9 @@ pub(crate) fn render_touch_zone_cards(
         (if has_analog_card { 104.0 } else { 0.0 }) + (if show_speed { 70.0 } else { 0.0 })
     };
     let buttons = match phase.as_str() {
-        "idle" if implicit_trig => 3,
+        "idle" if implicit_trig => 2,
         "idle" | "learning" => 1,
-        _ => 5,
+        _ => 4,
     };
     let bw = super::remapper_bodies::action_width(ui, TZ_CARD_W - reserved, buttons.max(3));
     let action = |ui: &egui::Ui, label: &str| super::remapper_bodies::action_button(ui, label, bw);
@@ -3129,18 +3120,6 @@ pub(crate) fn render_touch_zone_cards(
                         ..Default::default()
                     });
                 }
-                let b = ui.add(action(ui, "MIDI…"))
-                    .on_hover_text("Build a MIDI message for this zone to play.");
-                act_rects.push(b.rect);
-                if b.clicked() {
-                    if let Some(node) = snarl.get_node_mut(node_id) {
-                        node.params.insert("_tz_phase".into(), Value::from("captured"));
-                        node.params.insert("_tz_trig".into(), Value::from(idle_trig.as_str()));
-                        node.params.remove("_tz_draft_out");
-                        clear_draft_timing(node, "_tz_draft_out");
-                    }
-                    tz_request_midi(ui.ctx(), node_id, automap_parent);
-                }
             }
             "idle" => {
                 let b = ui.add(action(ui, "Learn"))
@@ -3178,12 +3157,6 @@ pub(crate) fn render_touch_zone_cards(
                         exclude_pin_prefix: menu_excl.clone(),
                         ..Default::default()
                     });
-                }
-                let b = ui.add(action(ui, "MIDI…"))
-                    .on_hover_text("Build a MIDI message for this zone to play.");
-                act_rects.push(b.rect);
-                if b.clicked() {
-                    tz_request_midi(ui.ctx(), node_id, automap_parent);
                 }
                 let armed = getp(snarl, "_tz_gp_arm").and_then(|v| v.as_bool()).unwrap_or(false);
                 let b = ui.add(action(ui, if armed { "🎮…" } else { "🎮" }).selected(armed))

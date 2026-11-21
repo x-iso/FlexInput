@@ -20,7 +20,7 @@
 //! an artefact of how SDL numbers the buttons of a pad it reads.
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -515,6 +515,9 @@ struct Slot {
     state: Mutex<SlotState>,
     /// The reader has ended: the slot is gone.
     ended: AtomicBool,
+    /// How many times the reader has opened the slot. The keeper's handle is as old
+    /// as the count it was opened at: once the reader opens again, it does too.
+    opened: AtomicU32,
 }
 
 /// What the reader has made of the reports so far.
@@ -541,7 +544,15 @@ struct SlotState {
 
 impl Slot {
     fn new(path: String, serial: String, interface: i32, pid: u16) -> Self {
-        Self { path, serial, interface, pid, state: Mutex::default(), ended: AtomicBool::new(false) }
+        Self {
+            path,
+            serial,
+            interface,
+            pid,
+            state: Mutex::default(),
+            ended: AtomicBool::new(false),
+            opened: AtomicU32::new(0),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotState> {
@@ -593,6 +604,7 @@ fn read(slot: Arc<Slot>) {
     // Opened again for silence since the last report.
     let mut reopened = false;
     'open: while let Some(dev) = open_path(&slot.path) {
+        slot.opened.fetch_add(1, Ordering::Relaxed);
         let opened = Instant::now();
         let mut last = opened;
         loop {
@@ -634,8 +646,17 @@ fn read(slot: Arc<Slot>) {
 /// [`LIZARD_EVERY`], and the IMU on as the pad comes and whenever its readings
 /// stop. Each waits on the pad's answer, which the puck can hold for seconds;
 /// the reader goes on meanwhile.
+///
+/// Its handle goes when the reader's does. The reader opens again when its
+/// handle stops delivering - HidHide cloaking the dongle under a handle opened
+/// before, which then reads nothing and says nothing - and a write through the
+/// keeper's old handle can go the same way: the pad, told nothing, turned lizard
+/// mode back on mid-game until the puck was plugged in again. Opened again with
+/// the reader's, the keeper sends both settings at once.
 fn keep(slot: Arc<Slot>) {
     let mut dev: Option<HidDevice> = None;
+    // The reader's open count the handle was opened at.
+    let mut dev_opened = 0;
     let mut lizard_sent: Option<Instant> = None;
     let mut imu_sent: Option<Instant> = None;
     while !slot.ended.load(Ordering::Relaxed) {
@@ -644,6 +665,11 @@ fn keep(slot: Arc<Slot>) {
             let s = slot.lock();
             (s.connected, s.imu_moved)
         };
+        let reader_opened = slot.opened.load(Ordering::Relaxed);
+        if dev.is_some() && reader_opened != dev_opened {
+            dev = None;
+            (lizard_sent, imu_sent) = (None, None);
+        }
         if !connected {
             (lizard_sent, imu_sent) = (None, None);
             continue;
@@ -658,6 +684,7 @@ fn keep(slot: Arc<Slot>) {
         }
         if dev.is_none() {
             dev = open_path(&slot.path);
+            dev_opened = reader_opened;
         }
         let Some(d) = dev.as_ref() else { continue };
         let mut ok = true;

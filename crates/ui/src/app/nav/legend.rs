@@ -67,6 +67,17 @@ impl FlexInputApp {
                         "Back to board"));
                     v
                 }
+                PickerUse::Chord if self.picker_tab() == crate::kbm_picker::PickerTab::Midi => {
+                    let mut v = vec![(hint_vert(), "Row"), (hint_horiz(), "Change")];
+                    tab(&mut v);
+                    v.push((vec!["btn_south"], "Add"));
+                    v.push((vec!["btn_north"], "Clear"));
+                    if self.picker_has_both_stages() {
+                        v.push((vec!["btn_west"], "Input / output"));
+                    }
+                    v.push((vec!["btn_east"], "Done"));
+                    v
+                }
                 PickerUse::Chord => {
                     let mut v = vec![(hint_move(), "Move")];
                     tab(&mut v);
@@ -148,10 +159,6 @@ impl FlexInputApp {
         if let Some(m) = &self.gamepad_nav.midi_modal {
             let mut v = vec![(hint_vert(), "Row"), (hint_horiz(), "Change")];
             match m.purpose {
-                crate::canvas::viewer::MidiModalPurpose::Add
-                | crate::canvas::viewer::MidiModalPurpose::AddTo { .. } => {
-                    v.push((vec!["btn_south"], "Add"))
-                }
                 crate::canvas::viewer::MidiModalPurpose::JsmInsert { .. } => {
                     v.push((vec!["btn_south"], "Insert"))
                 }

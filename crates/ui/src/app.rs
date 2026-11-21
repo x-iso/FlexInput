@@ -3233,7 +3233,7 @@ impl FlexInputApp {
         // ── Virtual KB/M picker (modal: captures dpad/LS/South/North/East) ────
         if self.gamepad_nav.kbm_picker_open {
             let step = self.picker_step(&nav, dt);
-            self.drive_kbm_picker(step, &nav);
+            self.drive_kbm_picker(ctx, step, &nav);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
             ctx.request_repaint();
             return;

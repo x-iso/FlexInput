@@ -63,6 +63,15 @@ pub const DEFAULT_HOLD_MS: f32 = 30.0;
 /// that the start of a jolt already published doesn't get held for its length.
 const REFERENCE: Duration = Duration::from_millis(30);
 
+/// An edge this soon after the same button's last one is chatter, not a click: a
+/// microswitch's press and release are further apart, and a digital trigger made
+/// from an analog one at a threshold (`btn_rt_dig`, a finger resting at the point)
+/// can flip on every report.
+const CHATTER: Duration = Duration::from_millis(15);
+
+/// The shortest a chain of holds may run, whatever the holds: see [`Gate::begin_hold`].
+const MIN_CHAIN: Duration = Duration::from_millis(60);
+
 /// One pad's settings. Compared by value, so the UI only replaces it on a change.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ClickGateConfig {
@@ -98,6 +107,11 @@ struct Gate {
     /// Last state of each button; `None` until first seen, so that connecting
     /// with one held down isn't an edge.
     pressed: Vec<Option<bool>>,
+    /// When each button last made an edge that counted (see [`CHATTER`]).
+    last_edge: Vec<Option<Instant>>,
+    /// The longest a chain of holds runs: twice the longest hold, at least
+    /// [`MIN_CHAIN`].
+    chain_max: Duration,
     /// The last value of each axis: a poll can leave some out.
     latest: [f32; 6],
     /// Input, newest at the back, far enough back for look-ahead + [`REFERENCE`].
@@ -127,6 +141,11 @@ impl Gate {
             button_keys: cfg.buttons.iter().map(|(p, _)| pin_key(dev, p)).collect(),
             imu_keys: IMU_PINS.map(|p| pin_key(dev, p)),
             pressed: vec![None; cfg.buttons.len()],
+            last_edge: vec![None; cfg.buttons.len()],
+            chain_max: {
+                let longest = cfg.buttons.iter().map(|(_, ms)| ms.clamp(0.0, MAX_HOLD_MS)).fold(0.0_f32, f32::max);
+                Duration::from_secs_f32(2.0 * longest / 1000.0).max(MIN_CHAIN)
+            },
             latest: [0.0; 6],
             history: VecDeque::new(),
             hold: None,
@@ -160,8 +179,17 @@ impl Gate {
         let end = now + hold;
         match &mut self.hold {
             // Still running at the start of this one, slope included: one long
-            // hold, at the value from before the first.
-            Some(h) if start <= h.end + self.release => h.end = h.end.max(end),
+            // hold, at the value from before the first - a press and its release,
+            // a few quick clicks. But only so long: the value is a turn RATE, so a
+            // chain kept going by a burst of fire turned the camera on by itself at
+            // the rate from before the first shot, with the gyro dead, for as long as
+            // the trigger kept clicking. Past `chain_max` the hold runs out, edges
+            // that come meanwhile pass, and the first after its slope starts a fresh
+            // hold at the pad's turn by then.
+            Some(h) if start <= h.end + self.release => {
+                let cap = h.start + self.chain_max;
+                h.end = h.end.max(end.min(cap));
+            }
             _ => {
                 let value = self.reference(start);
                 self.hold = Some(Hold { start, end, value });
@@ -191,9 +219,13 @@ impl Gate {
 
     /// Button `i` (of the config's) reads `pressed` at `now`.
     fn button(&mut self, i: usize, pressed: bool, now: Instant) {
+        let chatter = self.last_edge[i].is_some_and(|t| now.saturating_duration_since(t) < CHATTER);
         if self.pressed[i].is_some_and(|was| was != pressed) {
-            let ms = self.cfg.buttons[i].1.clamp(0.0, MAX_HOLD_MS);
-            self.begin_hold(now, Duration::from_secs_f32(ms / 1000.0));
+            if !chatter {
+                let ms = self.cfg.buttons[i].1.clamp(0.0, MAX_HOLD_MS);
+                self.begin_hold(now, Duration::from_secs_f32(ms / 1000.0));
+            }
+            self.last_edge[i] = Some(now);
         }
         self.pressed[i] = Some(pressed);
     }
@@ -795,6 +827,37 @@ mod tests {
             let v = if (jolt_at..jolt_at + 20).contains(&i) { 0.5 } else { 0.01 };
             (v, i >= 100)
         }).collect()
+    }
+
+    // Firing: a click every 40 ms, a 30 ms hold each, so every edge lands in the hold
+    // before. The pad was turning when the first shot went and stops just after. The
+    // holds chained into one at the turn from before the first shot for as long as the
+    // clicks came - the camera turning on by itself, the gyro dead. The chain runs out
+    // (twice the hold) and the next click holds where the pad is by then.
+    #[test]
+    fn a_burst_of_clicks_never_holds_an_old_turn_for_long() {
+        let input: Vec<(f32, bool)> = (0..800).map(|i| {
+            let v = if i < 110 { 0.3 } else { 0.0 };
+            let pressed = i >= 100 && (i - 100) % 40 < 20;
+            (v, pressed)
+        }).collect();
+        let out = run(&cfg(30.0, 0.0), &input);
+        assert!((out[105] - 0.3).abs() < 1e-6, "the first click holds the turn it had: {}", out[105]);
+        let stuck = out[300..800].iter().filter(|v| (**v - 0.3).abs() < 1e-3).count();
+        assert_eq!(stuck, 0, "the old turn came back {stuck} times in the burst");
+        assert!(out[300..800].iter().all(|v| v.abs() < 0.05), "the burst holds where the pad is: {:?}", &out[300..340]);
+    }
+
+    // A button flipping every few ms - a digital trigger made from an analog one, a
+    // finger resting at its point - isn't clicking: it holds once, and the rest pass.
+    #[test]
+    fn chatter_is_not_a_click() {
+        let input: Vec<(f32, bool)> = (0..400).map(|i| {
+            let v = if i < 120 { 0.3 } else { 0.0 };
+            (v, i >= 100 && (i / 4) % 2 == 0)
+        }).collect();
+        let out = run(&cfg(30.0, 0.0), &input);
+        assert!(out[200..400].iter().all(|v| v.abs() < 1e-6), "{:?}", &out[200..240]);
     }
 
     #[test]

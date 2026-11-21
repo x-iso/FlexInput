@@ -218,6 +218,17 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
     }
 }
 
+/// The MIDI tab's message (`None` while it's unfinished - a SysEx without its bytes) as a
+/// pin for `stage`, or why it can't go there: an output names one channel and is something
+/// that can be sent; an input can listen on any channel.
+pub fn midi_tab_pin(pin: Option<flexinput_core::midi::MidiPin>, stage: PickStage) -> Result<String, &'static str> {
+    let pin = pin.ok_or("Finish the message first (a SysEx needs F0 … F7).")?;
+    if stage == PickStage::Output && !pin.is_output_capable() {
+        return Err("An output names one channel, and is a message that can be sent.");
+    }
+    Ok(pin.to_id())
+}
+
 /// The touchpad clicked in a zone, or anywhere — inputs only.
 const CLICK_ZONES: [&str; 4] = ["touchpad_left", "touchpad_center", "touchpad_right", "touchpad_any"];
 
@@ -621,6 +632,9 @@ pub enum PickerTab {
     Gamepad,
     /// The patch's Macro Output ports, JSM `@` macros and menu targets.
     Macros,
+    /// A MIDI message, built from its type, channel and number rather than picked
+    /// from cells (it has none).
+    Midi,
 }
 
 impl PickerTab {
@@ -629,6 +643,7 @@ impl PickerTab {
             PickerTab::Kbm => "Keyboard & Mouse",
             PickerTab::Gamepad => "Gamepad",
             PickerTab::Macros => "Macros",
+            PickerTab::Midi => "MIDI",
         }
     }
 }
@@ -651,6 +666,7 @@ fn tab_shift(tab: PickerTab) -> f32 {
         PickerTab::Kbm => 0.0,
         PickerTab::Gamepad => PAD_ROW_Y - 0.5,
         PickerTab::Macros => MACRO_Y,
+        PickerTab::Midi => 0.0,
     }
 }
 
@@ -1727,5 +1743,27 @@ mod lane_walk_tests {
         // Come to some other way, it's the key over its middle, as before.
         let back = walk_cells(&cells, at("key_space"), NavStep::UP, |_| true, &mut None, 0);
         assert_eq!(cells[back].pin, "key_b");
+    }
+}
+
+#[cfg(test)]
+mod midi_tab_tests {
+    use super::{midi_tab_pin, PickStage, PickerTab};
+    use flexinput_core::midi::{Channel, MidiPin};
+
+    // The MIDI tab adds a message to either side, by the side's rule: a note on any channel
+    // is an input (it listens on all of them) but no output (a message goes on one); on one
+    // channel it's both. An unfinished message goes nowhere.
+    #[test]
+    fn the_midi_tab_adds_by_the_sides_rule() {
+        let any = MidiPin::Note { ch: Channel::Any, note: 60 };
+        let one = MidiPin::Note { ch: Channel::Ch(0), note: 60 };
+        assert_eq!(midi_tab_pin(Some(any.clone()), PickStage::Input), Ok(any.to_id()));
+        assert!(midi_tab_pin(Some(any), PickStage::Output).is_err());
+        assert_eq!(midi_tab_pin(Some(one.clone()), PickStage::Output), Ok(one.to_id()));
+        assert!(midi_tab_pin(None, PickStage::Input).is_err());
+        // No cells: the board's walk has nothing to land on there.
+        assert!(super::tab_cells(super::picker_cells(Default::default(), &[]), PickerTab::Midi).is_empty());
+        assert_eq!(PickerTab::Midi.label(), "MIDI");
     }
 }

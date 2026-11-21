@@ -444,9 +444,9 @@ impl FlexInputApp {
         // cycled with up/down, like tp_mode. It has no hold or touchpad mode.
         if area {
             let mut v = match phase {
-                "idle" => vec!["learn", "assign", "midi"],
+                "idle" => vec!["learn", "assign"],
                 "learning" => vec!["cancel"],
-                _ => vec!["assign", "midi", "gamepad", "add", "cancel"],
+                _ => vec!["assign", "gamepad", "add", "cancel"],
             };
             if phase != "learning" { v.push("area_trig"); }
             return v;
@@ -456,10 +456,10 @@ impl FlexInputApp {
         // gamepad-button capture) AND Choose (pick a specific output) directly,
         // matching the mouse menu card. Touch Zones demonstrates a gesture first.
         let mut v = match (menu, phase) {
-            (true, "idle")  => vec!["learn", "assign", "midi"],
+            (true, "idle")  => vec!["learn", "assign"],
             (false, "idle") => vec!["learn"],
             (_, "learning") => vec!["cancel"],
-            _               => vec!["assign", "midi", "gamepad", "add", "cancel"], // captured
+            _               => vec!["assign", "gamepad", "add", "cancel"], // captured
         };
         // Order MUST match the body's act_rects push order: tp_mode, mouse_speed,
         // then hold LAST. tp_mode is a VALUE cycled with LT/RT (like mouse_speed),
@@ -920,25 +920,6 @@ impl FlexInputApp {
                         self.gamepad_nav.card_index = 0;
                     }
                     "assign" => self.nav_tz_choose_draft(outer_id, inner, menu, &trig),
-                    "midi" => {
-                        // A menu zone picks its output straight from idle, as with
-                        // Choose: bind to the zone's selection first.
-                        if menu {
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_phase", "captured");
-                            self.set_subpatch_param_str(outer_id, inner, "_tz_trig", &trig);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out", &[]);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_gap", &[]);
-                            self.set_subpatch_param_str_array(outer_id, inner, "_tz_draft_out_dur", &[]);
-                        }
-                        self.open_midi_modal(crate::canvas::viewer::MidiModalRequest {
-                            inner,
-                            path: nav_path(outer_id),
-                            purpose: crate::canvas::viewer::MidiModalPurpose::AddTo {
-                                draft_key: "_tz_draft_out".to_string(),
-                                phase_key: None,
-                            },
-                        }, None);
-                    }
                     "gamepad" => {
                         let armed = self.get_subpatch_param_bool(outer_id, inner, "_tz_gp_arm").unwrap_or(false);
                         self.set_subpatch_param_bool(outer_id, inner, "_tz_gp_arm", !armed);
