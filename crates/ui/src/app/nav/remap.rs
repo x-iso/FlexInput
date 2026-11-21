@@ -85,8 +85,9 @@ pub(crate) fn draw_remap_card_glow(
                 .map(|(_, t)| t);
             let field = field.filter(|fr| fr.intersect(shown).is_positive());
             if let (true, Some(fr), Some(tip)) = (entered, field, tip) {
-                let tp = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
+                let mut tp = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
                     egui::Order::Tooltip, egui::Id::new(("gp_nav_remap_card_tip", outer_id.0)), host));
+                tp.multiply_opacity(crate::widgets::nav_highlight_alpha(ctx));
                 let galley = tp.layout(tip, crate::settings::ui_font(12.0),
                     egui::Color32::WHITE, 320.0);
                 let screen = ctx.content_rect();
@@ -598,8 +599,8 @@ impl FlexInputApp {
         use crate::gamepad_nav::EditLevel;
         let gn = &mut self.gamepad_nav;
         gn.prev_pressed = nav.pressed.clone();
-        gn.prev_lt = nav.lt > 0.5;
-        gn.prev_rt = nav.rt > 0.5;
+        gn.prev_lt = nav.lt_down;
+        gn.prev_rt = nav.rt_down;
         gn.start_down_at = None;
         gn.repeat_dir = None;
         gn.repeat_accum = 0.0;

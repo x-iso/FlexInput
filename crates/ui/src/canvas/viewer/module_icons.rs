@@ -123,7 +123,7 @@ const MIN_SIDE: f32 = 16.0;
 const PAD: f32 = 6.0;
 
 /// The margin a node frame keeps between its border and its content.
-const NODE_FRAME_MARGIN: f32 = 6.0;
+pub(crate) const NODE_FRAME_MARGIN: f32 = 6.0;
 
 /// The module's frame as the canvas last drew it, shrunk to what's inside the frame.
 ///

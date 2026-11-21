@@ -324,8 +324,53 @@ pub(crate) fn nav_highlight_painter(
     host: egui::LayerId,
     clip: egui::Rect,
 ) -> egui::Painter {
-    ctx.layer_painter(nav_glow_layer(ctx, egui::Order::Foreground, id, host))
-        .with_clip_rect(clip)
+    let mut painter = ctx.layer_painter(nav_glow_layer(ctx, egui::Order::Foreground, id, host))
+        .with_clip_rect(clip);
+    painter.multiply_opacity(nav_highlight_alpha(ctx));
+    painter
+}
+
+/// Ctx-data slot (global, every viewport): `true` while the mouse - or a trackpad, or a
+/// finger - has been used since the pad last picked or moved anything.
+const POINTER_OWNS_KEY: &str = "gp_nav_pointer_owns";
+
+/// The mouse, a trackpad or a finger was just used in a window: until the pad picks or moves
+/// something again, its highlights fade, its cursor hides and it stops scrolling its
+/// selection into view - which fought the wheel - so the pointer has the layout to itself.
+pub(crate) fn note_pointer_activity(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(POINTER_OWNS_KEY), true));
+}
+
+/// The pad picked or moved something: it has the layout back.
+pub(crate) fn note_pad_activity(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(POINTER_OWNS_KEY), false));
+}
+
+/// Whether the pointer has had the layout since the pad last did ([`note_pointer_activity`]).
+pub(crate) fn pointer_owns(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(egui::Id::new(POINTER_OWNS_KEY))).unwrap_or(false)
+}
+
+/// Whether this pass's input in `ctx`'s viewport presses, scrolls or touches: the pointer used
+/// on purpose. The pad's navigation draws its cursor itself and sends no pointer events, so
+/// none of this is the pad.
+pub(crate) fn pointer_pressed(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.raw_scroll_delta != egui::Vec2::ZERO || i.pointer.any_pressed() || i.any_touches())
+}
+
+/// Whether the pointer moved a real distance over `ctx`'s viewport this pass. Weaker than a
+/// press: a cursor a game re-centres, or one a pad's mouse output nudges, moves too - so the
+/// caller takes it only a while after the pad was last used.
+pub(crate) fn pointer_moved(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.pointer.has_pointer() && i.pointer.delta().length() >= 3.0)
+}
+
+/// How strongly gamepad navigation's highlights show in `ctx`'s viewport: whole while the pad
+/// is in control, easing away while the pointer is ([`pointer_owns`]).
+pub(crate) fn nav_highlight_alpha(ctx: &egui::Context) -> f32 {
+    let owns = pointer_owns(ctx);
+    let id = egui::Id::new(("gp_nav_highlight_fade", ctx.viewport_id()));
+    ctx.animate_bool_with_time(id, !owns, 0.25)
 }
 
 /// How far a gamepad-nav auto-scroll moves a view (`view_top..view_bot`) to show

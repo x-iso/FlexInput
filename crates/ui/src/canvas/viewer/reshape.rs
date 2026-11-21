@@ -619,9 +619,7 @@ pub(crate) fn draw_reshape_curve_editor(
             let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
                 .unwrap_or(egui::emath::TSTransform::IDENTITY);
             let screen_rect = to_global * rect;
-            ui.ctx().data_mut(|d| d.insert_temp(
-                egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-                (pass, screen_rect, x_lo, x_hi, 0.0f32, y_max)));
+            crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, screen_rect, x_lo, x_hi, 0.0f32, y_max));
             let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                 .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
             if let Some((_, idx, editing)) = nav_sel.filter(|(pp, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *pp)) {

@@ -140,9 +140,7 @@ pub(crate) fn show_response_curve_body(
                 let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
                     .unwrap_or(egui::emath::TSTransform::IDENTITY);
                 let screen_rect = to_global * rect;
-                ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-                    (pass, screen_rect, x_lo, x_hi, y_lo, y_hi)));
+                crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, screen_rect, x_lo, x_hi, y_lo, y_hi));
                 // Read the nav-selected dot (pass, idx, editing) for the highlight.
                 let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                     .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
@@ -543,6 +541,7 @@ pub(crate) fn show_response_curve_body(
         );
         changed |= rows_changed;
         [i0, i1, o0, o1] = range_v;
+        super::curve_rows::publish_curve_rows_in_widget(ui, node_id, &rows, false);
         register_exposable_element(ui, node_id, "scale_row", rows.scale);
         register_exposable_element(ui, node_id, "range_row", rows.range);
         register_exposable_element(ui, node_id, "grid_row", rows.grid);
@@ -718,6 +717,21 @@ pub(crate) fn show_vec_response_curve_body(
                         &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true)
                 };
                 publish_nav_curve_snap(ui.ctx(), node_id, snap, &snap_nodes_x, &snap_nodes_y, (x_lo, x_range, y_lo, y_range), true);
+                // Gamepad nav, as the plain curve body has it: where the graph is on the
+                // screen (for the cursor's adds and deletes), and the dot it has selected.
+                // Without them a stick's AutoMap curve - this body - showed the pad nothing
+                // and took no add or delete, while a gyro's, the plain body, did.
+                {
+                    let pass = ui.ctx().cumulative_pass_nr();
+                    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
+                        .unwrap_or(egui::emath::TSTransform::IDENTITY);
+                    crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi));
+                }
+                let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
+                    .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
+                let nav_sel_dot: Option<usize> = nav_sel
+                    .filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p))
+                    .map(|(_, i, _)| i);
 
                 painter.rect_filled(rect, 2.0, crate::settings::tinted(GRAPH_BG_DEFAULT));
 
@@ -756,7 +770,12 @@ pub(crate) fn show_vec_response_curve_body(
                     }
                 }
 
-                let alt_held = ui.input(|i| i.modifiers.alt);
+                // Bias handles show on mouse Alt OR when the gamepad driver is in bias mode
+                // this frame (hold-North in CurveDot level).
+                let nav_bias = ui.ctx().data(|d|
+                    d.get_temp::<u64>(egui::Id::new(("gp_nav_curve_bias", node_id.0))))
+                    .map_or(false, |p| crate::widgets::nav_pass_matches(ui.ctx(), p));
+                let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
                 let mut bends = crate::touch::BendFingers::begin(ui, ui.id().with(("bends", node_id)));
                 if (alt_held || bends.exposed()) && new_points.len() >= 2 {
                     while new_biases.len() < new_points.len() - 1 { new_biases.push(0.0); }
@@ -835,7 +854,21 @@ pub(crate) fn show_vec_response_curve_body(
                         remove_idx = Some(i);
                         pts_changed = true;
                     }
-                    let col = if pt_resp.hovered() || pt_resp.dragged() { Color32::WHITE } else { crate::settings::tinted_gray(190) };
+                    // Gamepad-nav selected dot: accent glow ring so the user can see which
+                    // point is targeted for move/delete.
+                    if nav_sel_dot == Some(i) {
+                        let accent = ui.visuals().selection.stroke.color;
+                        let [r, g, b, _] = accent.to_array();
+                        for k in 1..=4 {
+                            let rad = 6.0 + k as f32 * 2.5;
+                            let a = (120.0 * (1.0 - k as f32 / 5.0)) as u8;
+                            painter.circle_stroke(screen, rad,
+                                egui::Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(r, g, b, a)));
+                        }
+                        painter.circle_stroke(screen, 7.0, egui::Stroke::new(2.0_f32, accent));
+                    }
+                    let nav_here = nav_sel_dot == Some(i);
+                    let col = if pt_resp.hovered() || pt_resp.dragged() || nav_here { Color32::WHITE } else { crate::settings::tinted_gray(190) };
                     painter.circle_filled(screen, 5.0, col);
                     painter.circle_stroke(screen, 5.0, egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(80)));
                     // The dot's output value: always with the grid labels, else while handled.
@@ -985,6 +1018,7 @@ pub(crate) fn show_vec_response_curve_body(
             },
         );
         changed |= rows_changed;
+        super::curve_rows::publish_curve_rows_in_widget(ui, node_id, &rows, true);
         register_exposable_element(ui, node_id, "scale_row", rows.scale);
         register_exposable_element(ui, node_id, "range_row", rows.range);
         register_exposable_element(ui, node_id, "grid_row", rows.grid);
@@ -1177,9 +1211,7 @@ pub(crate) fn show_twoway_response_curve_body(
                 let pass = ui.ctx().cumulative_pass_nr();
                 let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
                     .unwrap_or(egui::emath::TSTransform::IDENTITY);
-                ui.ctx().data_mut(|d| d.insert_temp(
-                    egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-                    (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi)));
+                crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi));
                 let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
                     .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
                 let nav_sel_dot: Option<usize> = nav_sel
@@ -1525,6 +1557,7 @@ pub(crate) fn show_twoway_response_curve_body(
                 if vm { node.params.insert("absolute".into(), Value::Bool(true)); }
             }
         }
+        super::curve_rows::publish_curve_rows_in_widget(ui, node_id, &rows, false);
         register_exposable_element(ui, node_id, "scale_row", rows.scale);
         register_exposable_element(ui, node_id, "range_row", rows.range);
         register_exposable_element(ui, node_id, "grid_row", rows.grid);
@@ -1555,6 +1588,7 @@ pub(crate) fn show_twoway_response_curve_body(
                 "Start on Up: at rest the input sits on the Up curve, so a pull from rest\n\
                  follows it from the first sample with no band to clear. The band still\n\
                  applies once the input has moved off rest.", ("tw_start_up", node_id.0));
+            publish_widget_row_fields(ui, node_id, "hyst_row", &cells[..3]);
             register_exposable_element(ui, node_id, "hyst_row", cells[0].union(cells[2]));
 
             let cells = pill_bands(ui, w, &[130.0, 130.0, TW_DIR_W]);
@@ -1567,6 +1601,7 @@ pub(crate) fn show_twoway_response_curve_body(
                 ph_dir = d;
                 changed = true;
             }
+            publish_widget_row_fields(ui, node_id, "interp_row", &cells[..3]);
             register_exposable_element(ui, node_id, "interp_row", cells[0].union(cells[2]));
         }
 
@@ -1734,9 +1769,7 @@ pub(crate) fn paint_twoway_curve_graph(
     let pass = ui.ctx().cumulative_pass_nr();
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
         .unwrap_or(egui::emath::TSTransform::IDENTITY);
-    ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-        (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi)));
+    crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, to_global * rect, x_lo, x_hi, y_lo, y_hi));
     let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
         .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", node_id.0))));
     let nav_sel_dot: Option<usize> = nav_sel.filter(|(p,_,_)| crate::widgets::nav_pass_matches(ui.ctx(), *p)).map(|(_,i,_)| i);

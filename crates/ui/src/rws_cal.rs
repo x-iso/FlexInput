@@ -98,7 +98,9 @@ pub(crate) fn sync(ctx: &egui::Context, tabs: &mut [PatchTab], active: usize) {
             let size = [360.0, 60.0];
             let stacked = tab.config.items.iter().filter(|it| matches!(it, LayoutItem::Module(m) if m.element_id == ELEMENT)).count();
             let pos = [(monitor.x - size[0]) * 0.5, monitor.y * 0.08 + stacked as f32 * (size[1] + 12.0)];
+            // On every tab of the overlay: a calibration's prompt can't hide behind one.
             tab.config.items.push(LayoutItem::Module(ExposedModule {
+                tab: crate::canvas::node::ALL_TABS,
                 inner_node_id: inner,
                 element_id: ELEMENT.to_string(),
                 pos,
@@ -112,6 +114,7 @@ pub(crate) fn sync(ctx: &egui::Context, tabs: &mut [PatchTab], active: usize) {
                 keep_aspect: false,
                 anchor: Default::default(),
                 pin_style: Some(2),
+                zoom: None,
             }));
         }
     }

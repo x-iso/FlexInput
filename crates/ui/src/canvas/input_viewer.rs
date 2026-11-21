@@ -156,7 +156,7 @@ impl IvStyle {
         }
     }
 
-    fn to_override(self) -> IvStyleOverride {
+    pub(crate) fn to_override(self) -> IvStyleOverride {
         IvStyleOverride {
             bg: rgba(self.bg),
             accent: rgba(self.accent),
@@ -176,56 +176,6 @@ impl IvStyle {
     }
 }
 
-/// Inspector-strip controls for a pinned Input Viewer board's style, edited in
-/// the sub-patch layout editor and the screen overlay editor (never on the
-/// module body). Background (with transparency), highlight, element tint, and
-/// outline color/width, plus Reset-to-defaults. `ov` is the pin's stored
-/// override (`None` = defaults); returns the new override state to persist.
-pub(crate) fn iv_style_inspector(
-    ui: &mut egui::Ui,
-    id_salt: usize,
-    ov: Option<&IvStyleOverride>,
-) -> Option<IvStyleOverride> {
-    // Edit the RAW override bytes (straight alpha), seeded from the stored
-    // override or the default style. Never edit via the painter's `Color32`s:
-    // they're premultiplied internally, so bytes pulled back out of one are
-    // `rgb × alpha` — the swatch would re-darken the colour every frame (see
-    // `fxi_color_swatch`'s caller contract).
-    let mut o = ov.cloned().unwrap_or_else(|| IvStyle::default().to_override());
-    let before = o.clone();
-    let mut reset = false;
-    let swatch = |ui: &mut egui::Ui, c: &mut [u8; 4], tip: &str| {
-        crate::canvas::viewer::fxi_color_swatch(ui, c, tip, true);
-    };
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Input Viewer style").small().strong());
-        ui.separator();
-        ui.label(egui::RichText::new("bg").small().weak());
-        swatch(ui, &mut o.bg,
-            "Board plate color — lower the alpha for a see-through board over a game.");
-        ui.label(egui::RichText::new("highlight").small().weak());
-        swatch(ui, &mut o.accent,
-            "Pressed-element color: halos, trigger fill, stick/touch dots.");
-        ui.label(egui::RichText::new("tint").small().weak());
-        swatch(ui, &mut o.tint,
-            "Multiplies the button art; brightness still rises on press.");
-        ui.label(egui::RichText::new("outline").small().weak());
-        swatch(ui, &mut o.outline, "Board outline colour.");
-        ui.add(egui::DragValue::new(&mut o.outline_px).range(0.0..=6.0).speed(0.05))
-            .on_hover_text("Board outline width (0 = none).");
-        if ui.small_button("Reset").on_hover_text("Use the default board style").clicked() {
-            reset = true;
-        }
-    });
-    let _ = id_salt;
-    if reset {
-        None
-    } else if o != before {
-        Some(o)
-    } else {
-        ov.cloned()
-    }
-}
 
 // ── Node body ─────────────────────────────────────────────────────────────────
 

@@ -88,9 +88,32 @@ pub(crate) fn overlay_selected_module_info(
     Some((crate::canvas::viewer::curve_ui_module_id(inner).to_string(), graph_channels_of_node(inner)))
 }
 
+/// An overlay's row of tabs at `row` (nothing where it has under two): a click shows a tab;
+/// editing, tabs are renamed, added and taken off on it.
+fn overlay_tab_row(ui: &mut egui::Ui, row: egui::Rect, overlay: &mut OverlayLayout, edit: bool) {
+    if row.height() <= 0.0 {
+        return;
+    }
+    let act = super::viewer::tab_row(ui, row, &overlay.layout_tabs, overlay.active_tab, edit, ui.id().with("fxi_ov_tab_row"));
+    if act.any() {
+        act.apply(
+            &mut overlay.layout_tabs, &mut overlay.items, &mut overlay.active_tab,
+            &mut overlay.selected_item, &mut overlay.selected_items,
+        );
+    }
+}
+
+/// The part of an overlay's screen `full` its layout fills: beneath its row of tabs, where it
+/// has two or more. What the overlay's items are positioned in, and anchored to.
+pub(crate) fn overlay_layout_rect(full: egui::Rect, overlay: &OverlayLayout) -> egui::Rect {
+    let row_h = super::viewer::tab_row_h(overlay.layout_tabs.len());
+    egui::Rect::from_min_max(egui::pos2(full.min.x, full.min.y + row_h), full.max)
+}
+
 /// Render + (in edit mode) run interactions for the overlay layout. `rect` is
 /// the overlay's full screen area in the overlay viewport's coords; item
-/// positions are relative to its origin.
+/// positions are relative to the origin of the part of it beneath the overlay's
+/// row of tabs ([`overlay_layout_rect`]), which is all of it without tabs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show_overlay_body(
     ui: &mut egui::Ui,
@@ -101,6 +124,10 @@ pub(crate) fn show_overlay_body(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     panic_shortcut: &crate::app::PanicShortcut,
 ) {
+    // With two tabs or more, their row across the top of the screen and the layout beneath.
+    let full = rect;
+    let rect = overlay_layout_rect(full, overlay);
+    let row_rect = egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, rect.min.y));
     let origin = rect.min;
     let cur = [rect.width().max(1.0), rect.height().max(1.0)];
 
@@ -123,7 +150,19 @@ pub(crate) fn show_overlay_body(
     // Snapshot items for iteration (renderers need the tab snarl mutably).
     let items: Vec<LayoutItem> = overlay.items.clone();
     if items.is_empty() {
+        overlay_tab_row(ui, row_rect, overlay, edit);
         return;
+    }
+    // The overlay's tabs: what's on another tab than the one showing isn't drawn, picked or
+    // caught on (`shown`).
+    let layout_tabs = overlay.layout_tabs.clone();
+    let active_tab = overlay.active_tab;
+    let shown = super::viewer::shown_items(&items, active_tab, layout_tabs.len());
+    if edit {
+        overlay.selected_items.retain(|&i| shown.get(i).copied().unwrap_or(false));
+        if overlay.selected_item.is_some_and(|i| !shown.get(i).copied().unwrap_or(false)) {
+            overlay.selected_item = overlay.selected_items.last().copied();
+        }
     }
 
     // Per-item module info: (module_id, display_name, exists).
@@ -176,10 +215,15 @@ pub(crate) fn show_overlay_body(
     const MIN_W: f32 = 32.0;
     const MIN_H: f32 = 18.0;
 
-    // Edit-mode snap grid, drawn under everything.
-    if edit && snap_enabled && step_x >= 2.0 && step_y >= 2.0 {
+    // Edit-mode snap grid while an element is moved, drawn under everything.
+    let grid_id = egui::Id::new("fxi_ov_grid");
+    let grid_t = if edit { super::viewer::layout_grid_t(ui.ctx(), grid_id) } else { 0.0 };
+    // Each element's anchor - its point and the line to what it is anchored to - shows for
+    // the selection only, unless the toolbar's anchor switch shows them all.
+    let all_anchors = edit && super::viewer::overlay_all_anchors(ui.ctx());
+    if grid_t > 0.0 && snap_enabled && step_x >= 2.0 && step_y >= 2.0 {
         let painter = ui.painter().with_clip_rect(rect);
-        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
+        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, (34.0 * grid_t) as u8));
         let mut x = 0.0f32;
         while x <= rect.width() {
             painter.line_segment(
@@ -200,10 +244,11 @@ pub(crate) fn show_overlay_body(
 
     // Edit-mode 3×3 anchor-zone guide: shows the regions that decide each
     // element's anchor (single zone → holds that corner/edge; spanning ≥2 →
-    // stretches). Drawn brighter than the snap grid so the two read apart.
-    if edit {
+    // stretches). Drawn brighter than the snap grid so the two read apart -
+    // and, as the grid, while an element is moved.
+    if grid_t > 0.0 {
         let painter = ui.painter().with_clip_rect(rect);
-        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 60));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, (60.0 * grid_t) as u8));
         for k in 1..=2 {
             let x = origin.x + rect.width() * (k as f32 / 3.0);
             painter.line_segment([egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)], stroke);
@@ -288,6 +333,10 @@ pub(crate) fn show_overlay_body(
 
     // ── Render pass + edit interactions, in z-order (bottom → top) ──────────
     let mut new_pos:  Vec<Option<[f32; 2]>> = vec![None; items.len()];
+    // A gradient edited on its object this frame (`gradient_handles`), and the selected
+    // object's gradient to put handles on once every object is drawn.
+    let mut new_gradient: Option<(usize, crate::canvas::node::Gradient)> = None;
+    let mut gradient_on: Option<(usize, egui::Rect, crate::canvas::node::Gradient)> = None;
     let mut new_size: Vec<Option<[f32; 2]>> = vec![None; items.len()];
     let mut new_line: Vec<Option<([f32; 2], [f32; 2])>> = vec![None; items.len()];
     let mut zaction: Option<(usize, &'static str)> = None;
@@ -315,8 +364,44 @@ pub(crate) fn show_overlay_body(
     // Per-drag-session resolved target: which item a drag STARTED on the
     // topmost item `i` should actually move (see the body drag block below).
     let drag_tgt_id  = |i: usize| egui::Id::new(("fxi_ov_drag_tgt", i));
+    // Where a resized object stood as the resize began: Alt resizes it about its centre.
+    let drag_rpos_id = |i: usize| egui::Id::new(("fxi_ov_drag_rpos", i));
+    // Moving one object, Shift catches its edges on the others' and Ctrl its centre on
+    // theirs, within a few points; Alt resizes about the centre, with Shift too keeping
+    // the shape. The lines a move caught on are drawn as guides.
+    let object_snap = super::viewer::ObjectSnap::held(ui);
+    let alt_held = ui.input(|i| i.modifiers.alt);
+    // Ctrl catches a resize's edges on the other elements' edges or centres.
+    let resize_snap = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    if edit {
+        super::viewer::layout_modifier_hint(ui.ctx(), true);
+    }
+    // What a moved element catches on: what shows (one on another tab is nowhere).
+    let object_rects: Vec<egui::Rect> = items.iter().enumerate().map(|(i, it)| {
+        if !shown[i] {
+            return egui::Rect::NOTHING;
+        }
+        let (p, s) = it.bbox();
+        egui::Rect::from_min_size(egui::pos2(p[0], p[1]), egui::vec2(s[0], s[1]))
+    }).collect();
+    let mut guides: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
 
+    // Editing, every object is drawn as it will look, and the ones under the pointer ease
+    // see-through, so whatever they cover shows (`layout_hover_opacity`).
+    let hover_local = edit
+        .then(|| super::viewer::layout_pointer_local(ui, rect))
+        .flatten()
+        .map(|p| [p.x - origin.x, p.y - origin.y]);
     for (idx, it) in items.iter().enumerate() {
+        if !shown[idx] {
+            continue;
+        }
+        let opacity = if edit {
+            super::viewer::layout_hover_opacity(ui.ctx(), egui::Id::new(("fxi_ov_hover_fade", idx)),
+                hover_local.is_some_and(|p| it.hit_test(p)))
+        } else {
+            1.0
+        };
         // Resolve the item's rect for display — screen-anchored, or relative to
         // a linked target (anchor-to-object). Identity while editing, since
         // `authored == cur` after the bake above.
@@ -360,6 +445,7 @@ pub(crate) fn show_overlay_body(
                     let iv_style_ov = m.iv_style_override.clone();
                     let menu_style_ov = m.menu_style_override;
                 let pin_style = m.pin_style.unwrap_or(1);
+                let zoom = m.zoom.unwrap_or(1.0);
                     let outer_snap_ref = outer_snapshot.as_ref();
                     let path = m.source_path.clone();
                     ui.scope_builder(egui::UiBuilder::new().max_rect(item_rect), |ui| {
@@ -368,13 +454,17 @@ pub(crate) fn show_overlay_body(
                         // Salt widget IDs by item index so multiple pins of the
                         // same element don't collide.
                         ui.push_id(("fxi_ov_pin", idx), |ui| {
+                            // Not dimmed for being out of reach while it's edited: drawn
+                            // whole, see-through only under the pointer.
+                            ui.visuals_mut().disabled_alpha = 1.0;
+                            ui.multiply_opacity(opacity);
                             ui.add_enabled_ui(!edit, |ui| match path.as_slice() {
                                 [] => {
                                     render_pinned_element(
                                         inner_id, &module_id, &element_id, ui, tab_snarl,
                                         mod_size, live_signals, panic_shortcut, None,
                                         None, OVERLAY_TOP_OUTER, edit, graph_ov, iv_style_ov,
-                                        menu_style_ov, pin_style,
+                                        menu_style_ov, pin_style, zoom,
                                     );
                                 }
                                 [sp] => {
@@ -388,7 +478,7 @@ pub(crate) fn show_overlay_body(
                                             inner_id, &module_id, &element_id, ui, inner_snarl,
                                             mod_size, live_signals, panic_shortcut, None,
                                             outer_snap_ref, sp_node, edit, graph_ov, iv_style_ov,
-                                            menu_style_ov, pin_style,
+                                            menu_style_ov, pin_style, zoom,
                                         );
                                     }
                                 }
@@ -399,7 +489,8 @@ pub(crate) fn show_overlay_body(
                 }
             }
             LayoutItem::Deco(_) => {
-                let painter = ui.painter().with_clip_rect(rect);
+                let mut painter = ui.painter().with_clip_rect(rect);
+                painter.multiply_opacity(opacity);
                 // Re-anchor the decoration's geometry for display (following any
                 // anchor-to link; identity while editing since authored == cur).
                 paint_decoration(&painter, origin, &resolve_layout_deco(&items, idx, authored, cur));
@@ -415,20 +506,27 @@ pub(crate) fn show_overlay_body(
         let is_primary = selected_idx == Some(idx);
         let is_sel = in_set || is_primary;
 
+        // The selection's outline always; any other's only while the pointer is over it,
+        // easing in with its see-through (`layout_hover_t`).
+        let hover_t = super::viewer::layout_hover_t(ui.ctx(), egui::Id::new(("fxi_ov_hover_fade", idx)),
+            hover_local.is_some_and(|p| it.hit_test(p)));
         let outline_col = if is_sel {
             egui::Color32::from_rgba_unmultiplied(255, 220, 120, 230)
         } else {
-            egui::Color32::from_rgba_unmultiplied(150, 220, 255, 140)
+            egui::Color32::from_rgba_unmultiplied(150, 220, 255, (140.0 * hover_t) as u8)
         };
-        ui.painter().rect_stroke(
-            item_rect, 0.0,
-            egui::Stroke::new(1.0_f32, outline_col),
-            egui::StrokeKind::Inside,
-        );
+        if outline_col.a() > 0 {
+            ui.painter().rect_stroke(
+                item_rect, 0.0,
+                egui::Stroke::new(1.0_f32, outline_col),
+                egui::StrokeKind::Inside,
+            );
+        }
 
-        // Anchor pivot marker on selected items: a dot at the point the element
-        // is anchored to (corner / edge / centre), inset a little from the edges.
-        if is_sel {
+        // Anchor pivot marker on selected items (every item with the anchor switch on): a dot
+        // at the point the element is anchored to (corner / edge / centre), inset a little
+        // from the edges.
+        if is_sel || all_anchors {
             let a = it.anchor();
             let (bp, bs) = it.bbox();
             let ex = if a.x == AnchorAxis::Auto { zone_axis(bp[0], bs[0], authored[0]).0 } else { a.x };
@@ -587,8 +685,19 @@ pub(crate) fn show_overlay_body(
                         .unwrap_or([tp[0], tp[1], 0.0, 0.0]);
                     ui.ctx().data_mut(|d| d.insert_temp(
                         drag_pos_id(target), [prev[0], prev[1], prev[2] + dd.x, prev[3] + dd.y]));
-                    let tx = snap_x(prev[0] + prev[2] + dd.x).max(0.0);
-                    let ty = snap_y(prev[1] + prev[3] + dd.y).max(0.0);
+                    let mut tx = snap_x(prev[0] + prev[2] + dd.x).max(0.0);
+                    let mut ty = snap_y(prev[1] + prev[3] + dd.y).max(0.0);
+                    if let Some(mode) = object_snap {
+                        let (_, ts) = items[target].bbox();
+                        let moving = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(ts[0], ts[1]));
+                        let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+                            .filter(|(j, _)| *j != target).map(|(_, r)| *r).collect();
+                        let (off, gx, gy) = super::viewer::snap_to_objects(moving, &others, mode, 6.0);
+                        tx = (tx + off.x).max(0.0);
+                        ty = (ty + off.y).max(0.0);
+                        guides.0.extend(gx);
+                        guides.1.extend(gy);
+                    }
                     new_pos[target] = Some([tx, ty]);
                 }
             }
@@ -629,7 +738,10 @@ pub(crate) fn show_overlay_body(
                     );
                 }
                 if h_resp.drag_started() {
-                    ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [ls[0], ls[1], 0.0f32, 0.0f32]));
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(drag_size_id(idx), [ls[0], ls[1], 0.0f32, 0.0f32]);
+                        d.insert_temp(drag_rpos_id(idx), [lp[0], lp[1]]);
+                    });
                 }
                 if h_resp.dragged_by(egui::PointerButton::Primary) {
                     let prev = ui.ctx().data(|d| d.get_temp::<[f32; 4]>(drag_size_id(idx)))
@@ -642,8 +754,10 @@ pub(crate) fn show_overlay_body(
                         if ax.abs() * (1.0 / aspect) > ay.abs() { ay = ax / aspect; } else { ax = ay * aspect; }
                     }
                     ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [prev[0], prev[1], ax, ay]));
-                    let tw = snap_x(prev[0] + ax).max(MIN_W.min(8.0));
-                    let th = snap_y(prev[1] + ay).max(MIN_H.min(8.0));
+                    // About the centre the corner's move is half the growth.
+                    let grow = if alt_held { 2.0 } else { 1.0 };
+                    let tw = snap_x(prev[0] + grow * ax).max(MIN_W.min(8.0));
+                    let th = snap_y(prev[1] + grow * ay).max(MIN_H.min(8.0));
                     // Clamp against the pin's cached natural size — same
                     // no-crop envelope as sub-patch layouts. The cache key
                     // matches what render_pinned_element used above.
@@ -656,13 +770,67 @@ pub(crate) fn show_overlay_body(
                     };
                     let (tw, th) = clamp_pin_frame_to_content(ui, clamp_outer, it, tw, th);
                     new_size[idx] = Some([tw, th]);
+                    // Where it began, or that far round its centre; let go of Alt and it
+                    // grows from where it began again.
+                    let p0 = ui.ctx().data(|d| d.get_temp::<[f32; 2]>(drag_rpos_id(idx))).unwrap_or([lp[0], lp[1]]);
+                    let at = if alt_held {
+                        [(p0[0] - (tw - prev[0]) * 0.5).max(0.0), (p0[1] - (th - prev[1]) * 0.5).max(0.0)]
+                    } else {
+                        p0
+                    };
+                    new_pos[idx] = Some(at);
+                    if resize_snap {
+                        let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+                            .filter(|(j, _)| *j != idx).map(|(_, r)| *r).collect();
+                        let aspect = shift_held.then(|| prev[0] / prev[1].max(1.0));
+                        let (at, size, gx, gy) = super::viewer::snap_resize_to_objects(at, [tw, th], &others, 6.0, alt_held, aspect);
+                        let (sw, sh) = clamp_pin_frame_to_content(
+                            ui, clamp_outer, it, size[0].max(MIN_W.min(8.0)), size[1].max(MIN_H.min(8.0)));
+                        new_size[idx] = Some([sw, sh]);
+                        new_pos[idx] = Some([at[0].max(0.0), at[1].max(0.0)]);
+                        guides.0.extend(gx);
+                        guides.1.extend(gy);
+                    }
                 }
             } else if is_sel {
                 let ghost = egui::Color32::from_rgba_unmultiplied(150, 220, 255, 40);
                 ui.painter().rect_filled(handle_rect, 2.0, ghost);
             }
+            // The selected object's gradient: its handles go on after every object.
+            if is_primary && !is_multi {
+                if let Some(g) = super::viewer::item_gradient(it) {
+                    let at = egui::Rect::from_min_size(origin + egui::vec2(lp[0], lp[1]), egui::vec2(ls[0], ls[1]));
+                    gradient_on = Some((idx, at, g.clone()));
+                }
+            }
         }
     }
+
+    super::viewer::paint_snap_guides(&ui.painter().with_clip_rect(rect), origin, rect, &guides.0, &guides.1);
+    if edit {
+        let moving = multi_drag_delta.is_some()
+            || new_pos.iter().any(Option::is_some)
+            || new_size.iter().any(Option::is_some)
+            || new_line.iter().any(Option::is_some);
+        super::viewer::layout_set_moving(ui.ctx(), grid_id, moving);
+    }
+
+    // The selected object's gradient handles, after every object: one drawn above it would
+    // otherwise take the pointer from them.
+    if let Some((idx, at, g)) = gradient_on {
+        let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+            .filter(|(j, _)| *j != idx)
+            .map(|(_, r)| r.translate(origin.to_vec2()))
+            .collect();
+        let snap = object_snap.map(|mode| super::viewer::HandleSnap { mode, reach: 6.0, others: &others });
+        let (edited, _) = super::viewer::gradient_handles(ui, at, &g, egui::Id::new(("fxi_ov_gradient", idx)), snap);
+        if let Some(edited) = edited {
+            new_gradient = Some((idx, edited));
+        }
+    }
+
+    // The tabs' row, over what's drawn.
+    overlay_tab_row(ui, row_rect, overlay, edit);
 
     if !edit {
         // Live mode: only stale-pin cleanup applies.
@@ -678,10 +846,17 @@ pub(crate) fn show_overlay_body(
     {
         let painter = ui.painter().with_clip_rect(rect);
         let center = |p: [f32; 2], s: [f32; 2]| origin + egui::vec2(p[0] + s[0] * 0.5, p[1] + s[1] * 0.5);
-        // A guide line from each follower to the target it is anchored to.
+        // A guide line from a follower to the target it is anchored to: the selection's own
+        // and those of what follows it, or every one with the anchor switch on.
+        let selected = |i: usize| overlay.selected_item == Some(i) || overlay.selected_items.contains(&i);
         for (i, it) in items.iter().enumerate() {
+            if !shown[i] {
+                continue;
+            }
             if let Some(to) = it.anchor().to.filter(|&t| t != 0) {
-                if let Some(j) = items.iter().position(|t| { let a = t.anchor(); a.id != 0 && a.id == to }) {
+                if let Some(j) = items.iter().position(|t| { let a = t.anchor(); a.id != 0 && a.id == to })
+                    .filter(|&j| all_anchors || selected(i) || selected(j))
+                {
                     let (fp, fs) = resolve_layout_rect(&items, i, authored, cur);
                     let (tp, ts) = resolve_layout_rect(&items, j, authored, cur);
                     let col = egui::Color32::from_rgba_unmultiplied(120, 210, 160, 210);
@@ -695,7 +870,7 @@ pub(crate) fn show_overlay_body(
         if anchor_pick_armed(ui.ctx()).is_some() {
             if let Some(c) = ui.ctx().pointer_hover_pos() {
                 let local = [c.x - origin.x, c.y - origin.y];
-                if let Some(i) = items.iter().enumerate().rev().find_map(|(i, it)| it.hit_test(local).then_some(i)) {
+                if let Some(i) = items.iter().enumerate().rev().find_map(|(i, it)| (shown[i] && it.hit_test(local)).then_some(i)) {
                     let (p, s) = resolve_layout_rect(&items, i, authored, cur);
                     let r = egui::Rect::from_min_size(
                         origin + egui::vec2(p[0], p[1]),
@@ -772,7 +947,7 @@ pub(crate) fn show_overlay_body(
             // bottom→top, so `.rev()` yields top→bottom).
             let cur_local = [cp.x - origin.x, cp.y - origin.y];
             let hits: Vec<usize> = items.iter().enumerate().rev()
-                .filter_map(|(i, it)| it.hit_test(cur_local).then_some(i))
+                .filter_map(|(i, it)| (shown[i] && it.hit_test(cur_local)).then_some(i))
                 .collect();
             let hits = if hits.is_empty() { vec![idx] } else { hits };
             let near_prev = overlay.cycle_pos.map(|q| {
@@ -804,7 +979,7 @@ pub(crate) fn show_overlay_body(
         overlay.cycle_pos = None;
     }
     if let Some(r) = marquee_commit {
-        let picked: Vec<usize> = items.iter().enumerate().filter_map(|(i, it)| {
+        let picked: Vec<usize> = items.iter().enumerate().filter(|(i, _)| shown[*i]).filter_map(|(i, it)| {
             let (lp, ls) = it.bbox();
             let i_rect = egui::Rect::from_min_size(
                 origin + egui::vec2(lp[0], lp[1]),
@@ -844,6 +1019,11 @@ pub(crate) fn show_overlay_body(
                     },
                 }
             }
+        }
+    }
+    if let Some((i, g)) = new_gradient.take() {
+        if let Some(it) = overlay.items.get_mut(i) {
+            super::viewer::set_item_gradient(it, g);
         }
     }
     let n_items = overlay.items.len();

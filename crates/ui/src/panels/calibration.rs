@@ -868,6 +868,28 @@ pub(crate) fn start_calibration(
     }
 }
 
+/// A pad's calibration for what reads the pad straight from its device - gamepad navigation,
+/// its cursor, the phase tuner - so it answers there as it does in the patch: its source
+/// node's on `canvas`, else what a new source node for it would start with (the tab's memory
+/// of it, its type's default, stock, at `default_deadzone`).
+pub(crate) fn pad_calibration(
+    canvas: &crate::canvas::Canvas,
+    dev_id: &str,
+    device_type: &str,
+    default_deadzone: f32,
+) -> flexinput_engine::eval::PadCalibration {
+    let source = canvas.snarl.nodes_ids_data().map(|(_, n)| &n.value).find(|n| {
+        n.module_id == "device.source" && n.params.get("device_id").and_then(|v| v.as_str()) == Some(dev_id)
+    });
+    if let Some(n) = source {
+        return flexinput_engine::eval::PadCalibration::from_params(&n.params);
+    }
+    let mut params = HashMap::new();
+    params.insert("deadzone".to_string(), Value::from(default_deadzone as f64));
+    start_calibration(&mut params, &canvas.device_memory, dev_id, device_type);
+    flexinput_engine::eval::PadCalibration::from_params(&params)
+}
+
 fn cal_file_parse(text: &str) -> Result<CalFile, String> {
     let doc: Value = serde_json::from_str(text).map_err(|_| "it isn't a calibration file".to_string())?;
     let version = doc.get(CAL_FILE_MARKER).and_then(|v| v.as_u64())
@@ -5036,7 +5058,8 @@ fn triggers_section(
                     (false, "It takes effect with "),
                     (true, "Digital triggers"),
                     (false, " on in this pad's node. Until then its digital button presses where \
-                             the pad itself decides, which may not be the yellow pin."),
+                             the pad itself decides, which may not be the yellow pin. Gamepad \
+                             navigation presses at the yellow pin either way."),
                 ]);
             }
             ui.add_space(6.0);

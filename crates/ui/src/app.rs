@@ -88,6 +88,8 @@ fn chord_watch_config_from(s: &AppSettings) -> ChordWatchConfig {
         pin:        shortcut_spec_from(&s.pin_chord, &s.pin_chord_mode, s.pin_chord_gap_ms),
         config:     shortcut_spec_from(&s.config_overlay_chord, &s.config_overlay_chord_mode, s.config_overlay_chord_gap_ms),
         phase:      shortcut_spec_from(&s.phase_overlay_chord, &s.phase_overlay_chord_mode, s.phase_overlay_chord_gap_ms),
+        tab_prev:   shortcut_spec_from(&s.tab_prev_chord, &s.tab_prev_chord_mode, s.tab_prev_chord_gap_ms),
+        tab_next:   shortcut_spec_from(&s.tab_next_chord, &s.tab_next_chord_mode, s.tab_next_chord_gap_ms),
     }
 }
 
@@ -292,6 +294,10 @@ pub struct FlexInputApp {
     shared_devices: Arc<RwLock<Vec<PhysicalDevice>>>,
     /// Latest raw device signals (written by I/O thread at the polling rate); used for canvas display.
     last_signals: HashMap<(String, String), Signal>,
+    /// Each pad's calibration this frame (`calibration::pad_calibration`), for what reads the
+    /// raw `last_signals` of a pad rather than a patch's: gamepad navigation, its cursor, the
+    /// phase tuner.
+    pad_cals: HashMap<String, flexinput_engine::eval::PadCalibration>,
     /// Per-frame snapshot of [`Self::sink_bus`] — what the engine actually
     /// routed to each `(device_id, sink pin)` on the last tick, direct wires and
     /// Auto-Map alike. The canvas reads it to tell a device inlet the bus drives
@@ -580,6 +586,9 @@ pub struct FlexInputApp {
     /// Devices currently selected for UI navigation (nav mode on), republished
     /// each frame for the background shortcut watcher's nav-only device filter.
     nav_enabled_devices: Arc<RwLock<HashSet<String>>>,
+    /// [`Self::pad_cals`] for the gamepad-shortcut watcher, republished when it changes, so
+    /// a shortcut with a trigger in it presses where the trigger is calibrated to.
+    shared_pad_cals: Arc<RwLock<HashMap<String, flexinput_engine::eval::PadCalibration>>>,
     /// True while the pin shortcut button is in Learn mode in Settings.
     pin_learning: bool,
     /// Raised by the overlay hotkey listener thread; the UI loop consumes
@@ -596,6 +605,9 @@ pub struct FlexInputApp {
     /// Raised by the gamepad-shortcut watcher; flips the phase tuner over the
     /// game (`phase_overlay`).
     phase_overlay_toggle_requested: Arc<AtomicBool>,
+    /// Raised by the gamepad-shortcut watcher: the previous / next patch tab.
+    tab_prev_requested: Arc<AtomicBool>,
+    tab_next_requested: Arc<AtomicBool>,
     /// Live snapshot of the config-overlay chord shared with its listener thread.
     config_overlay_shortcut_shared: Arc<RwLock<PinShortcut>>,
     /// True while the config-overlay shortcut button is in Learn mode in Settings.
@@ -1130,6 +1142,7 @@ impl FlexInputApp {
         // in `chord_watch_config_from`). Drives the toggle flags below.
         let config_chord_cfg = Arc::new(RwLock::new(chord_watch_config_from(&app_settings)));
         let nav_enabled_devices = Arc::new(RwLock::new(HashSet::new()));
+        let shared_pad_cals = Arc::new(RwLock::new(HashMap::new()));
         let seethrough_toggle_requested = Arc::new(AtomicBool::new(false));
         spawn_pin_hotkey_listener(
             crate::pin_hotkey::HOTKEY_ID_PIN,
@@ -1166,6 +1179,8 @@ impl FlexInputApp {
         );
         // The phase tuner has only its gamepad shortcut.
         let phase_overlay_toggle_requested = Arc::new(AtomicBool::new(false));
+        let tab_prev_requested = Arc::new(AtomicBool::new(false));
+        let tab_next_requested = Arc::new(AtomicBool::new(false));
         spawn_chord_watcher(
             Arc::clone(&config_chord_cfg),
             ShortcutToggles {
@@ -1175,8 +1190,11 @@ impl FlexInputApp {
                 pin: Arc::clone(&pin_toggle_requested),
                 config: Arc::clone(&config_overlay_toggle_requested),
                 phase: Arc::clone(&phase_overlay_toggle_requested),
+                tab_prev: Arc::clone(&tab_prev_requested),
+                tab_next: Arc::clone(&tab_next_requested),
             },
             Arc::clone(&nav_enabled_devices),
+            Arc::clone(&shared_pad_cals),
             Arc::clone(&proc_device_signals),
             Arc::clone(&shortcut_owned),
             shortcut_replay,
@@ -1218,6 +1236,7 @@ impl FlexInputApp {
             devices: vec![],
             shared_devices,
             last_signals: HashMap::new(),
+            pad_cals: HashMap::new(),
             last_sink_bus: HashMap::new(),
             eval_cache: HashMap::new(),
             logo_texture,
@@ -1316,12 +1335,15 @@ impl FlexInputApp {
             pin_shortcut_shared,
             config_chord_cfg,
             nav_enabled_devices,
+            shared_pad_cals,
             pin_learning: false,
             overlay_toggle_requested,
             overlay_shortcut_shared,
             overlay_learning: false,
             config_overlay_toggle_requested,
             phase_overlay_toggle_requested,
+            tab_prev_requested,
+            tab_next_requested,
             config_overlay_shortcut_shared,
             config_overlay_learning: false,
             edit_overlay_toggle_requested,
@@ -1706,6 +1728,30 @@ impl eframe::App for FlexInputApp {
             puffin::profile_scope!("read_devices_clone");
             self.devices = self.shared_devices.read().unwrap().clone();
         }
+        // Each pad's calibration from the tab in front, as the engine takes it there, for
+        // what reads the pad raw: navigation, its cursor and the phase tuner answer the pad
+        // as its patch does - sticks deadzoned, triggers pressing at their point, the gyro
+        // without its bias.
+        {
+            puffin::profile_scope!("pad_cals");
+            let canvas = &self.tabs[self.active_tab].canvas;
+            let dz = self.settings.default_stick_deadzone;
+            let pad_cals: HashMap<String, flexinput_engine::eval::PadCalibration> = self.devices.iter()
+                .filter(|d| !matches!(d.kind,
+                    flexinput_devices::ControllerKind::MidiIn | flexinput_devices::ControllerKind::MidiOut))
+                .map(|d| {
+                    let ty = crate::panels::calibration::device_type_for(
+                        &d.id, flexinput_devices::steam_haptics::is_steam_controller(d.vid, d.pid));
+                    (d.id.clone(), crate::panels::calibration::pad_calibration(canvas, &d.id, &ty, dz))
+                })
+                .collect();
+            if pad_cals != self.pad_cals {
+                if let Ok(mut shared) = self.shared_pad_cals.write() {
+                    *shared = pad_cals.clone();
+                }
+                self.pad_cals = pad_cals;
+            }
+        }
         // The 3D viewer picks a model from the device id, which names no
         // product for an SDL pad (a Steam Controller is `sdl:generic:…`), so
         // it gets the USB ids as well.
@@ -2045,6 +2091,13 @@ impl eframe::App for FlexInputApp {
             let on = crate::config_overlay::config_overlay_visible(ctx);
             crate::config_overlay::set_config_overlay_visible(ctx, !on);
         }
+        // ── Previous / next patch tab (gamepad shortcut) ───────────────────
+        if self.tab_prev_requested.swap(false, Ordering::Relaxed) && self.active_tab > 0 {
+            self.set_active_tab(self.active_tab - 1);
+        }
+        if self.tab_next_requested.swap(false, Ordering::Relaxed) && self.active_tab + 1 < self.tabs.len() {
+            self.set_active_tab(self.active_tab + 1);
+        }
         // ── Phase tuner over the game (gamepad shortcut) ──────────────────
         if self.phase_overlay_toggle_requested.swap(false, Ordering::Relaxed) {
             let on = crate::phase_overlay::visible(ctx);
@@ -2377,7 +2430,7 @@ impl eframe::App for FlexInputApp {
         {
             puffin::profile_scope!("show_phase_overlay");
             let fps = self.overlay_fps();
-            crate::phase_overlay::show(ctx, &mut self.settings, &mut self.settings_dirty, &self.last_signals, fps);
+            crate::phase_overlay::show(ctx, &mut self.settings, &mut self.settings_dirty, &self.last_signals, &self.pad_cals, fps);
         }
 
         // ── Config overlay ────────────────────────────────────────────────────
@@ -2929,14 +2982,21 @@ impl FlexInputApp {
                 .collect();
 
             const STICK_DZ: f32 = 0.35;
-            const TRIG_DZ: f32 = 0.5;
             // Buttons a gamepad shortcut is using never reach nav: the D-pad
             // of a Home+D-pad chord must not also step the selection.
             let shortcut_owned = self.shortcut_owned.read()
                 .map(|s| s.clone()).unwrap_or_default();
             let prev_pressed = &self.gamepad_nav.prev_pressed;
+            // Each pad through its calibration (`pad_cals`), its triggers stepped against
+            // their points frame to frame.
+            let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+            let stock = flexinput_engine::eval::PadCalibration::default();
+            let trig_cross = &mut self.gamepad_nav.trig_cross;
+            trig_cross.retain(|id, _| eligible.contains(id));
             let inputs: Vec<(String, gn::NavInput)> = eligible.iter().map(|id| {
-                let mut nav = gn::read_nav_input(&self.last_signals, id, prev_pressed);
+                let cal = self.pad_cals.get(id).unwrap_or(&stock);
+                let triggers = trig_cross.entry(id.clone()).or_default();
+                let mut nav = gn::read_nav_input_calibrated(&self.last_signals, id, prev_pressed, cal, triggers, dt);
                 gn::mask_owned(&mut nav, id, &shortcut_owned);
                 (id.clone(), nav)
             }).collect();
@@ -2946,7 +3006,7 @@ impl FlexInputApp {
             // over another pad's movement, so a drifting stick can't steal it.
             let moved = |nav: &gn::NavInput| nav.lstick.length() > STICK_DZ
                 || nav.rstick.length() > STICK_DZ
-                || nav.lt > TRIG_DZ || nav.rt > TRIG_DZ;
+                || nav.lt_down || nav.rt_down;
             let sticky = self.gamepad_nav.active_dev.as_ref()
                 .filter(|d| eligible.contains(d));
             let sticky_moving = sticky
@@ -3050,6 +3110,27 @@ impl FlexInputApp {
         // the right button-glyph skin this frame.
         self.gamepad_nav.active_dev = Some(dev_id.clone());
 
+        // Who has the layout: the mouse (a trackpad, a finger) once it's used here, until the
+        // pad picks or moves something again - its highlights fade meanwhile, its cursor
+        // hides and the Easy body stops following its selection (`widgets::pointer_owns`).
+        // A press, a scroll or a touch takes it at once; a move only once the pad has been
+        // left alone a moment, as a cursor nudged by something else - a game, a pad's mouse
+        // output - moves too.
+        let pad_idle = self.gamepad_nav.last_pad_input.is_none_or(|t| t.elapsed().as_secs_f32() > 0.6);
+        if crate::widgets::pointer_pressed(ctx) || (pad_idle && crate::widgets::pointer_moved(ctx)) {
+            crate::widgets::note_pointer_activity(ctx);
+            self.gamepad_nav.cursor_visible = false;
+        }
+        let pad_used = !nav.rising.is_empty()
+            || nav.lstick.length() > 0.5
+            || nav.rstick.length() > 0.3
+            || (nav.rt_down && !self.gamepad_nav.prev_rt)
+            || (nav.lt_down && !self.gamepad_nav.prev_lt);
+        if pad_used {
+            crate::widgets::note_pad_activity(ctx);
+            self.gamepad_nav.last_pad_input = Some(std::time::Instant::now());
+        }
+
         let dt = ctx
             .input(|i| i.stable_dt)
             .clamp(0.001, 0.1);
@@ -3100,8 +3181,8 @@ impl FlexInputApp {
         if config_visible {
             self.nav_drive_config_overlay(ctx, &nav, dt);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
-            self.gamepad_nav.prev_lt = nav.lt > 0.5;
-            self.gamepad_nav.prev_rt = nav.rt > 0.5;
+            self.gamepad_nav.prev_lt = nav.lt_down;
+            self.gamepad_nav.prev_rt = nav.rt_down;
             ctx.request_repaint();
             return;
         }
@@ -3139,12 +3220,12 @@ impl FlexInputApp {
 
         // ── Gamepad settings panel (modal: captures dpad/South/East/West) ────
         if self.gamepad_nav.settings_open {
-            let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
-            let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+            let rt_rising = nav.rt_down && !self.gamepad_nav.prev_rt;
+            let lt_rising = nav.lt_down && !self.gamepad_nav.prev_lt;
             self.nav_drive_gp_settings(&nav, rt_rising, lt_rising);
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
-            self.gamepad_nav.prev_rt = nav.rt > 0.5;
-            self.gamepad_nav.prev_lt = nav.lt > 0.5;
+            self.gamepad_nav.prev_rt = nav.rt_down;
+            self.gamepad_nav.prev_lt = nav.lt_down;
             ctx.request_repaint();
             return;
         }
@@ -3212,15 +3293,15 @@ impl FlexInputApp {
             } else {
                 self.gamepad_nav.repeat_dir = None;
             }
-            if nav.is_rising("btn_south") || (nav.rt > 0.5 && !self.gamepad_nav.prev_rt) {
+            if nav.is_rising("btn_south") || (nav.rt_down && !self.gamepad_nav.prev_rt) {
                 self.gamepad_nav.preset_nav_select = true;
             }
             if nav.is_rising("btn_east") {
                 self.gamepad_nav.preset_nav_open = false;
             }
             self.gamepad_nav.prev_pressed = nav.pressed.clone();
-            self.gamepad_nav.prev_rt = nav.rt > 0.5;
-            self.gamepad_nav.prev_lt = nav.lt > 0.5;
+            self.gamepad_nav.prev_rt = nav.rt_down;
+            self.gamepad_nav.prev_lt = nav.lt_down;
             ctx.request_repaint();
             return;
         }
@@ -3243,11 +3324,22 @@ impl FlexInputApp {
             || matches!(self.gamepad_nav.edit_level,
                 crate::gamepad_nav::EditLevel::RemapScroll | crate::gamepad_nav::EditLevel::RemapCard
                 | crate::gamepad_nav::EditLevel::RemapMove);
-        if !tz_editing && nav.is_rising("btn_lb") && self.active_tab > 0 {
-            self.set_active_tab(self.active_tab - 1);
-        }
-        if !tz_editing && nav.is_rising("btn_rb") && self.active_tab + 1 < self.tabs.len() {
-            self.set_active_tab(self.active_tab + 1);
+        // The layout's tabs (LB / RB unless rebound); a layout without tabs leaves them to
+        // the patch tabs, which also have their own shortcut (Home + LB / RB).
+        let tab_step = if gn::combo_rising(&nav, self.settings.layout_tab_next_chord.as_deref()) {
+            1
+        } else if gn::combo_rising(&nav, self.settings.layout_tab_prev_chord.as_deref()) {
+            -1
+        } else {
+            0
+        };
+        if !tz_editing && tab_step != 0 && self.step_layout_tab(ctx, tab_step).is_none() {
+            if tab_step < 0 && self.active_tab > 0 {
+                self.set_active_tab(self.active_tab - 1);
+            }
+            if tab_step > 0 && self.active_tab + 1 < self.tabs.len() {
+                self.set_active_tab(self.active_tab + 1);
+            }
         }
 
         // ── Undo / redo ──────────────────────────────────────────────────────
@@ -3265,16 +3357,20 @@ impl FlexInputApp {
         }
 
         // ── Cursor (right stick + gyro) ──────────────────────────────────────
-        self.update_nav_cursor(ctx, &nav, dt);
+        // Not while the pointer has the layout: the gyro, never quite still, would bring the
+        // cursor back on its own. The right stick takes the layout back first (above).
+        if !crate::widgets::pointer_owns(ctx) {
+            self.update_nav_cursor(ctx, &nav, dt);
+        }
 
         // ── Analog trigger context (default: RT = confirm/enter, LT = back) ──
         // Widget-specific trigger contexts (curve dot add/delete, remapper
         // filter cycle) are a planned follow-up; the default confirm/back
         // mapping below composes with the edit-level handling.
-        let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
-        let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
-        self.gamepad_nav.prev_rt = nav.rt > 0.5;
-        self.gamepad_nav.prev_lt = nav.lt > 0.5;
+        let rt_rising = nav.rt_down && !self.gamepad_nav.prev_rt;
+        let lt_rising = nav.lt_down && !self.gamepad_nav.prev_lt;
+        self.gamepad_nav.prev_rt = nav.rt_down;
+        self.gamepad_nav.prev_lt = nav.lt_down;
 
         // ── North: toggle the Easy left "Devices" panel (top nav level only) ──
         // North is otherwise unused at the base Widget level, so it doubles as the
@@ -3317,6 +3413,35 @@ impl FlexInputApp {
     }
 
     /// The active tab's top-level sub-patch node (the one Easy-mode nav drives).
+    /// Step the tab of the layout the pad is in `dir` along: the config overlay's while it's
+    /// up and has the pad, else Easy mode's. `None` where that layout has no tabs; else
+    /// whether the tab changed (not past either end). What was selected goes.
+    pub(crate) fn step_layout_tab(&mut self, ctx: &egui::Context, dir: i32) -> Option<bool> {
+        let config = crate::config_overlay::config_overlay_visible(ctx);
+        let (tabs, active, selected, selection) = if config {
+            let c = &mut self.tabs[self.active_tab].config;
+            (c.layout_tabs.len(), &mut c.active_tab, &mut c.selected_item, &mut c.selected_items)
+        } else {
+            if self.settings.ui_mode != settings::UiMode::Easy {
+                return None;
+            }
+            let id = self.nav_active_subpatch_id()?;
+            let sp = self.tabs[self.active_tab].canvas.snarl.get_node_mut(id)?.subpatch.as_mut()?;
+            (sp.layout_tabs.len(), &mut sp.active_tab, &mut sp.selected_item, &mut sp.selected_items)
+        };
+        if tabs < 2 {
+            return None;
+        }
+        let Some(k) = crate::canvas::viewer::stepped_tab(*active, tabs, dir) else { return Some(false) };
+        *active = k;
+        *selected = None;
+        selection.clear();
+        self.gamepad_nav.module_part = None;
+        self.gamepad_nav.module_field = None;
+        self.gamepad_nav.module_part_item = None;
+        Some(true)
+    }
+
     pub(crate) fn nav_active_subpatch_id(&self) -> Option<egui_snarl::NodeId> {
         self.tabs[self.active_tab].canvas.snarl
             .nodes_ids_data()
@@ -3326,7 +3451,22 @@ impl FlexInputApp {
 
     /// Publish the sub-patch nav glow for `outer_id` (selection ring + the
     /// mapping-card glow) from the current edit level.
+    /// On a stop of a module pinned whole (selected in the sub-patch `outer_id`, or the
+    /// config overlay's focused pin): publish it - the part, the field, whether it's worked in
+    /// - for the host to ring it rather than the whole widget (`module_part_focus_rect`).
+    pub(crate) fn nav_publish_module_part_focus(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+        let Some(part) = self.gamepad_nav.module_part.clone() else { return };
+        let worked = self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget;
+        let field = self.gamepad_nav.module_field;
+        if let Some(inner) = self.nav_selected_inner_node(outer_id) {
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|d| d.insert_temp(crate::canvas::viewer::module_part_focus_id(inner.0), (pass, part, field, worked)));
+        }
+    }
+
     pub(crate) fn nav_publish_subpatch_glow(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
+        // On a stop of a module pinned whole, the host rings that stop.
+        self.nav_publish_module_part_focus(ctx, outer_id);
         // Presence of the key means "draw the nav selection glow"; value =
         // is-editing.
         let editing = matches!(
@@ -3368,6 +3508,12 @@ impl FlexInputApp {
         lt_rising: bool,
     ) {
         use crate::gamepad_nav::{self as gn, EditLevel, NavDir};
+
+        // Editing a row entered from one of its fields (a module pinned whole): the walk's
+        // stop follows the field being edited, so it's where the walk goes on from after.
+        if self.gamepad_nav.edit_level == EditLevel::Editing && self.gamepad_nav.module_field.is_some() {
+            self.gamepad_nav.module_field = Some(self.gamepad_nav.field_index);
+        }
 
         // Resolve directional intent: dpad = discrete; stick = auto-repeat.
         let mut step_dir: Option<NavDir> = None;
@@ -3419,94 +3565,71 @@ impl FlexInputApp {
 
         match self.gamepad_nav.edit_level {
             EditLevel::Widget => {
-                // Move selection spatially.
+                // Move along the walk's stops: each widget, and on a module pinned whole each of
+                // its fields and parts (`nav_easy_stops`) - nothing to go into and out of.
                 if let Some(step) = step {
-                    // Seamless cross LEFT into the Devices panel: when already at
-                    // the left-most sub-patch widget (a real selection with no
-                    // left neighbour) and the panel is visible, hand focus to the
-                    // panel instead of staying put. Consumes this frame; the panel
-                    // takes over next frame.
-                    if step == gn::NavStep::LEFT && !self.easy_left_panel_collapsed {
-                        let at_left_edge = {
-                            let canvas = &self.tabs[self.active_tab].canvas;
-                            canvas.snarl.get_node(outer_id)
-                                .and_then(|n| n.subpatch.as_ref())
-                                .map(|sp| {
-                                    let editable: Vec<bool> = (0..sp.items.len())
-                                        .map(|i| Self::sp_item_is_editable(sp, i))
-                                        .collect();
-                                    sp.selected_item.is_some()
-                                        && gn::nearest_in_dir(&sp.items, sp.selected_item, NavDir::Left,
-                                            |i| editable.get(i).copied().unwrap_or(false)).is_none()
-                                })
-                                .unwrap_or(false)
-                        };
-                        if at_left_edge {
-                            let targets: Vec<gn::LeftNavTarget> = ctx
-                                .data(|d| d.get_temp::<(u64, Vec<gn::LeftNavTarget>)>(
-                                    gn::left_targets_id()))
-                                .map(|(_, t)| t)
-                                .unwrap_or_default();
-                            if let Some(idx) =
-                                gn::nearest_target_rect_in_dir(&targets, None, NavDir::Left)
-                            {
-                                self.gamepad_nav.left_selected = Some(idx);
-                                self.gamepad_nav.repeat_dir = None;
-                                self.gamepad_nav.repeat_accum = 0.0;
-                                return;
-                            }
+                    let stops = self.nav_easy_stops(ctx, outer_id);
+                    let cur = self.nav_easy_stop_at(outer_id, &stops);
+                    let next = cur.and_then(|c| gn::step_in_lane(
+                        &mut self.gamepad_nav.easy_lane, outer_id.0 as u64, (c, stops[c].3),
+                        stops.iter().enumerate().filter(|(j, _)| *j != c).map(|(j, s)| (j, s.3)),
+                        step,
+                    ));
+                    // Seamless cross LEFT into the Devices panel: when already at the left-most
+                    // stop (a real selection with nothing left of it) and the panel is visible,
+                    // hand focus to the panel instead of staying put. Consumes this frame; the
+                    // panel takes over next frame.
+                    if step == gn::NavStep::LEFT && cur.is_some() && next.is_none() && !self.easy_left_panel_collapsed {
+                        let targets: Vec<gn::LeftNavTarget> = ctx
+                            .data(|d| d.get_temp::<(u64, Vec<gn::LeftNavTarget>)>(gn::left_targets_id()))
+                            .map(|(_, t)| t)
+                            .unwrap_or_default();
+                        if let Some(idx) = gn::nearest_target_rect_in_dir(&targets, None, NavDir::Left) {
+                            self.gamepad_nav.left_selected = Some(idx);
+                            self.gamepad_nav.repeat_dir = None;
+                            self.gamepad_nav.repeat_accum = 0.0;
+                            return;
                         }
                     }
-                    let canvas = &mut self.tabs[self.active_tab].canvas;
-                    if let Some(sp) = canvas
-                        .snarl
-                        .get_node_mut(outer_id)
-                        .and_then(|n| n.subpatch.as_mut())
-                    {
-                        // Editability bitmap (visual-only pins are non-navigable),
-                        // computed once and closed over so the shared `&sp.items`
-                        // arg and the predicate don't both borrow `sp`.
-                        let editable: Vec<bool> = (0..sp.items.len())
-                            .map(|i| Self::sp_item_is_editable(sp, i))
-                            .collect();
-                        let is_editable = |i: usize| editable.get(i).copied().unwrap_or(false);
-                        // Keeping to the lane it came down or across in: down onto a
-                        // wide widget from its right goes on down from the right.
-                        if let Some(next) = gn::walk_items(&sp.items, sp.selected_item, step, &is_editable,
-                            &mut self.gamepad_nav.easy_lane, outer_id.0 as u64)
-                        {
-                            sp.selected_item = Some(next);
-                            sp.selected_items = vec![next];
-                        } else if sp.selected_item.is_none() {
-                            // Seed selection at the first navigable item.
-                            if let Some(seed) = gn::nearest_item_toward(&sp.items, None, step, &is_editable) {
-                                sp.selected_item = Some(seed);
-                                sp.selected_items = vec![seed];
-                            }
-                        }
+                    // Nothing selected yet: the top-left-most stop.
+                    let next = next.or_else(|| cur.is_none().then(|| {
+                        stops.iter().enumerate()
+                            .min_by(|a, b| (a.1.3.top(), a.1.3.left()).partial_cmp(&(b.1.3.top(), b.1.3.left()))
+                                .unwrap_or(std::cmp::Ordering::Equal))
+                            .map(|(j, _)| j)
+                    }).flatten());
+                    if let Some(j) = next {
+                        let stop = stops[j].clone();
+                        self.nav_select_easy_stop(outer_id, &stop);
                     }
                 }
-                // If the RS/gyro cursor is visible, RT/South first MOVES the
-                // selection to whatever widget the cursor is over (the cursor's
-                // whole point: visually pick the target). Only then do we act on
-                // it. Falls through to act on the existing selection when the
-                // cursor isn't over any item.
+                // If the RS/gyro cursor is visible, RT/South first MOVES the walk to the stop
+                // the cursor is over (the cursor's whole point: visually pick the target). Only
+                // then do we act on it. Falls through to act on the existing selection when the
+                // cursor isn't over any stop.
                 if (nav.is_rising("btn_south") || rt_rising)
                     && self.gamepad_nav.cursor_visible
                 {
-                    if let Some(hit) = self.nav_cursor_hit_item(ctx, outer_id) {
-                        let canvas = &mut self.tabs[self.active_tab].canvas;
-                        if let Some(sp) = canvas
-                            .snarl
-                            .get_node_mut(outer_id)
-                            .and_then(|n| n.subpatch.as_mut())
-                        {
-                            sp.selected_item = Some(hit);
-                            sp.selected_items = vec![hit];
+                    if let Some(stop) = self.nav_cursor_hit_stop(ctx, outer_id) {
+                        self.nav_select_easy_stop(outer_id, &stop);
+                    }
+                }
+                // On a section heading of a module pinned whole: South folds or unfolds it.
+                if (nav.is_rising("btn_south") || rt_rising) && self.nav_flip_section_fold(ctx, outer_id) {
+                    return;
+                }
+                let kind = self.nav_selected_kind(outer_id);
+                // On a field of a module pinned whole that flips (a toggle in a row): South
+                // flips it there and then.
+                if (nav.is_rising("btn_south") || rt_rising)
+                    && matches!(kind, NavWidgetKind::MultiField | NavWidgetKind::Value)
+                {
+                    if let Some(k) = self.gamepad_nav.module_field {
+                        if self.nav_flip_toggle_field(outer_id, k) {
+                            return;
                         }
                     }
                 }
-                let kind = self.nav_selected_kind(outer_id);
                 // Response curve: South ENTERS the curve (dot navigation). Once
                 // inside, LT/RT add/remove dots and South again edits a dot.
                 if matches!(kind, NavWidgetKind::Curve) {
@@ -3560,7 +3683,8 @@ impl FlexInputApp {
                             | NavWidgetKind::MultiField => {
                                 self.gamepad_nav.edit_level = EditLevel::Editing;
                                 self.gamepad_nav.fine_increment = false;
-                                self.gamepad_nav.field_index = 0;
+                                // On a field of a module pinned whole: that field.
+                                self.gamepad_nav.field_index = self.gamepad_nav.module_field.unwrap_or(0);
                                 // Snapshot for a single coalesced undo entry on exit.
                                 self.gamepad_nav.edit_baseline = Some(Box::new(
                                     self.tabs[self.active_tab].canvas.snapshot_for_undo()));
@@ -3796,6 +3920,12 @@ impl FlexInputApp {
     /// single standalone-allowed system button that isn't already used by a
     /// mapping in any tab. A single ordinary button is rejected (keep listening).
     fn chord_draft_acceptable(&self, draft: &[String]) -> bool {
+        // The layout-tab buttons: any navigation buttons, one or more (East alone backs out).
+        if self.gamepad_nav.chord_learn.is_some_and(|t| t.in_app()) {
+            return !draft.is_empty()
+                && draft != ["btn_east"]
+                && draft.iter().all(|p| crate::gamepad_nav::NAV_BUTTONS.contains(&p.as_str()));
+        }
         match draft.len() {
             0 => false,
             1 => {
@@ -3916,28 +4046,14 @@ impl FlexInputApp {
         self.gamepad_nav.chord_arm_idle = false;
         let single = chord.len() == 1;
         let target = self.gamepad_nav.chord_learn.take();
-        match target {
-            Some(ChordTarget::SeeThrough)    => self.settings.seethrough_chord = Some(chord),
-            Some(ChordTarget::Panic)         => self.settings.panic_chord = Some(chord),
-            Some(ChordTarget::Overlay)       => self.settings.overlay_chord = Some(chord),
-            Some(ChordTarget::Pin)           => self.settings.pin_chord = Some(chord),
-            Some(ChordTarget::ConfigOverlay) => self.settings.config_overlay_chord = Some(chord),
-            Some(ChordTarget::PhaseOverlay)  => self.settings.phase_overlay_chord = Some(chord),
-            None => {}
+        if let Some(t) = target {
+            *self.settings.chord_mut(t) = Some(chord);
         }
         // A single-button shortcut can't be "on press" (it would fire the instant
         // the button is touched, even as part of another combo). Nudge a
         // default/"down" mode to "long" so a standalone Guide/Capture is safe.
-        if single {
-            let mode = match target {
-                Some(ChordTarget::SeeThrough)    => Some(&mut self.settings.seethrough_chord_mode),
-                Some(ChordTarget::Panic)         => Some(&mut self.settings.panic_chord_mode),
-                Some(ChordTarget::Overlay)       => Some(&mut self.settings.overlay_chord_mode),
-                Some(ChordTarget::Pin)           => Some(&mut self.settings.pin_chord_mode),
-                Some(ChordTarget::ConfigOverlay) => Some(&mut self.settings.config_overlay_chord_mode),
-                Some(ChordTarget::PhaseOverlay)  => Some(&mut self.settings.phase_overlay_chord_mode),
-                None => None,
-            };
+        if single && !target.is_some_and(ChordTarget::in_app) {
+            let mode = target.and_then(|t| self.settings.chord_mode_mut(t));
             if let Some(m) = mode {
                 if m == "down" { *m = "long".to_string(); }
             }
@@ -3968,9 +4084,10 @@ impl FlexInputApp {
             // Seed at screen center on first appearance.
             gn.cursor_pos = screen.center();
         }
+        // The stick is past its calibrated deadzone already (`read_nav_input_calibrated`).
         let rs = nav.rstick;
         let mag = rs.length();
-        if mag > 0.08 {
+        if mag > 1e-3 {
             // Direction from the stick, speed from the accelerated curve on the
             // magnitude (slow start, fast late when rs_exp > 1).
             let speed = rs_max * mag.clamp(0.0, 1.0).powf(rs_exp);

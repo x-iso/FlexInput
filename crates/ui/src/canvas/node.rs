@@ -241,6 +241,26 @@ pub struct ExposedModule {
     /// are made as 2. Ignored by elements with one look. See `viewer::pin_style2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pin_style: Option<u8>,
+    /// A module pinned whole, zoomed: laid out as if the widget were its size over this, and
+    /// drawn that much smaller (or larger) to fit - under 1 its buttons and values come out
+    /// smaller and what fills the rest, a graph, larger. Absent is 1. See
+    /// `pinned::render_module_widget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<f32>,
+    /// Which of its layout's tabs this is on ([`ALL_TABS`]: every one). A layout without
+    /// tabs shows everything, so this reads 0 until tabs are made.
+    #[serde(default, skip_serializing_if = "is_first_tab")]
+    pub tab: u8,
+}
+
+/// The least and most a module pinned whole can be zoomed ([`ExposedModule::zoom`]).
+pub const WIDGET_ZOOM: std::ops::RangeInclusive<f32> = 0.4..=2.0;
+
+/// A layout object's `tab` when it's on every tab of its layout.
+pub const ALL_TABS: u8 = u8::MAX;
+
+fn is_first_tab(t: &u8) -> bool {
+    *t == 0
 }
 
 /// Per-pin style for a pinned Touch Zones / Virtual Menu field pad. Colour
@@ -414,6 +434,8 @@ pub enum LayoutDecoration {
         valign: TextVAlign,
         #[serde(default, skip_serializing_if = "Anchor::is_auto")]
         anchor: Anchor,
+        #[serde(default, skip_serializing_if = "is_first_tab")]
+        tab: u8,
     },
     Svg {
         pos: [f32; 2],
@@ -422,6 +444,9 @@ pub enum LayoutDecoration {
         rev: u64,
         tint: [u8; 4],
         tint_mode: String,
+        /// The tint as a gradient across the picture instead of one colour, if it is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tint_gradient: Option<Gradient>,
         stroke: [u8; 4],
         stroke_px: f32,
         /// Chosen shared-set / `gp:<pin>` icon key ("" = use `svg_data`). When set,
@@ -431,25 +456,37 @@ pub enum LayoutDecoration {
         icon_key: String,
         #[serde(default, skip_serializing_if = "Anchor::is_auto")]
         anchor: Anchor,
+        #[serde(default, skip_serializing_if = "is_first_tab")]
+        tab: u8,
     },
     Rect {
         pos: [f32; 2],
         size: [f32; 2],
         fill: [u8; 4],
+        /// The fill as a gradient instead of one colour, if it is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill_gradient: Option<Gradient>,
         stroke: [u8; 4],
         stroke_px: f32,
         corner_radius: f32,
         #[serde(default, skip_serializing_if = "Anchor::is_auto")]
         anchor: Anchor,
+        #[serde(default, skip_serializing_if = "is_first_tab")]
+        tab: u8,
     },
     Ellipse {
         pos: [f32; 2],
         size: [f32; 2],
         fill: [u8; 4],
+        /// The fill as a gradient instead of one colour, if it is one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill_gradient: Option<Gradient>,
         stroke: [u8; 4],
         stroke_px: f32,
         #[serde(default, skip_serializing_if = "Anchor::is_auto")]
         anchor: Anchor,
+        #[serde(default, skip_serializing_if = "is_first_tab")]
+        tab: u8,
     },
     Line {
         a: [f32; 2],
@@ -458,7 +495,44 @@ pub enum LayoutDecoration {
         stroke_px: f32,
         #[serde(default, skip_serializing_if = "Anchor::is_auto")]
         anchor: Anchor,
+        #[serde(default, skip_serializing_if = "is_first_tab")]
+        tab: u8,
     },
+}
+
+/// How a gradient spreads its colours: along a line, or out from a centre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GradientKind {
+    #[default]
+    Linear,
+    Radial,
+}
+
+/// One colour on a gradient's line: where it is (0 at the start, 1 at the end), and what.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GradientStop {
+    pub at: f32,
+    pub color: [u8; 4],
+}
+
+/// A gradient fill. Its line runs from `start` to `end`, each a share of the object's box
+/// (0,0 its top-left corner, 1,1 its bottom-right, either may lie outside it): a linear
+/// gradient's colours run along it, a radial one's out from `start`, `end` on its edge. The
+/// colours are its `stops`, at least two; `bias` is where on the line the middle of them
+/// falls, 0.5 for evenly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gradient {
+    #[serde(default)]
+    pub kind: GradientKind,
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+    #[serde(default = "gradient_even_bias")]
+    pub bias: f32,
+    pub stops: Vec<GradientStop>,
+}
+
+fn gradient_even_bias() -> f32 {
+    0.5
 }
 
 impl LayoutDecoration {
@@ -497,6 +571,28 @@ impl LayoutDecoration {
             | LayoutDecoration::Rect { anchor, .. }
             | LayoutDecoration::Ellipse { anchor, .. }
             | LayoutDecoration::Line { anchor, .. } => *anchor,
+        }
+    }
+
+    /// Which tab of its layout this is on ([`ALL_TABS`]: every one).
+    pub fn tab(&self) -> u8 {
+        match self {
+            LayoutDecoration::Text { tab, .. }
+            | LayoutDecoration::Svg { tab, .. }
+            | LayoutDecoration::Rect { tab, .. }
+            | LayoutDecoration::Ellipse { tab, .. }
+            | LayoutDecoration::Line { tab, .. } => *tab,
+        }
+    }
+
+    /// Put this on tab `t` of its layout ([`ALL_TABS`]: every one).
+    pub fn set_tab(&mut self, t: u8) {
+        match self {
+            LayoutDecoration::Text { tab, .. }
+            | LayoutDecoration::Svg { tab, .. }
+            | LayoutDecoration::Rect { tab, .. }
+            | LayoutDecoration::Ellipse { tab, .. }
+            | LayoutDecoration::Line { tab, .. } => *tab = t,
         }
     }
 
@@ -582,6 +678,31 @@ impl LayoutItem {
             LayoutItem::Deco(d)   => d.set_anchor(a),
         }
     }
+    /// The tab of its layout this is on, `None` when it's on every one.
+    pub fn tab(&self) -> Option<u8> {
+        let t = match self {
+            LayoutItem::Module(m) => m.tab,
+            LayoutItem::Deco(d) => d.tab(),
+        };
+        (t != ALL_TABS).then_some(t)
+    }
+    /// Put this on tab `t` of its layout, or every one (`None`).
+    pub fn set_tab(&mut self, t: Option<u8>) {
+        let t = t.unwrap_or(ALL_TABS);
+        match self {
+            LayoutItem::Module(m) => m.tab = t,
+            LayoutItem::Deco(d) => d.set_tab(t),
+        }
+    }
+    /// Whether this shows while tab `active` of a layout with `tabs` tabs is shown: always
+    /// where the layout has one tab or none; else when it's on every tab, or on that one -
+    /// one on a tab past the last counts as on the last.
+    pub fn on_tab(&self, active: usize, tabs: usize) -> bool {
+        if tabs <= 1 {
+            return true;
+        }
+        self.tab().is_none_or(|t| (t as usize).min(tabs - 1) == active.min(tabs - 1))
+    }
     /// Whether the given point (in body-local coords) hits this item. Lines
     /// use a distance-to-segment test; others use the bbox.
     pub fn hit_test(&self, p: [f32; 2]) -> bool {
@@ -636,6 +757,12 @@ pub struct OverlayLayout {
     /// Runtime-only: click-cycle anchor (see `UiSubPatch::cycle_pos`).
     #[serde(skip)]
     pub cycle_pos: Option<[f32; 2]>,
+    /// The overlay's tabs, by name (see `UiSubPatch::layout_tabs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layout_tabs: Vec<String>,
+    /// Runtime-only: the tab showing.
+    #[serde(skip)]
+    pub active_tab: usize,
 }
 
 impl Default for OverlayLayout {
@@ -648,11 +775,22 @@ impl Default for OverlayLayout {
             selected_item: None,
             selected_items: Vec::new(),
             cycle_pos: None,
+            layout_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 }
 
 impl OverlayLayout {
+    /// The tab a new object goes on: the one showing, where the layout has tabs.
+    pub fn new_item_tab(&self) -> u8 {
+        if self.layout_tabs.len() >= 2 {
+            self.active_tab.min(self.layout_tabs.len() - 1) as u8
+        } else {
+            0
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -816,7 +954,7 @@ pub(crate) fn resolve_layout_deco(
 ) -> LayoutDecoration {
     let Some(LayoutItem::Deco(d)) = items.get(idx) else {
         // Caller only invokes this for decorations; return a harmless default.
-        return LayoutDecoration::Rect {
+        return LayoutDecoration::Rect { tab: 0, fill_gradient: None,
             pos: [0.0, 0.0], size: [0.0, 0.0], fill: [0, 0, 0, 0],
             stroke: [0, 0, 0, 0], stroke_px: 0.0, corner_radius: 0.0,
             anchor: Anchor::default(),
@@ -932,9 +1070,25 @@ pub struct UiSubPatch {
     /// items rather than always selecting the topmost).
     #[serde(skip)]
     pub cycle_pos: Option<[f32; 2]>,
+    /// The layout's tabs, by name: each object is on one of them (or every one), and one
+    /// shows at a time. None (the default) or one: the layout has no tabs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layout_tabs: Vec<String>,
+    /// Runtime-only: the tab showing.
+    #[serde(skip)]
+    pub active_tab: usize,
 }
 
 impl UiSubPatch {
+    /// The tab a new object goes on: the one showing, where the layout has tabs.
+    pub fn new_item_tab(&self) -> u8 {
+        if self.layout_tabs.len() >= 2 {
+            self.active_tab.min(self.layout_tabs.len() - 1) as u8
+        } else {
+            0
+        }
+    }
+
     /// Drain any legacy `exposed_modules` / `decorations` into the unified
     /// `items` Vec. Decorations go to the bottom (preserving their internal
     /// order), modules on top.
@@ -1412,6 +1566,8 @@ impl Default for UiSubPatch {
             selected_item: None,
             selected_items: Vec::new(),
             cycle_pos: None,
+            layout_tabs: Vec::new(),
+            active_tab: 0,
         }
     }
 }
@@ -1521,8 +1677,10 @@ mod tests {
     #[test]
     fn overlay_layout_serde_roundtrip() {
         let layout = OverlayLayout {
+            active_tab: 0, layout_tabs: Vec::new(),
             items: vec![
                 LayoutItem::Module(ExposedModule {
+                    tab: 0,
                     inner_node_id: 7,
                     element_id: "curve".into(),
                     pos: [40.0, 60.0],
@@ -1539,8 +1697,9 @@ mod tests {
                     keep_aspect: false,
                     anchor: Anchor { x: AnchorAxis::End, y: AnchorAxis::Start, stretch_x: true, ..Default::default() },
                     pin_style: None,
+                    zoom: None,
                 }),
-                LayoutItem::Deco(LayoutDecoration::Rect {
+                LayoutItem::Deco(LayoutDecoration::Rect { tab: 0, fill_gradient: None,
                     pos: [5.0, 6.0],
                     size: [100.0, 50.0],
                     fill: [10, 20, 30, 200],
@@ -1639,7 +1798,7 @@ mod tests {
 
     // ── anchor-to-object ──
     fn rect_item(pos: [f32; 2], size: [f32; 2], anchor: Anchor) -> LayoutItem {
-        LayoutItem::Deco(LayoutDecoration::Rect {
+        LayoutItem::Deco(LayoutDecoration::Rect { tab: 0, fill_gradient: None,
             pos, size, fill: [0, 0, 0, 0], stroke: [0, 0, 0, 0], stroke_px: 0.0,
             corner_radius: 0.0, anchor,
         })
@@ -1722,6 +1881,7 @@ mod tests {
 
     fn overlay_pin(inner: usize, source_path: Vec<usize>) -> LayoutItem {
         LayoutItem::Module(ExposedModule {
+            tab: 0,
             inner_node_id: inner,
             element_id: "value".into(),
             pos: [0.0, 0.0],
@@ -1735,6 +1895,7 @@ mod tests {
             keep_aspect: false,
             anchor: Anchor::default(),
             pin_style: None,
+            zoom: None,
         })
     }
 
@@ -1792,7 +1953,7 @@ mod tests {
     }
 
     fn deco(x: f32) -> LayoutItem {
-        LayoutItem::Deco(LayoutDecoration::Rect {
+        LayoutItem::Deco(LayoutDecoration::Rect { tab: 0, fill_gradient: None,
             pos: [x, 10.0], size: [40.0, 20.0], fill: [1, 2, 3, 255],
             stroke: [0, 0, 0, 0], stroke_px: 0.0, corner_radius: 0.0,
             anchor: Anchor::default(),

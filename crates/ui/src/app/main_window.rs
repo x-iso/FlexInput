@@ -1133,6 +1133,14 @@ impl FlexInputApp {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(panel_full_rect), |ui| {
                         ui.set_clip_rect(left_rect);
                         puffin::profile_scope!("easy_io_panel_show");
+                        // While the layout is being edited the panel is its Inspector.
+                        if let Some(oid) = crate::easy::center_panel::layout_editing_subpatch(canvas) {
+                            ui.scope_builder(
+                                egui::UiBuilder::new().max_rect(panel_full_rect.shrink2(egui::vec2(10.0, 0.0))),
+                                |ui| crate::easy::center_panel::show_layout_inspector(ui, canvas, oid),
+                            );
+                            return;
+                        }
                         crate::easy::io_panel::show(
                             ui,
                             devices,
@@ -1158,7 +1166,11 @@ impl FlexInputApp {
                 let (tab_resp, tab_rect) = crate::panels::physical_devices::draw_devices_tab(
                     ctx,
                     "easy_devices_tab",
-                    "Devices",
+                    if crate::easy::center_panel::layout_editing_subpatch(canvas).is_some() {
+                        "Inspector"
+                    } else {
+                        "Devices"
+                    },
                     left_rect.right(),
                     // Match the preset pill's top: center content top + add_space(6)
                     // + the (34-row − 30-pill)/2 centering inset.

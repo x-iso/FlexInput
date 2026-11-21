@@ -285,6 +285,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             ];
             overlay_layout.items.push(crate::canvas::node::LayoutItem::Module(
                 crate::canvas::node::ExposedModule {
+                    tab: overlay_layout.new_item_tab(),
                     inner_node_id: inner_uid,
                     element_id: eid,
                     pos,
@@ -298,6 +299,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     keep_aspect: false,
                     anchor: Default::default(),
                     pin_style: Some(2),
+                    zoom: None,
                 },
             ));
             let idx = overlay_layout.items.len() - 1;
@@ -507,9 +509,11 @@ fn overlay_edit_toolbar(
     overlay_layout: &mut crate::canvas::OverlayLayout,
     exit_edit: &mut bool,
 ) {
+    // Under the overlay's row of tabs, where it has one.
+    let below = crate::canvas::viewer::tab_row_h(overlay_layout.layout_tabs.len());
     let area = egui::Area::new(egui::Id::new("fxi_overlay_toolbar"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0 + below))
         .interactable(true);
     let area_resp = area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
@@ -528,16 +532,12 @@ fn overlay_edit_toolbar(
                 let mut state = crate::canvas::viewer::LayoutStateMut::of_overlay(overlay_layout);
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("✔ Done").strong())
-                            .on_hover_text("Exit overlay editing (Esc)")
-                            .clicked()
-                        {
+                        if crate::canvas::viewer::layout_tool_word(ui, "Done", "Exit overlay editing (Esc)", true) {
                             *exit_edit = true;
                         }
                         ui.separator();
-                        if ui.button("➕ Add element")
-                            .on_hover_text("Pick a module UI element to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window (and first-level sub-patch editors). Esc cancels.")
-                            .clicked()
+                        if crate::canvas::viewer::layout_tool_word(ui, "+ Add element",
+                            "Pick a module UI element to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window (and first-level sub-patch editors). Esc cancels.", false)
                         {
                             crate::canvas::viewer::set_overlay_pick_active(ui.ctx(), true);
                             crate::canvas::viewer::set_overlay_pick_dest_config(ui.ctx(), false);
@@ -556,7 +556,7 @@ fn overlay_edit_toolbar(
                         crate::canvas::viewer::layout_toolbar_controls_core(ui, &mut state);
                     });
                     // Second row: properties of the selected item, if any.
-                    crate::canvas::viewer::layout_inspector_strip_core(ui, &mut state, sel_module);
+                    crate::canvas::viewer::overlay_inspector_strip(ui, &mut state, sel_module);
                 });
             });
     });
@@ -565,4 +565,111 @@ fn overlay_edit_toolbar(
     // until laid out here).
     ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
     let _ = rect;
+}
+
+#[cfg(test)]
+mod toolbar_shots {
+    use super::*;
+
+    /// Pictures of the overlay's edit toolbar with a gradient rectangle selected - the tools
+    /// and the compact Inspector under them, in a line, in tabs and folded:
+    /// `cargo test -p flexinput-ui --lib shoot_overlay_toolbar -- --ignored`, PNGs
+    /// `target/module_shots/overlay_toolbar{,_tabs,_folded}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_overlay_toolbar() {
+        use crate::canvas::node::{Gradient, GradientKind, LayoutDecoration, LayoutItem};
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut snarl: egui_snarl::Snarl<crate::canvas::NodeData> = egui_snarl::Snarl::new();
+        let mut layout = crate::canvas::OverlayLayout::default();
+        layout.items.push(LayoutItem::Deco(LayoutDecoration::Rect {
+            tab: 0,
+            pos: [200.0, 300.0],
+            size: [300.0, 160.0],
+            fill: [0; 4],
+            fill_gradient: Some(Gradient::new(GradientKind::Linear, [40, 120, 255, 255], [255, 80, 160, 255])),
+            stroke: [0; 4],
+            stroke_px: 0.0,
+            corner_radius: 0.0,
+            anchor: Default::default(),
+        }));
+        layout.selected_item = Some(0);
+        layout.selected_items = vec![0];
+        let mut shot = crate::canvas::shot::Shot::default();
+        // In a line where the screen holds it, in tabs where it doesn't, and folded away.
+        for (width, folded, name) in [(1920.0, false, "overlay_toolbar"), (1280.0, false, "overlay_toolbar_tabs"), (1280.0, true, "overlay_toolbar_folded")] {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("layout_inspector_folded"), folded));
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 120.0));
+            let mut shapes = Vec::new();
+            for t in 0..10 {
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 30.0), ..Default::default() };
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut exit = false;
+                        overlay_edit_toolbar(ui, screen, &mut snarl, &mut layout, &mut exit);
+                    });
+                });
+                shot.absorb(&out.textures_delta);
+                shapes = out.shapes;
+            }
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/module_shots/{name}.png"));
+            shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// A picture of an overlay with three tabs being edited: their row across the top, the
+    /// toolbar under it, the layout beneath - a rectangle anchored to another, selected, so
+    /// its anchor shows and the other's doesn't: `cargo test -p flexinput-ui --lib
+    /// shoot_overlay_tabs -- --ignored`, PNG `target/module_shots/overlay_tabs.png`.
+    #[test]
+    #[ignore]
+    fn shoot_overlay_tabs() {
+        use crate::canvas::node::{Anchor, LayoutDecoration, LayoutItem};
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut snarl: egui_snarl::Snarl<crate::canvas::NodeData> = egui_snarl::Snarl::new();
+        let mut layout = crate::canvas::OverlayLayout::default();
+        let rect = |pos: [f32; 2], fill: [u8; 4], anchor: Anchor| LayoutItem::Deco(LayoutDecoration::Rect {
+            tab: 0,
+            pos,
+            size: [220.0, 120.0],
+            fill,
+            fill_gradient: None,
+            stroke: [0; 4],
+            stroke_px: 0.0,
+            corner_radius: 6.0,
+            anchor,
+        });
+        let target = Anchor { id: 1, ..Default::default() };
+        let follower = Anchor { to: Some(1), ..Default::default() };
+        layout.items.push(rect([160.0, 160.0], [40, 120, 255, 255], target));
+        layout.items.push(rect([520.0, 220.0], [255, 80, 160, 255], follower));
+        layout.items.push(rect([860.0, 160.0], [60, 200, 120, 255], Default::default()));
+        layout.layout_tabs = vec!["Aim".into(), "Move".into(), "Menu".into()];
+        layout.selected_item = Some(1);
+        layout.selected_items = vec![1];
+        let mut shot = crate::canvas::shot::Shot::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 420.0));
+        let mut shapes = Vec::new();
+        for t in 0..10 {
+            let raw = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 30.0), ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(30, 34, 40))).show(ctx, |ui| {
+                    let panic = crate::app::PanicShortcut::default();
+                    crate::canvas::overlay_body::show_overlay_body(
+                        ui, screen, &mut snarl, &mut layout, true, &Default::default(), &panic,
+                    );
+                    let mut exit = false;
+                    overlay_edit_toolbar(ui, screen, &mut snarl, &mut layout, &mut exit);
+                });
+            });
+            shot.absorb(&out.textures_delta);
+            shapes = out.shapes;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots/overlay_tabs.png");
+        shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+        println!("{}", path.display());
+    }
 }

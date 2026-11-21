@@ -364,5 +364,26 @@ fn relayout_text(text: &mut epaint::TextShape, fonts: &mut epaint::text::FontsVi
         }
     }
     galley.pixels_per_point = pixels_per_point;
+    // Text already scaled on its way here - drawn under `Ui::with_visual_transform`, as a
+    // layout being edited draws its pinned widgets - keeps that scale: the fresh layout is
+    // the job's own size, and replacing the old with it drew the text unscaled, too big for
+    // a widget pinned smaller than its design (its words ran out of their buttons).
+    // Only a scale well past what rounding the rows to a finer pixel grid makes of the same
+    // text (a percent or two): taken for a scale, that moved text that wasn't scaled at all.
+    let scale = if galley.rect.height() > 1e-3 { old.rect.height() / galley.rect.height() } else { 1.0 };
+    let galley = if scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() > 0.04 {
+        scale_galley(galley, scale)
+    } else {
+        galley
+    };
     text.galley = std::sync::Arc::new(galley);
+}
+
+/// FLEXINPUT PATCH: a galley scaled about its origin by `s`, by epaint's own
+/// `TextShape::transform` (its rects, its rows and their glyphs' vertices), for
+/// [`relayout_text`] to carry a scale the text already had.
+fn scale_galley(galley: epaint::Galley, s: f32) -> epaint::Galley {
+    let mut shape = epaint::TextShape::new(emath::Pos2::ZERO, std::sync::Arc::new(galley), epaint::Color32::PLACEHOLDER);
+    shape.transform(TSTransform::from_scaling(s));
+    std::sync::Arc::unwrap_or_clone(shape.galley)
 }

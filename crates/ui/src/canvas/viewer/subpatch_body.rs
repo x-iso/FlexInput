@@ -53,6 +53,11 @@ pub(crate) fn show_inlet_outlet_body(node_id: NodeId, ui: &mut egui::Ui, snarl: 
 /// dashed selection outline + corner resize handle and the underlying widget
 /// is disabled so the user can drag/resize without accidentally operating it.
 /// In Lock mode the widget is fully interactive and no chrome is drawn.
+/// A sub-patch's layout: its pins and decorations, editable while it's unlocked. With two
+/// tabs or more the layout sits beneath a row of them across its top - drawn here when
+/// `own_tab_row`, or by a caller that puts the row somewhere of its own (Easy mode, above
+/// the scrolled layout).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_subpatch_body(
     outer_id: NodeId,
     ui: &mut egui::Ui,
@@ -60,6 +65,7 @@ pub(crate) fn show_subpatch_body(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     panic_shortcut: &crate::app::PanicShortcut,
     automap_parent: Option<&AutomapGlowParent<'_>>,
+    own_tab_row: bool,
 ) -> bool {
     // ── One-time legacy migrations ──────────────────────────────────────────
     if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
@@ -143,6 +149,22 @@ pub(crate) fn show_subpatch_body(
         .and_then(|n| n.subpatch.as_ref())
         .map(|sp| sp.items.clone())
         .unwrap_or_default();
+    // The layout's tabs: what's on another tab than the one showing isn't drawn, picked or
+    // caught on (`shown`). With two or more, the layout sits beneath their row.
+    let (layout_tabs, active_tab): (Vec<String>, usize) = snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .map(|sp| (sp.layout_tabs.clone(), sp.active_tab))
+        .unwrap_or_default();
+    let shown = shown_items(&items, active_tab, layout_tabs.len());
+    let row_h = if own_tab_row { tab_row_h(layout_tabs.len()) } else { 0.0 };
+    if is_unlocked {
+        if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            sp.selected_items.retain(|&i| shown.get(i).copied().unwrap_or(false));
+            if sp.selected_item.is_some_and(|i| !shown.get(i).copied().unwrap_or(false)) {
+                sp.selected_item = sp.selected_items.last().copied();
+            }
+        }
+    }
 
     // Snapshot the outer snarl for pin renderers that walk the
     // AutomapGlowParent chain (device resolution, live dots, the Special-picker
@@ -190,13 +212,18 @@ pub(crate) fn show_subpatch_body(
     }
     let body_w = (bbox_max[0] + PAD).max(120.0);
     let body_h = (bbox_max[1] + PAD).max(40.0);
-    let (body_rect, _) = ui.allocate_exact_size(egui::vec2(body_w, body_h), egui::Sense::hover());
+    let (whole_rect, _) = ui.allocate_exact_size(egui::vec2(body_w, row_h + body_h), egui::Sense::hover());
+    // The tabs' row across the top, the layout beneath it.
+    let row_rect = egui::Rect::from_min_size(whole_rect.min, egui::vec2(body_w, row_h));
+    let body_rect = egui::Rect::from_min_max(egui::pos2(whole_rect.min.x, row_rect.max.y), whole_rect.max);
     let origin = body_rect.min;
 
-    // Layout mode: faint snap grid for visual feedback. Drawn under widgets.
-    if is_unlocked && snap_enabled && snap_grid >= 2.0 {
+    // Layout mode: a faint snap grid while an object is moved, under the objects.
+    let grid_id = egui::Id::new(("li_grid", outer_id.0));
+    let grid_t = if is_unlocked { layout_grid_t(ui.ctx(), grid_id) } else { 0.0 };
+    if grid_t > 0.0 && snap_enabled && snap_grid >= 2.0 {
         let painter = ui.painter().with_clip_rect(body_rect);
-        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, 28));
+        let stroke = egui::Stroke::new(0.5_f32, egui::Color32::from_rgba_unmultiplied(150, 200, 255, (34.0 * grid_t) as u8));
         let mut x = 0.0f32;
         while x <= body_w {
             painter.line_segment(
@@ -221,6 +248,13 @@ pub(crate) fn show_subpatch_body(
     let mut new_pos:  Vec<Option<[f32; 2]>> = vec![None; items.len()];
     let mut new_size: Vec<Option<[f32; 2]>> = vec![None; items.len()];
     let mut new_line: Vec<Option<([f32;2],[f32;2])>> = vec![None; items.len()];
+    // A gradient edited on its object this frame (`gradient_handles`), and the selected
+    // object's gradient to put handles on once every object is drawn.
+    let mut new_gradient: Option<(usize, crate::canvas::node::Gradient)> = None;
+    let mut gradient_on: Option<(usize, egui::Rect, crate::canvas::node::Gradient)> = None;
+    // The pointer was on a gradient handle last frame: a press there is the handle's.
+    let grad_hot_key = egui::Id::new(("li_grad_hot", outer_id.0));
+    let grad_hot: bool = ui.ctx().data(|d| d.get_temp(grad_hot_key)).unwrap_or(false);
     let mut zaction: Option<(usize, &'static str)> = None;
     let mut delete_idx: Option<usize> = None;
     let mut stale_remove: Option<usize> = None;
@@ -246,6 +280,8 @@ pub(crate) fn show_subpatch_body(
     let drag_size_id = |i: usize| egui::Id::new(("li_drag_size", outer_id.0, i));
     let drag_a_id    = |i: usize| egui::Id::new(("li_drag_la",   outer_id.0, i));
     let drag_b_id    = |i: usize| egui::Id::new(("li_drag_lb",   outer_id.0, i));
+    // Where a resized object stood as the resize began: Alt resizes it about its centre.
+    let drag_rpos_id = |i: usize| egui::Id::new(("li_drag_rpos", outer_id.0, i));
 
     // ── Render pass (paint widgets / decorations in z-order) ────────────────
     // All items render disabled in Layout mode (clicks fall through to the
@@ -268,7 +304,22 @@ pub(crate) fn show_subpatch_body(
     let pick_here = overlay_pick_active(ui.ctx())
         && automap_parent.is_none()
         && !is_unlocked;
+    // Editing, every object is drawn as it will look, and the ones under the pointer ease
+    // see-through, so whatever they cover shows (`layout_hover_opacity`).
+    let hover_local = is_unlocked
+        .then(|| layout_pointer_local(ui, body_rect))
+        .flatten()
+        .map(|p| [p.x - origin.x, p.y - origin.y]);
     for (idx, it) in items.iter().enumerate() {
+        if !shown[idx] {
+            continue;
+        }
+        let opacity = if is_unlocked {
+            layout_hover_opacity(ui.ctx(), egui::Id::new(("li_hover_fade", outer_id.0, idx)),
+                hover_local.is_some_and(|p| it.hit_test(p)))
+        } else {
+            1.0
+        };
         match it {
             LayoutItem::Module(m) => {
                 let (mid, _disp, exists) = &infos[idx];
@@ -283,6 +334,7 @@ pub(crate) fn show_subpatch_body(
                 let iv_style_ov = m.iv_style_override.clone();
                 let menu_style_ov = m.menu_style_override;
                 let pin_style = m.pin_style.unwrap_or(1);
+                let zoom = m.zoom.unwrap_or(1.0);
                 let outer_snap_ref = outer_snapshot.as_ref();
                 let prev_suppressed = ui.ctx().data(|d| {
                     d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
@@ -297,13 +349,17 @@ pub(crate) fn show_subpatch_body(
                     // the same inner module don't collide on their per-mapping
                     // widget IDs (DragValue, Button, etc.).
                     ui.push_id(("fxi_layout_pin", idx), |ui| {
+                        // Not dimmed for being out of reach while it's edited: drawn whole,
+                        // see-through only under the pointer.
+                        ui.visuals_mut().disabled_alpha = 1.0;
+                        ui.multiply_opacity(opacity);
                         ui.add_enabled_ui(!is_unlocked, |ui| {
                             if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
                                 render_pinned_element(
                                     inner_id, &module_id, &element_id, ui, &mut sp.snarl,
                                     mod_size, live_signals, panic_shortcut, automap_parent,
                                     outer_snap_ref, outer_id, is_unlocked, graph_ov, iv_style_ov,
-                                    menu_style_ov, pin_style,
+                                    menu_style_ov, pin_style, zoom,
                                 );
                             }
                         });
@@ -335,8 +391,19 @@ pub(crate) fn show_subpatch_body(
                 }
             }
             LayoutItem::Deco(d) => {
-                let painter = ui.painter().with_clip_rect(body_rect);
+                let mut painter = ui.painter().with_clip_rect(body_rect);
+                painter.multiply_opacity(opacity);
                 paint_decoration(&painter, origin, d);
+            }
+        }
+    }
+    // The tabs' row, over what's drawn: a click shows a tab; editing, tabs are renamed, added
+    // and taken off on it.
+    if row_h > 0.0 {
+        let act = tab_row(ui, row_rect, &layout_tabs, active_tab, is_unlocked, ui.id().with(("li_tab_row", outer_id.0)));
+        if act.any() {
+            if let Some(sp) = snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+                act.apply(&mut sp.layout_tabs, &mut sp.items, &mut sp.active_tab, &mut sp.selected_item, &mut sp.selected_items);
             }
         }
     }
@@ -391,7 +458,8 @@ pub(crate) fn show_subpatch_body(
     // otherwise alias onto. `body_rect.contains` alone is insufficient because
     // it spans the whole (unscrolled) body, not just the visible window.
     let visible_rect = ui.clip_rect();
-    let in_view = |p: egui::Pos2| body_rect.contains(p) && visible_rect.contains(p);
+    // Not the tabs' row: that's its own, and a press on it is no press on the layout.
+    let in_view = |p: egui::Pos2| body_rect.contains(p) && visible_rect.contains(p) && !row_rect.contains(p);
     let primary_down   = ui.ctx().input(|i| i.pointer.primary_down());
     let secondary_down = ui.ctx().input(|i| i.pointer.secondary_down());
     let prev: Option<PressState> = ui.ctx().data(|d| d.get_temp(press_state_key));
@@ -422,13 +490,13 @@ pub(crate) fn show_subpatch_body(
     // "ignore" so the release doesn't trigger background-click logic.
     if primary_down && !primary_was_down {
         if let Some(p) = pointer_local {
-            if in_view(p) && !pointer_on_higher_layer {
+            if in_view(p) && !pointer_on_higher_layer && !grad_hot {
                 let local = [p.x - origin.x, p.y - origin.y];
                 ui.ctx().data_mut(|d| d.insert_temp(press_state_key, (local, true, false)));
                 // Begin a marquee when Shift is held and the press landed in
                 // empty space (no item under the cursor).
                 if shift_held {
-                    let on_item = items.iter().any(|it| it.hit_test(local));
+                    let on_item = items.iter().enumerate().any(|(i, it)| shown[i] && it.hit_test(local));
                     if !on_item {
                         ui.ctx().data_mut(|d| d.insert_temp(marquee_key, local));
                     }
@@ -463,7 +531,7 @@ pub(crate) fn show_subpatch_body(
                     let dy = cur_local[1] - start[1];
                     if (dx*dx + dy*dy).sqrt() < 6.0 {
                         let hits: Vec<usize> = items.iter().enumerate().rev()
-                            .filter_map(|(i, it)| it.hit_test(cur_local).then_some(i))
+                            .filter_map(|(i, it)| (shown[i] && it.hit_test(cur_local)).then_some(i))
                             .collect();
                         if hits.is_empty() {
                             click_in_empty = true;
@@ -527,7 +595,7 @@ pub(crate) fn show_subpatch_body(
             let max = [start[0].max(cur[0]), start[1].max(cur[1])];
             let area = (max[0] - min[0]) * (max[1] - min[1]);
             if area >= 16.0 {
-                let picked: Vec<usize> = items.iter().enumerate().filter_map(|(i, it)| {
+                let picked: Vec<usize> = items.iter().enumerate().filter(|(i, _)| shown[*i]).filter_map(|(i, it)| {
                     let (lp, ls) = it.bbox();
                     let i_min = lp;
                     let i_max = [lp[0] + ls[0].max(1.0), lp[1] + ls[1].max(1.0)];
@@ -597,6 +665,9 @@ pub(crate) fn show_subpatch_body(
     // context menu (left-click selection is done manually above).
     let mut hit_responses: Vec<(usize, egui::Response)> = Vec::with_capacity(items.len());
     for (idx, it) in items.iter().enumerate() {
+        if !shown[idx] {
+            continue;
+        }
         let (lp, ls) = it.bbox();
         let mut rect = egui::Rect::from_min_size(
             origin + egui::vec2(lp[0], lp[1]),
@@ -636,10 +707,31 @@ pub(crate) fn show_subpatch_body(
     // item in the commit pass (so they move together).
     let mut multi_drag_delta: Option<[f32; 2]> = None;
     let is_multi = selected_set.len() > 1;
+    // Moving one object, Shift catches its edges on the others' and Ctrl its centre on
+    // theirs, within a few screen points; Alt resizes about the centre, with Shift too
+    // keeping the shape, and Ctrl catches a resize's edges on the others' edges or centres.
+    // The lines a move or a resize caught on are drawn as guides.
+    let object_snap = ObjectSnap::held(ui);
+    let alt_held = ui.input(|i| i.modifiers.alt);
+    let resize_snap = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+    layout_modifier_hint(ui.ctx(), false);
+    let snap_reach = 6.0 / parent_to_global.scaling.max(0.01);
+    // What a moved object catches on: what shows (one on another tab is nowhere).
+    let object_rects: Vec<egui::Rect> = items.iter().enumerate().map(|(i, it)| {
+        if !shown[i] {
+            return egui::Rect::NOTHING;
+        }
+        let (p, s) = it.bbox();
+        egui::Rect::from_min_size(egui::pos2(p[0], p[1]), egui::vec2(s[0], s[1]))
+    }).collect();
+    let mut guides: (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
 
     // Per-item paint pass + drag/resize. Outline = any item in the selection
     // set; resize handle / line endpoints / inspector = the PRIMARY only.
     for (idx, it) in items.iter().enumerate() {
+        if !shown[idx] {
+            continue;
+        }
         let (lp, ls) = it.bbox();
         let rect = egui::Rect::from_min_size(
             origin + egui::vec2(lp[0], lp[1]),
@@ -650,17 +742,22 @@ pub(crate) fn show_subpatch_body(
         // `is_sel` drives the selection outline color: highlight every member.
         let is_sel = in_set || is_primary;
 
-        // Outline.
+        // Outline: the selection's always; any other's only while the pointer is over it,
+        // easing in with its see-through (`layout_hover_t`).
+        let hover_t = layout_hover_t(ui.ctx(), egui::Id::new(("li_hover_fade", outer_id.0, idx)),
+            hover_local.is_some_and(|p| it.hit_test(p)));
         let outline_col = if is_sel {
             egui::Color32::from_rgba_unmultiplied(255, 220, 120, 230)
         } else {
-            egui::Color32::from_rgba_unmultiplied(150, 220, 255, 140)
+            egui::Color32::from_rgba_unmultiplied(150, 220, 255, (140.0 * hover_t) as u8)
         };
-        let stroke = egui::Stroke::new(1.0_f32, outline_col);
-        ui.painter().line_segment([rect.left_top(),     rect.right_top()],    stroke);
-        ui.painter().line_segment([rect.right_top(),    rect.right_bottom()], stroke);
-        ui.painter().line_segment([rect.right_bottom(), rect.left_bottom()],  stroke);
-        ui.painter().line_segment([rect.left_bottom(),  rect.left_top()],     stroke);
+        if outline_col.a() > 0 {
+            let stroke = egui::Stroke::new(1.0_f32, outline_col);
+            ui.painter().line_segment([rect.left_top(),     rect.right_top()],    stroke);
+            ui.painter().line_segment([rect.right_top(),    rect.right_bottom()], stroke);
+            ui.painter().line_segment([rect.right_bottom(), rect.left_bottom()],  stroke);
+            ui.painter().line_segment([rect.left_bottom(),  rect.left_top()],     stroke);
+        }
 
         let menu_header = match it {
             LayoutItem::Module(m) => {
@@ -686,7 +783,7 @@ pub(crate) fn show_subpatch_body(
             let handle_col = if is_sel {
                 outline_col
             } else {
-                egui::Color32::from_rgba_unmultiplied(outline_col.r(), outline_col.g(), outline_col.b(), 60)
+                egui::Color32::from_rgba_unmultiplied(outline_col.r(), outline_col.g(), outline_col.b(), (60.0 * hover_t) as u8)
             };
             ui.painter().rect_filled(ha_rect, 1.0, handle_col);
             ui.painter().rect_filled(hb_rect, 1.0, handle_col);
@@ -763,8 +860,18 @@ pub(crate) fn show_subpatch_body(
                         ]);
                     } else {
                         ui.ctx().data_mut(|d| d.insert_temp(drag_pos_id(idx), [prev[0], prev[1], prev[2]+dd.x, prev[3]+dd.y]));
-                        let tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
-                        let ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
+                        let mut tx = snap(prev[0] + prev[2] + dd.x).max(0.0);
+                        let mut ty = snap(prev[1] + prev[3] + dd.y).max(0.0);
+                        if let Some(mode) = object_snap {
+                            let moving = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(ls[0], ls[1]));
+                            let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+                                .filter(|(j, _)| *j != idx).map(|(_, r)| *r).collect();
+                            let (off, gx, gy) = snap_to_objects(moving, &others, mode, snap_reach);
+                            tx = (tx + off.x).max(0.0);
+                            ty = (ty + off.y).max(0.0);
+                            guides.0.extend(gx);
+                            guides.1.extend(gy);
+                        }
                         new_pos[idx] = Some([tx, ty]);
                     }
                 }
@@ -799,7 +906,10 @@ pub(crate) fn show_subpatch_body(
                     );
                 }
                 if h_resp.drag_started() {
-                    ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [ls[0], ls[1], 0.0f32, 0.0f32]));
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(drag_size_id(idx), [ls[0], ls[1], 0.0f32, 0.0f32]);
+                        d.insert_temp(drag_rpos_id(idx), [lp[0], lp[1]]);
+                    });
                 }
                 if h_resp.dragged_by(egui::PointerButton::Primary) {
                     let prev = ui.ctx().data(|d| d.get_temp::<[f32;4]>(drag_size_id(idx))).unwrap_or([ls[0],ls[1],0.0,0.0]);
@@ -811,15 +921,45 @@ pub(crate) fn show_subpatch_body(
                         if ax.abs() * (1.0 / aspect) > ay.abs() { ay = ax / aspect; } else { ax = ay * aspect; }
                     }
                     ui.ctx().data_mut(|d| d.insert_temp(drag_size_id(idx), [prev[0], prev[1], ax, ay]));
-                    let tw = snap(prev[0] + ax).max(MIN_W.min(8.0));
-                    let th = snap(prev[1] + ay).max(MIN_H.min(8.0));
+                    // About the centre the corner's move is half the growth.
+                    let grow = if alt_held { 2.0 } else { 1.0 };
+                    let tw = snap(prev[0] + grow * ax).max(MIN_W.min(8.0));
+                    let th = snap(prev[1] + grow * ay).max(MIN_H.min(8.0));
                     let (tw, th) = clamp_pin_frame_to_content(ui, outer_id, it, tw, th);
                     new_size[idx] = Some([tw, th]);
+                    // Where it began, or that far round its centre; let go of Alt and it
+                    // grows from where it began again.
+                    let p0 = ui.ctx().data(|d| d.get_temp::<[f32; 2]>(drag_rpos_id(idx))).unwrap_or([lp[0], lp[1]]);
+                    let at = if alt_held {
+                        [(p0[0] - (tw - prev[0]) * 0.5).max(0.0), (p0[1] - (th - prev[1]) * 0.5).max(0.0)]
+                    } else {
+                        p0
+                    };
+                    new_pos[idx] = Some(at);
+                    if resize_snap {
+                        let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+                            .filter(|(j, _)| *j != idx).map(|(_, r)| *r).collect();
+                        let aspect = shift_held.then(|| prev[0] / prev[1].max(1.0));
+                        let (at, size, gx, gy) = snap_resize_to_objects(at, [tw, th], &others, snap_reach, alt_held, aspect);
+                        let (sw, sh) = clamp_pin_frame_to_content(
+                            ui, outer_id, it, size[0].max(MIN_W.min(8.0)), size[1].max(MIN_H.min(8.0)));
+                        new_size[idx] = Some([sw, sh]);
+                        new_pos[idx] = Some([at[0].max(0.0), at[1].max(0.0)]);
+                        guides.0.extend(gx);
+                        guides.1.extend(gy);
+                    }
                 }
-            } else {
-                // Ghost handle for discoverability — paint only.
-                let ghost = egui::Color32::from_rgba_unmultiplied(150, 220, 255, 40);
+            } else if hover_t > 0.0 {
+                // Ghost handle for discoverability, with the outline - paint only.
+                let ghost = egui::Color32::from_rgba_unmultiplied(150, 220, 255, (40.0 * hover_t) as u8);
                 ui.painter().rect_filled(handle_rect, 2.0, ghost);
+            }
+            // The selected object's gradient: its handles go on after every object.
+            if is_primary && !is_multi {
+                if let Some(g) = item_gradient(it) {
+                    let at = egui::Rect::from_min_size(origin + egui::vec2(lp[0], lp[1]), egui::vec2(ls[0], ls[1]));
+                    gradient_on = Some((idx, at, g.clone()));
+                }
             }
         }
 
@@ -854,6 +994,32 @@ pub(crate) fn show_subpatch_body(
             });
         }
     }
+
+    paint_snap_guides(&ui.painter().with_clip_rect(body_rect), origin, body_rect, &guides.0, &guides.1);
+    if is_unlocked {
+        let moving = multi_drag_delta.is_some()
+            || new_pos.iter().any(Option::is_some)
+            || new_size.iter().any(Option::is_some)
+            || new_line.iter().any(Option::is_some);
+        layout_set_moving(ui.ctx(), grid_id, moving);
+    }
+
+    // The selected object's gradient handles, after every object: one drawn above it would
+    // otherwise take the pointer from them.
+    let mut on_handle = false;
+    if let Some((idx, at, g)) = gradient_on {
+        let others: Vec<egui::Rect> = object_rects.iter().enumerate()
+            .filter(|(j, _)| *j != idx)
+            .map(|(_, r)| r.translate(origin.to_vec2()))
+            .collect();
+        let snap = object_snap.map(|mode| HandleSnap { mode, reach: snap_reach, others: &others });
+        let (edited, hot) = gradient_handles(ui, at, &g, egui::Id::new(("li_gradient", outer_id.0, idx)), snap);
+        on_handle = hot;
+        if let Some(edited) = edited {
+            new_gradient = Some((idx, edited));
+        }
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(grad_hot_key, on_handle));
 
     // Read the style clipboard BEFORE the mutable `sp` borrow below so the
     // paste-style path can apply it without re-borrowing ctx data mid-borrow.
@@ -890,6 +1056,11 @@ pub(crate) fn show_subpatch_body(
                         },
                     }
                 }
+            }
+        }
+        if let Some((i, g)) = new_gradient.take() {
+            if let Some(it) = sp.items.get_mut(i) {
+                set_item_gradient(it, g);
             }
         }
         let n_items = sp.items.len();

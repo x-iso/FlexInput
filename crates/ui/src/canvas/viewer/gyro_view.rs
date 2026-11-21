@@ -301,21 +301,45 @@ pub(crate) fn draw_gyro_view(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, 
     let now = ui.input(|i| i.time);
     let mut trace: EdgeTrace = ui.ctx().data(|d| d.get_temp(key)).unwrap_or_default();
     let h = heading_of(v.pose.unwrap_or(glam::Quat::IDENTITY), &v.proj);
+    // Orient's Edge turn goes by the nose as the pad is drawn (the view), as the engine's does.
+    let orient_view = v.view.filter(|_| v.proj.axis == "orient" && v.pose.is_some());
     // A computed pose turns by the 3D rot x, so Edge turn divides it back out of the pose and
-    // its own turn is drawn turned by it; a device's own pose is physical.
-    let scale = if v.proj.physical { 1.0 } else { v.orient_scale.abs().max(1e-3) };
+    // its own turn is drawn turned by it; a device's own pose is physical, and so is the view.
+    let scale = if v.proj.physical || orient_view.is_some() { 1.0 } else { v.orient_scale.abs().max(1e-3) };
     {
-        let d = edge_deflection(&h, &v.proj, scale);
-        let nose = v.pose.unwrap_or(glam::Quat::IDENTITY) * glam::Vec3::X;
+        let (d, nose) = match orient_view {
+            Some(view) => {
+                let n = view * glam::Vec3::X;
+                let sign = |b: bool| if b { -1.0 } else { 1.0 };
+                let d = glam::Vec2::new(
+                    (-n.y).atan2(n.x).to_degrees() * sign(v.proj.inv[0]),
+                    n.z.clamp(-1.0, 1.0).asin().to_degrees() * sign(v.proj.inv[1]),
+                );
+                (d, n)
+            }
+            None => (edge_deflection(&h, &v.proj, scale), v.pose.unwrap_or(glam::Quat::IDENTITY) * glam::Vec3::X),
+        };
         let past = v.zone.is_some_and(|z| nose.angle_between(glam::Vec3::X).to_degrees() > z);
         trace.step(now, d, past, v.edge.as_ref().filter(|_| v.pose.is_some()));
     }
     // The pointer is where the module has added its outputs up to (`aim`); Edge turn's own
     // turn is the world turning past it (`Output::world`).
     let world = (egui::vec2(trace.offset.x, trace.offset.y) * scale, trace.shown);
-    let (out, base_x) = match v.aim.filter(|_| v.pose.is_some()) {
-        Some(a) => (egui::vec2(a.x, a.y), a.z),
-        None => (egui::vec2(h.out_x, h.out_y), h.base_x),
+    let (out, base_x) = match (v.proj.axis, v.view.filter(|_| v.pose.is_some()), v.aim.filter(|_| v.pose.is_some())) {
+        // Orient: where the nose is from the reference - the pad drawn - its outputs' inverts
+        // turning it round, as they turn the outputs. Its output is a camera following the
+        // nose by its moves, which can part from where the nose points (past straight up,
+        // where it holds its heading back); the picture shows the pad's own relation to the
+        // reference, the one Edge turn goes by.
+        ("orient", Some(view), _) => {
+            let n = view * glam::Vec3::X;
+            let sign = |b: bool| if b { -1.0 } else { 1.0 };
+            let x = (-n.y).atan2(n.x).to_degrees() * sign(v.proj.inv[0]);
+            let y = n.z.clamp(-1.0, 1.0).asin().to_degrees() * sign(v.proj.inv[1]);
+            (egui::vec2(x, y), x)
+        }
+        (_, _, Some(a)) => (egui::vec2(a.x, a.y), a.z),
+        _ => (egui::vec2(h.out_x, h.out_y), h.base_x),
     };
     trace.note(now, out.x, out.y, glam::Vec2::new(world.0.x, world.0.y));
     let trail: Vec<(f32, f32, f32)> =

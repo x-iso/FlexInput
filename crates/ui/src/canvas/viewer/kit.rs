@@ -1091,6 +1091,23 @@ pub(crate) fn header_icon_button(
     resp.clicked()
 }
 
+/// [`header_icon_button`] laid out in the flow rather than at a place: a square the stepper's
+/// height with its drawing, greyed - and saying `disabled_hover` - while it can't be pressed.
+pub(crate) fn icon_button(
+    ui: &mut egui::Ui,
+    glyph: super::glyphs::Glyph,
+    hover: &str,
+    enabled: bool,
+    disabled_hover: &str,
+) -> bool {
+    let h = stepper_h(ui);
+    let resp = ui.add_enabled(enabled, egui::Button::new("").min_size(egui::vec2(h, h)));
+    let resp = if enabled { resp.on_hover_text(hover) } else { resp.on_disabled_hover_text(disabled_hover) };
+    let colour = if enabled { ui.style().interact(&resp).text_color() } else { ui.visuals().weak_text_color() };
+    super::glyphs::paint(ui.painter(), resp.rect.expand(1.0), glyph, colour);
+    resp.clicked()
+}
+
 /// A Response Curve's header controls, right to left: Reset, Load, Save as drawings, then
 /// the `labels` and `grid` switches - narrower than the Envelope's pair, because this header
 /// has three buttons to fit beside them.

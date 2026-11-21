@@ -628,8 +628,7 @@ mod tests {
                     key = Some(super::super::scale::pin_ws_nat_key(pin.ctx(), outer.0, id.0, "scale_row"));
                     super::super::pinned::render_pinned_element(
                         id, "module.response_curve", "scale_row", &mut pin, &mut snarl, frame.size(),
-                        &live, &panic, None, None, outer, true, None, None, None, style,
-                    );
+                        &live, &panic, None, None, outer, true, None, None, None, style, 1.0);
                     if style == 2 {
                         assert!(
                             (pin.min_rect().width() - 296.0).abs() < 0.6,

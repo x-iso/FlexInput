@@ -80,65 +80,9 @@ pub fn show(
             &canvas.snarl, tab_overlay, tab_config);
     }
 
-    // Layout-editing properties panel — directly below the preset bar, only
-    // while 🎨 (layout edit) is active and a sub-patch exists. This mirrors the
-    // controls row at the top of the sub-patch node in Advanced layout mode:
-    // snap toggle + grid step, Add-decoration buttons, and the per-selection
-    // style inspector.
-    if matches!(compat, Compat::Ok) {
-        if let Some(oid) = find_subpatch(canvas) {
-            let unlocked = canvas.snarl.get_node(oid)
-                .map(|n| n.extra.layout_unlocked)
-                .unwrap_or(false);
-            if unlocked {
-                ui.add_space(4.0);
-                // Render the inspector strip into a FOREGROUND-order layer so its
-                // color pickers and buttons always win pointer input over the
-                // sub-patch body, which lives in an Order::Middle Area. Without
-                // this, body widgets that scroll up underneath the inspector
-                // (their interact rects ride a transformed sublayer that the
-                // body clip doesn't bound for hit-testing) sit "in front" of the
-                // Background-layer inspector and silently swallow clicks.
-                //
-                // A layered child UI doesn't advance the parent's cursor, so we
-                // measure the rendered height and reserve it explicitly, keeping
-                // the body below the inspector in the normal flow.
-                let start = ui.cursor().min;
-                let avail_w = ui.available_width();
-                let inspector_layer = egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new(("easy_layout_inspector_layer", oid.0)),
-                );
-                let built = ui.scope_builder(
-                    egui::UiBuilder::new()
-                        .layer_id(inspector_layer)
-                        .max_rect(egui::Rect::from_min_size(
-                            start,
-                            egui::vec2(avail_w, ui.available_height()),
-                        )),
-                    |ui| {
-                        ui.set_width(avail_w);
-                        egui::Frame::group(ui.style())
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                ui.set_width(avail_w - 16.0);
-                                ui.label(egui::RichText::new("Layout editing").small().strong().weak());
-                                egui::ScrollArea::horizontal()
-                                    .id_salt(("easy_layout_controls_scroll", oid.0))
-                                    .show(ui, |ui| {
-                                        crate::canvas::viewer::layout_editing_controls(
-                                            ui, &mut canvas.snarl, oid);
-                                    });
-                            });
-                    },
-                );
-                // Reserve the inspector's footprint in the parent flow so the
-                // body Area below starts beneath it.
-                let used = built.response.rect;
-                ui.allocate_rect(used, egui::Sense::hover());
-            }
-        }
-    }
+    // Layout editing has no panel of its own here: its tools take the preset bar's row
+    // (`show_preset_picker`) and the selection's options are the left panel's Inspector
+    // (`show_layout_inspector`), so turning it on moves nothing below.
 
     ui.add_space(6.0);
     ui.separator();
@@ -249,37 +193,128 @@ fn show_preset_picker(
     let row_rect = ui.available_rect_before_wrap();
     let row_rect = egui::Rect::from_min_size(
         row_rect.min, egui::vec2(row_rect.width(), BAR_ROW_H));
+    // Advance the parent cursor past the row we just claimed.
+    ui.allocate_rect(row_rect, egui::Sense::hover());
+
+    // The two mode buttons sit at the row's far right whatever is in front of them: 🎨
+    // turns layout editing on and off, 🔧 opens the sub-patch editor, or brings it up if it
+    // is open already.
+    let layout_unlocked = outer_id
+        .and_then(|id| canvas.snarl.get_node(id))
+        .map(|n| n.extra.layout_unlocked)
+        .unwrap_or(false);
+    const MODE_BTN: f32 = 28.0;
+    let modes_w = 2.0 * MODE_BTN + 4.0 + 8.0;
+    let modes_rect = egui::Rect::from_min_max(
+        egui::pos2(row_rect.right() - modes_w, row_rect.top()),
+        row_rect.max,
+    );
+    {
+        let mut modes_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(modes_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        let ui = &mut modes_ui;
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.add_space(8.0);
+        if ui.add_sized([MODE_BTN, MODE_BTN],
+            egui::Button::new(egui::RichText::new("🔧").size(crate::settings::ui_size(14.0))))
+            .on_hover_text("Open the sub-patch editor (add/wire modules), or bring it up if it's open")
+            .clicked()
+        {
+            if let Some(oid) = outer_id {
+                // Same mechanism the Advanced canvas uses: stash the request;
+                // `show_subpatch_editors` consumes it next frame, and spawns the
+                // editor window or brings the open one up.
+                canvas.pending_edit_subpatch = Some(oid);
+            }
+        }
+        let palette_btn = egui::Button::selectable(
+            layout_unlocked, egui::RichText::new("🎨").size(crate::settings::ui_size(14.0)));
+        if ui.add_sized([MODE_BTN, MODE_BTN], palette_btn)
+            .on_hover_text(if layout_unlocked {
+                "Layout edit: ON — drag, resize, and select elements.\nClick to lock."
+            } else {
+                "Layout edit: OFF — click to arrange elements on the sub-patch body."
+            })
+            .clicked()
+        {
+            if let Some(oid) = outer_id {
+                if let Some(n) = canvas.snarl.get_node_mut(oid) {
+                    n.extra.layout_unlocked = !layout_unlocked;
+                }
+                // The preset list belongs to the bar the editor's tools replace.
+                ui.ctx().data_mut(|d| d.insert_temp(open_id, false));
+                // (The Easy I/O nodes reflow to the sub-patch's new size on the
+                // next frame via the per-frame reposition in app.rs.)
+            }
+        }
+    }
+
+    let row_rect = egui::Rect::from_min_max(row_rect.min, egui::pos2(modes_rect.left(), row_rect.bottom()));
     let mut row_ui = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(row_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    // Advance the parent cursor past the row we just claimed.
-    ui.allocate_rect(row_rect, egui::Sense::hover());
-    {
+    // Nothing in the row reaches the mode buttons, however narrow the window or large the UI
+    // scale: what doesn't fit gives way first (`fits`), and the rest is cut at their edge.
+    row_ui.set_clip_rect(row_ui.clip_rect().intersect(row_rect));
+    let strong_w = |ui: &egui::Ui, text: &str| {
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::PLACEHOLDER).size().x
+    };
+    // Clamp so the row's content never slides under the Easy-mode left panel's tab (its
+    // right edge is published by app.rs each frame). When the left panel is expanded the
+    // tab sits at the panel seam, left of this row, so the clamp is a no-op; when collapsed
+    // the tab pins to the window top-left over this row and the clamp pushes it right.
+    let devices_label_right: f32 = ui.ctx()
+        .data(|d| d.get_temp(egui::Id::new("easy_devices_label_right_x")).unwrap_or(0.0));
+    let min_pad = (devices_label_right - row_rect.min.x + 8.0).max(0.0);
+    if layout_unlocked {
+        // Layout editing: the editor's own tools in the preset bar's place - snap and its
+        // grid, and the things to add - with the selection's options in the Inspector.
         let ui = &mut row_ui;
-        // Left padding so the cluster is roughly centered.
-        let label_w = 56.0; // "Preset:" label
-        // 🎨 🔧 (layout/edit) + 💾 📂 (save/load) buttons + spacing.
-        let trailing_w = 150.0;
-        // Bar width = whatever fits between label and the trailing
-        // buttons, clamped so it doesn't collapse on narrow windows.
-        let bar_w = (ui.available_width() - label_w - trailing_w - 16.0)
-            .clamp(220.0, 560.0);
-        let mut pad = ((ui.available_width() - label_w - bar_w - trailing_w - 16.0) * 0.5)
-            .max(0.0);
-        // Clamp so the "Preset:" cluster never slides under the Easy-mode
-        // "Devices" tab (its right edge is published by app.rs each frame). When
-        // the left panel is expanded the tab sits at the panel seam, left of this
-        // row, so the clamp is a no-op; when collapsed the tab pins to the window
-        // top-left over this row and the clamp pushes "Preset:" right to clear it.
-        let devices_label_right: f32 = ui.ctx()
-            .data(|d| d.get_temp(egui::Id::new("easy_devices_label_right_x")).unwrap_or(0.0));
-        let min_pad = (devices_label_right - row_rect.min.x + 8.0).max(0.0);
-        pad = pad.max(min_pad);
+        bar_rect_out = None;
+        ui.add_space(min_pad);
+        // The title only where the tools still fit beside it (six squares, the grid's pill, the
+        // tab picker and the rules between them).
+        const TOOLS_W: f32 = 6.0 * 28.0 + 104.0 + 150.0 + 36.0;
+        let title_w = strong_w(ui, "Layout editor");
+        if ui.available_width() >= title_w + 8.0 + TOOLS_W {
+            ui.label(egui::RichText::new("Layout editor").strong());
+            ui.add_space(8.0);
+        }
+        if let Some(sp) = outer_id
+            .and_then(|id| canvas.snarl.get_node_mut(id))
+            .and_then(|n| n.subpatch.as_mut())
+        {
+            crate::canvas::viewer::layout_toolbar_controls_core(
+                ui, &mut crate::canvas::viewer::LayoutStateMut::of_subpatch(sp));
+        }
+    } else {
+        let ui = &mut row_ui;
+        // The Save and Load buttons and the space before them.
+        let trailing_w = 2.0 * MODE_BTN + 4.0 + 10.0;
+        // What the row has past the left panel's tab. The bar takes what's left of it after
+        // its label and the buttons - up to 560, down to 220 while that leaves room, then
+        // narrower still; and when even a 160-point bar wouldn't fit beside the label, the
+        // label gives way. They collided once the UI was scaled up: the bar never went under
+        // 220 and the label was taken to be 56 points whatever its size.
+        let room = (ui.available_width() - min_pad).max(0.0);
+        let label_w = strong_w(ui, "Preset:") + ui.spacing().item_spacing.x;
+        let show_label = room >= label_w + 160.0 + trailing_w + 16.0;
+        let label_w = if show_label { label_w } else { 0.0 };
+        let fit = room - label_w - trailing_w - 16.0;
+        let bar_w = if fit >= 220.0 { fit.min(560.0) } else { fit.max(60.0) };
+        // The cluster in the middle of what's left, never under the tab.
+        let pad = ((room - label_w - bar_w - trailing_w - 16.0) * 0.5).max(0.0) + min_pad;
         ui.add_space(pad);
 
-        ui.label(egui::RichText::new("Preset:").strong());
+        if show_label {
+            ui.label(egui::RichText::new("Preset:").strong());
+        }
 
         // Edit-in-place state for the bar's name slot. When `editing`
         // is true, `preset_dropdown_bar` renders a TextEdit inside
@@ -323,11 +358,7 @@ fn show_preset_picker(
                     // Update BOTH the outer node's display_name (shown
                     // in the Advanced-mode canvas header) AND the
                     // inner UiSubPatch.display_name (used as the
-                    // default filename when saving a .fxsp). Saving
-                    // from the sub-patch editor will then write a file
-                    // named after the preset title, so the next time
-                    // it appears in the preset list it uses the same
-                    // name.
+                    // default filename when saving a .fxsp).
                     n.display_name = trimmed.clone();
                     if let Some(sp) = n.subpatch.as_mut() {
                         sp.display_name = trimmed.clone();
@@ -345,15 +376,15 @@ fn show_preset_picker(
             });
         }
 
-        // ── Save (💾) + Load (📂) buttons ───────────────────────────
-        // Save/Load come FIRST (left), with the layout-edit/patch-edit
-        // pair after them (right), separated by a small gap.
+        // ── Save + Load: drawings on square buttons, as every Save and Load is ──
         ui.add_space(10.0);
-        if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("💾").size(crate::settings::ui_size(14.0))))
-            .on_hover_text("Save sub-patch to .fxsp")
-            .clicked()
-        {
+        let icon = |ui: &mut egui::Ui, glyph: crate::canvas::viewer::glyphs::Glyph, hover: &str| -> bool {
+            let resp = ui.add_sized([MODE_BTN, MODE_BTN], egui::Button::new("")).on_hover_text(hover);
+            let colour = ui.style().interact(&resp).text_color();
+            crate::canvas::viewer::glyphs::paint(ui.painter(), resp.rect.shrink(3.0), glyph, colour);
+            resp.clicked()
+        };
+        if icon(ui, crate::canvas::viewer::glyphs::Glyph::Save, "Save sub-patch to .fxsp") {
             if let Some(oid) = outer_id {
                 // Bake THIS tab's overlay/config items for this sub-patch (pins
                 // and their decorations) into the saved copy — the tab overlays
@@ -370,55 +401,9 @@ fn show_preset_picker(
                 }
             }
         }
-        if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("📂").size(crate::settings::ui_size(14.0))))
-            .on_hover_text("Load sub-patch from .fxsp")
-            .clicked()
-        {
+        if icon(ui, crate::canvas::viewer::glyphs::Glyph::Load, "Load sub-patch from .fxsp") {
             if let Some(loaded) = crate::app::load_subpatch_file() {
                 apply_subpatch_inline(canvas, easy_state, &loaded, None);
-            }
-        }
-
-        // ── Layout-edit (🎨) + Edit (🔧) buttons ────────────────────
-        // Separated slightly from Save/Load. 🎨 toggles the sub-patch's
-        // layout-unlocked state (drag/resize/select decorations in
-        // place); 🔧 opens the full Advanced sub-patch editor window.
-        ui.add_space(10.0);
-        let layout_unlocked = outer_id
-            .and_then(|id| canvas.snarl.get_node(id))
-            .map(|n| n.extra.layout_unlocked)
-            .unwrap_or(false);
-        let palette_btn = egui::Button::selectable(
-            layout_unlocked, egui::RichText::new("🎨").size(crate::settings::ui_size(14.0)));
-        if ui.add_sized([28.0, 28.0], palette_btn)
-            .on_hover_text(if layout_unlocked {
-                "Layout edit: ON — drag, resize, and select elements.\nClick to lock."
-            } else {
-                "Layout edit: OFF — click to arrange elements on the sub-patch body."
-            })
-            .clicked()
-        {
-            if let Some(oid) = outer_id {
-                if let Some(n) = canvas.snarl.get_node_mut(oid) {
-                    n.extra.layout_unlocked = !layout_unlocked;
-                }
-                // (The Easy I/O nodes reflow to the sub-patch's new size on the
-                // next frame via the per-frame reposition in app.rs, which reads
-                // the freshly-measured rects — including after a Layout-editor
-                // resize, so no explicit call is needed here.)
-            }
-        }
-        if ui.add_sized([28.0, 28.0],
-            egui::Button::new(egui::RichText::new("🔧").size(crate::settings::ui_size(14.0))))
-            .on_hover_text("Open the sub-patch editor (add/wire modules)")
-            .clicked()
-        {
-            if let Some(oid) = outer_id {
-                // Same mechanism the Advanced canvas uses: stash the
-                // request; `show_subpatch_editors` consumes it next
-                // frame and spawns the editor viewport window.
-                canvas.pending_edit_subpatch = Some(oid);
             }
         }
     }
@@ -1269,6 +1254,40 @@ fn find_subpatch(canvas: &Canvas) -> Option<NodeId> {
         .map(|(id, _)| id)
 }
 
+/// The Easy sub-patch whose layout is being edited, if it is.
+pub(crate) fn layout_editing_subpatch(canvas: &Canvas) -> Option<NodeId> {
+    find_subpatch(canvas)
+        .filter(|&id| canvas.snarl.get_node(id).is_some_and(|n| n.extra.layout_unlocked))
+}
+
+/// The Easy left panel while the layout is being edited: the Inspector, in the Devices
+/// panel's place - where the selected object sits and how big it is, and its options.
+pub(crate) fn show_layout_inspector(ui: &mut egui::Ui, canvas: &mut Canvas, oid: NodeId) {
+    egui::ScrollArea::vertical()
+        .id_salt(("easy_layout_inspector", oid.0))
+        .auto_shrink([false; 2])
+        .show(ui, |ui| {
+            ui.add_space(44.0);
+            let sel_module = crate::canvas::viewer::subpatch_selected_module_info(&canvas.snarl, oid);
+            let Some(sp) = canvas.snarl.get_node_mut(oid).and_then(|n| n.subpatch.as_mut()) else { return };
+            let Some(idx) = sp.selected_item.filter(|&i| i < sp.items.len()) else {
+                ui.label(egui::RichText::new("Select an object on the layout to see its options here.").weak());
+                return;
+            };
+            // A pin is named for the module it shows, and which part of it.
+            let title = match &sp.items[idx] {
+                crate::canvas::node::LayoutItem::Module(m) => {
+                    let part = m.element_id.replace('_', " ");
+                    let module = sp.snarl.get_node(NodeId(m.inner_node_id)).map(|n| n.display_name.clone()).unwrap_or_default();
+                    Some(if module.is_empty() { part } else { format!("{module} · {part}") })
+                }
+                crate::canvas::node::LayoutItem::Deco(_) => None,
+            };
+            crate::canvas::viewer::layout_inspector(
+                ui, &mut crate::canvas::viewer::LayoutStateMut::of_subpatch(sp), sel_module, title.as_deref(), None);
+        });
+}
+
 // ── Sub-patch body render ───────────────────────────────────────────
 
 /// The `Area` layer the Easy sub-patch body of `outer_id` renders in. Every nav
@@ -1317,6 +1336,26 @@ fn render_subpatch_body(
             ((mx + PAD).max(120.0), (my + PAD).max(40.0))
         })
         .unwrap_or((120.0, 40.0));
+
+    // With two tabs or more, their row across the top of the panel - staying put as the layout
+    // scrolls, and not scaled with it - and the layout beneath.
+    let (row_tabs, row_active, row_edit) = canvas.snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref().map(|sp| (sp.layout_tabs.clone(), sp.active_tab, n.extra.layout_unlocked)))
+        .unwrap_or_default();
+    if row_tabs.len() >= 2 {
+        let (row_rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), crate::canvas::viewer::TAB_ROW_H),
+            egui::Sense::hover(),
+        );
+        let act = crate::canvas::viewer::tab_row(
+            ui, row_rect, &row_tabs, row_active, row_edit, egui::Id::new(("easy_tab_row", outer_id.0)),
+        );
+        if act.any() {
+            if let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+                act.apply(&mut sp.layout_tabs, &mut sp.items, &mut sp.active_tab, &mut sp.selected_item, &mut sp.selected_items);
+            }
+        }
+    }
 
     let panel_rect = ui.available_rect_before_wrap();
     let panel_w = panel_rect.width().max(40.0);
@@ -1372,7 +1411,9 @@ fn render_subpatch_body(
                 d.get_temp(egui::Id::new("gp_nav_owns_selection")));
             stamp == Some(cur_pass)
         };
-        if nav_owns {
+        // Not while the mouse or a trackpad has the layout: following the pad's selection
+        // fought every scroll of the wheel back to it.
+        if nav_owns && !crate::widgets::pointer_owns(ui.ctx()) {
             // What to keep in view, in screen-Y post-scale, pre-scroll offset —
             // the space whose visible window is [scroll_y, scroll_y + panel_h].
             // Inside the selected widget it's the focus there (a card, a field),
@@ -1492,6 +1533,7 @@ fn render_subpatch_body(
                 live_signals,
                 panic_shortcut,
                 None,
+                false,
             );
 
             // Custom scrollbar painted into the Area's parent layer
@@ -1569,10 +1611,17 @@ fn render_subpatch_body(
             xform * egui::Rect::from_min_size(
                 egui::pos2(lp[0], lp[1]), egui::vec2(ls[0].max(1.0), ls[1].max(1.0)))
         });
+    // On a module pinned whole, the pad is on one of its stops - a field, a graph - and that
+    // is what's ringed, as a widget pinned on its own would be.
+    let stop_rect = canvas.snarl.get_node(outer_id)
+        .and_then(|n| n.subpatch.as_ref())
+        .and_then(|sp| selected.and_then(|i| sp.items.get(i)))
+        .and_then(|it| match it { crate::canvas::node::LayoutItem::Module(m) => Some(m.inner_node_id), _ => None })
+        .and_then(|inner| crate::canvas::viewer::module_part_focus_rect(ui.ctx(), inner));
     let glow: Option<(u64, bool)> =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("gp_nav_glow", outer_id.0))));
     if let Some((pass, editing)) = glow {
-        if let (true, Some(rect)) = (pass == cur_pass, selected_rect) {
+        if let (true, Some(rect)) = (pass == cur_pass, stop_rect.or(selected_rect)) {
             let accent = ui.visuals().selection.stroke.color;
             let [r, g, b, _] = accent.to_array();
             let base_round = 6.0_f32;
@@ -1620,7 +1669,8 @@ fn render_subpatch_body(
     // field had scrolled out of the panel.
     crate::app::draw_requested_card_glow(ui.ctx(), outer_id, area_layer, panel_rect);
     if let Some(item) = selected_rect {
-        crate::app::draw_requested_field_hud(ui.ctx(), outer_id, item, area_layer, panel_rect);
+        // On a module pinned whole, the field's label goes over the stop it's on.
+        crate::app::draw_requested_field_hud(ui.ctx(), outer_id, stop_rect.unwrap_or(item), area_layer, panel_rect);
     }
 
     // Where the focus inside the selected widget is, body-local, for next pass's
@@ -1628,6 +1678,7 @@ fn render_subpatch_body(
     // this pass's transform maps it back.
     let focus = crate::app::nav_card_focus_rect(ui.ctx(), outer_id)
         .or_else(|| crate::app::nav_field_focus_rect(ui.ctx(), outer_id))
+        .or(stop_rect)
         .map(|g| xform.inverse() * g)
         .filter(|r| r.is_finite());
     ui.ctx().data_mut(|d| match (focus, selected) {
@@ -2105,6 +2156,28 @@ mod nav_scroll_tests {
             "came to rest at {rest}, not showing the widget ({top}..{bot}) whole");
     }
 
+    /// Once the mouse or a trackpad is used, the pad's selection stops pulling the body back
+    /// to it and its highlight fades - the wheel used to be dragged back every frame - until
+    /// the pad picks or moves something again.
+    #[test]
+    fn the_pointer_has_the_layout_until_the_pad_moves_again() {
+        let mut r = Rig::with_pins(3, &[(60.0, 100.0), (400.0, 100.0)], 2);
+        let followed = *r.run(Nav::Widget, 10).last().unwrap();
+        assert!(followed > 60.0 * scale(), "the pad's selection is scrolled to: {followed}");
+        // The wheel scrolls back to the top, the pointer having been used.
+        crate::widgets::note_pointer_activity(&r.ctx);
+        let scroll_id = r.scroll_id();
+        r.ctx.data_mut(|d| d.insert_temp(scroll_id, 0.0_f32));
+        let scrolls = r.run(Nav::Widget, 20);
+        assert!(scrolls.iter().all(|s| *s == 0.0), "the body stays where the wheel put it: {scrolls:?}");
+        assert!(crate::widgets::nav_highlight_alpha(&r.ctx) < 0.05, "the pad's highlight faded");
+        // The pad moves: its selection is followed again, its highlight back.
+        crate::widgets::note_pad_activity(&r.ctx);
+        let back = *r.run(Nav::Widget, 20).last().unwrap();
+        assert!((back - followed).abs() < 1.0, "followed again: {back} vs {followed}");
+        assert!(crate::widgets::nav_highlight_alpha(&r.ctx) > 0.95, "the highlight is back");
+    }
+
     /// A Two-Way curve's rows pinned on the layout answer a click in Easy mode, for
     /// the plain curve and the AutoMap one, in either pin style: its lane toggle,
     /// clicked, sets the lane it edits.
@@ -2219,6 +2292,1206 @@ mod nav_scroll_tests {
                 assert!(PANEL.expand(1.0).contains_rect(vis),
                     "{what}: a shape paints at {vis:?}, outside the panel {PANEL:?}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_editor_shots {
+    use super::*;
+    use crate::canvas::node::LayoutItem;
+
+    /// An Easy layout of `items`, one selected, laid out by Easy mode's center panel at
+    /// `screen`: the canvas, and a frame to run with pointer events, which hands back the
+    /// frame's shapes.
+    struct EasyScene {
+        ctx: egui::Context,
+        canvas: Canvas,
+        oid: egui_snarl::NodeId,
+        easy_state: EasyState,
+        overlay: crate::canvas::OverlayLayout,
+        config: crate::canvas::OverlayLayout,
+        nav: crate::gamepad_nav::GamepadNav,
+        favorites: Vec<std::path::PathBuf>,
+        screen: egui::Rect,
+        t: u32,
+        shot: crate::canvas::shot::Shot,
+    }
+
+    impl EasyScene {
+        fn new(items: Vec<LayoutItem>, selected: usize, editing: bool, screen: egui::Vec2) -> Self {
+            let desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == "subpatch")
+                .expect("the sub-patch module");
+            let ctx = egui::Context::default();
+            crate::app::fonts::setup_fonts(&ctx);
+            let mut canvas = Canvas::new();
+            let oid = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+            if let Some(n) = canvas.snarl.get_node_mut(oid) {
+                let mut sp = UiSubPatch::default();
+                sp.display_name = "Shooter".into();
+                sp.items = items;
+                sp.selected_item = Some(selected);
+                sp.selected_items = vec![selected];
+                n.subpatch = Some(Box::new(sp));
+                n.extra.layout_unlocked = editing;
+            }
+            Self {
+                ctx,
+                canvas,
+                oid,
+                easy_state: EasyState::default(),
+                overlay: Default::default(),
+                config: Default::default(),
+                nav: Default::default(),
+                favorites: Vec::new(),
+                screen: egui::Rect::from_min_size(egui::Pos2::ZERO, screen),
+                t: 0,
+                shot: Default::default(),
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+            self.frame_held(events, egui::Modifiers::NONE)
+        }
+
+        /// A frame with `modifiers` held.
+        fn frame_held(&mut self, events: Vec<egui::Event>, modifiers: egui::Modifiers) -> Vec<egui::epaint::ClippedShape> {
+            self.t += 1;
+            let raw = egui::RawInput { screen_rect: Some(self.screen), time: Some(self.t as f64 / 30.0), events, modifiers, ..Default::default() };
+            let Self { ctx, canvas, easy_state, overlay, config, nav, favorites, shot, .. } = self;
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui, canvas, easy_state, overlay, config, None,
+                        Default::default(), &[], &[], &Default::default(), &Default::default(),
+                        &Default::default(), &Default::default(), favorites, nav,
+                    );
+                });
+            });
+            shot.absorb(&out.textures_delta);
+            out.shapes
+        }
+
+        fn items(&self) -> &[LayoutItem] {
+            &self.canvas.snarl.get_node(self.oid).and_then(|n| n.subpatch.as_ref()).expect("the sub-patch").items
+        }
+
+        fn selected(&self) -> Option<usize> {
+            self.canvas.snarl.get_node(self.oid).and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.selected_item)
+        }
+    }
+
+    /// The parts a whole-module widget of node `inner` published last pass on the Easy body,
+    /// as `(nav pass, [(element, rect on the screen)])`.
+    fn widget_parts(ctx: &egui::Context, inner: usize) -> Option<(u64, Vec<(String, egui::Rect)>)> {
+        let parts: Option<(u64, Vec<crate::canvas::viewer::ModulePart>)> =
+            ctx.data(|d| d.get_temp(crate::canvas::viewer::module_parts_id(inner, egui::ViewportId::ROOT)));
+        parts.map(|(p, v)| (p, v.into_iter().map(|m| (m.element, m.rect)).collect()))
+    }
+
+    /// Every painted circle in `shapes`: its centre, radius and fill.
+    fn painted_circles(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Pos2, f32, egui::Color32)> {
+        fn walk(s: &egui::Shape, out: &mut Vec<(egui::Pos2, f32, egui::Color32)>) {
+            match s {
+                egui::Shape::Circle(c) => out.push((c.center, c.radius, c.fill)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// A rectangle, `fill`, at `pos` `size` big - with `gradient` for its fill if one is given.
+    fn rect_item(pos: [f32; 2], size: [f32; 2], fill: [u8; 4], gradient: Option<crate::canvas::node::Gradient>) -> LayoutItem {
+        LayoutItem::Deco(crate::canvas::node::LayoutDecoration::Rect {
+            tab: 0,
+            pos, size, fill, fill_gradient: gradient, stroke: [0; 4], stroke_px: 0.0, corner_radius: 0.0,
+            anchor: Default::default(),
+        })
+    }
+
+    /// The selected object's gradient handles work where another object lies over them: they
+    /// go on after every object, so nothing drawn above takes the pointer from them, and a
+    /// press on one is the handle's, not a click selecting what's on top.
+    #[test]
+    fn gradient_handles_work_under_another_object() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use crate::canvas::node::{Gradient, GradientKind};
+        let pink = [255, 80, 160, 255];
+        let below = rect_item([16.0, 16.0], [220.0, 120.0], [0; 4], Some(Gradient::new(GradientKind::Linear, [40, 120, 255, 255], pink)));
+        // Over the gradient's end, which sits on the lower one's right edge.
+        let above = rect_item([150.0, 16.0], [200.0, 120.0], [90, 90, 90, 255], None);
+        let mut scene = EasyScene::new(vec![below, above], 0, true, egui::vec2(1100.0, 500.0));
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 450.0))]);
+        }
+        let pink_c = egui::Color32::from_rgba_unmultiplied(pink[0], pink[1], pink[2], pink[3]);
+        let (end, _, _) = painted_circles(&shapes)
+            .into_iter()
+            .find(|(_, r, f)| *r > 3.0 && *f == pink_c)
+            .expect("the gradient's end handle is drawn");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: end, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+        };
+        scene.frame(vec![egui::Event::PointerMoved(end)]);
+        scene.frame(vec![button(true)]);
+        for k in 1..=6 {
+            scene.frame(vec![egui::Event::PointerMoved(end - egui::vec2(10.0 * k as f32, 0.0))]);
+        }
+        scene.frame(vec![egui::Event::PointerButton {
+            pos: end - egui::vec2(60.0, 0.0), button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default(),
+        }]);
+        scene.frame(vec![]);
+        let Some(LayoutItem::Deco(crate::canvas::node::LayoutDecoration::Rect { fill_gradient: Some(g), .. })) = scene.items().first() else {
+            panic!("the lower rectangle keeps its gradient");
+        };
+        assert!(g.end[0] < 0.9, "the end was dragged in: {:?}", g.end);
+        assert_eq!(scene.selected(), Some(0), "the drag didn't select the rectangle on top");
+    }
+
+    /// The snap grid's lines in `shapes`: faint lines in the grid's blue (their width is the
+    /// layout's scale, so not that).
+    fn grid_lines(shapes: &[egui::epaint::ClippedShape]) -> usize {
+        fn grid_blue(c: egui::Color32) -> bool {
+            let [r, g, b, a] = c.to_srgba_unmultiplied();
+            a > 0 && a <= 40 && r.abs_diff(150) <= 4 && g.abs_diff(200) <= 4 && b.abs_diff(255) <= 4
+        }
+        fn walk(s: &egui::Shape, n: &mut usize) {
+            match s {
+                egui::Shape::LineSegment { stroke, .. } if grid_blue(stroke.color) => *n += 1,
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, n)),
+                _ => {}
+            }
+        }
+        let mut n = 0;
+        shapes.iter().for_each(|c| walk(&c.shape, &mut n));
+        n
+    }
+
+    /// The four sides of the selection's outline in `shapes`, as the rect they go round.
+    fn selection_outline(shapes: &[egui::epaint::ClippedShape]) -> Option<egui::Rect> {
+        let sel = egui::Color32::from_rgba_unmultiplied(255, 220, 120, 230);
+        fn walk(s: &egui::Shape, sel: egui::Color32, out: &mut Vec<egui::Pos2>) {
+            match s {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == sel => out.extend(points),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, sel, out)),
+                _ => {}
+            }
+        }
+        let mut pts = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, sel, &mut pts));
+        (!pts.is_empty()).then(|| egui::Rect::from_points(&pts))
+    }
+
+    /// The snap grid shows only while an object is moved: not while the layout is just open
+    /// for editing, and it goes again once the object is let go.
+    #[test]
+    fn the_snap_grid_shows_only_while_an_object_moves() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = vec![rect_item([16.0, 16.0], [220.0, 120.0], [90, 90, 90, 255], None)];
+        let mut scene = EasyScene::new(items, 0, true, egui::vec2(1100.0, 500.0));
+        if let Some(sp) = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()) {
+            sp.snap_enabled = true;
+        }
+        let away = egui::pos2(1000.0, 480.0);
+        let mut shapes = Vec::new();
+        for _ in 0..8 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        assert_eq!(grid_lines(&shapes), 0, "no grid while nothing moves");
+        let outline = selection_outline(&shapes).expect("the selection's outline is drawn");
+        let grab = outline.min + egui::vec2(40.0, 40.0);
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        scene.frame(vec![egui::Event::PointerMoved(grab)]);
+        scene.frame(vec![button(grab, true)]);
+        let mut during = 0;
+        for k in 1..=10 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(grab + egui::vec2(4.0 * k as f32, 0.0))]);
+            during = during.max(grid_lines(&shapes));
+        }
+        assert!(during > 10, "the grid shows while the object moves ({during} lines)");
+        let end = grab + egui::vec2(40.0, 0.0);
+        scene.frame(vec![button(end, false)]);
+        for _ in 0..12 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        assert_eq!(grid_lines(&shapes), 0, "the grid goes once the object is let go");
+    }
+
+    /// Editing a layout, a held modifier says what it does there, as the canvas does for its
+    /// own: Ctrl's move and resize catches, Alt's resize about the centre; nothing unheld.
+    #[test]
+    fn a_held_modifier_says_what_it_does_in_the_layout_editor() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = vec![rect_item([16.0, 16.0], [220.0, 120.0], [90, 90, 90, 255], None)];
+        let mut scene = EasyScene::new(items, 0, true, egui::vec2(1100.0, 500.0));
+        let says = |shapes: &[egui::epaint::ClippedShape], words: &str| painted_texts(shapes).iter().any(|(t, _, _)| t.starts_with(words));
+        let shapes = scene.frame_held(vec![], egui::Modifiers::NONE);
+        assert!(!says(&shapes, "Ctrl+Resize") && !says(&shapes, "Alt+Resize"), "nothing while nothing's held");
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            shapes = scene.frame_held(vec![], egui::Modifiers::CTRL);
+        }
+        assert!(says(&shapes, "Ctrl+Resize") && says(&shapes, "Ctrl+Drag"), "Ctrl's catches");
+        for _ in 0..2 {
+            shapes = scene.frame_held(vec![], egui::Modifiers::ALT);
+        }
+        assert!(says(&shapes, "Alt+Resize"), "Alt's resize about the centre");
+    }
+
+    /// The pointer on the grid's pill shows the grid, so a change to its size can be seen -
+    /// and doesn't hang the app (the pill asked the context for the pass while holding it).
+    #[test]
+    fn the_grid_shows_while_the_pointer_is_on_its_pill() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = vec![rect_item([16.0, 16.0], [220.0, 120.0], [90, 90, 90, 255], None)];
+        let mut scene = EasyScene::new(items, 0, true, egui::vec2(1100.0, 500.0));
+        if let Some(sp) = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()) {
+            sp.snap_enabled = true;
+        }
+        let away = egui::pos2(1000.0, 480.0);
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        assert_eq!(grid_lines(&shapes), 0, "no grid to start with");
+        let pill = painted_texts(&shapes).into_iter().find(|(t, _, _)| t == "grid").map(|(_, r, _)| r).expect("the grid's pill");
+        let mut most = 0;
+        for _ in 0..10 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(pill.center())]);
+            most = most.max(grid_lines(&shapes));
+        }
+        assert!(most > 10, "the grid shows under the pointer on its pill ({most} lines)");
+    }
+
+    /// A layout with two tabs or more has their row across the top of the panel and is laid
+    /// out beneath it: the objects of the tab showing show, a click on another tab shows that
+    /// one, and while the layout is edited the row's + adds a tab and a double click renames
+    /// one.
+    #[test]
+    fn a_layout_shows_one_tab_at_a_time_under_its_row_of_tabs() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let red = [220, 40, 40, 255];
+        let green = [40, 200, 60, 255];
+        let mut first = rect_item([16.0, 16.0], [100.0, 60.0], red, None);
+        first.set_tab(Some(0));
+        let mut second = rect_item([140.0, 16.0], [100.0, 60.0], green, None);
+        second.set_tab(Some(1));
+        let mut scene = EasyScene::new(vec![first, second], 0, false, egui::vec2(1100.0, 500.0));
+        if let Some(sp) = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()) {
+            sp.layout_tabs = vec!["One".into(), "Two".into()];
+        }
+        let colour = |c: [u8; 4]| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+        let rect_of = |shapes: &[egui::epaint::ClippedShape], c: [u8; 4]| {
+            painted_rects(shapes).into_iter().find(|(_, f)| *f == colour(c)).map(|(r, _)| r)
+        };
+        // The lowest of the words: the row's, beneath the header (whose tab picker, editing,
+        // names the tab showing too).
+        let text_of = |shapes: &[egui::epaint::ClippedShape], t: &str| {
+            painted_texts(shapes).into_iter().filter(|(s, _, _)| s == t).map(|(_, r, _)| r)
+                .max_by(|a, b| a.center().y.total_cmp(&b.center().y))
+        };
+        let away = egui::pos2(1000.0, 480.0);
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let shown = rect_of(&shapes, red).expect("the first tab's object shows");
+        assert!(rect_of(&shapes, green).is_none(), "the second tab's doesn't");
+        let one = text_of(&shapes, "One").expect("the row names the first tab");
+        let two = text_of(&shapes, "Two").expect("and the second");
+        assert!((one.center().y - two.center().y).abs() < 1.0 && two.left() > one.right(), "side by side, in a row");
+        assert!(shown.top() >= one.bottom(), "the layout is beneath the row: {shown:?} under {one:?}");
+        let click = |scene: &mut EasyScene, at: egui::Pos2| {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            scene.frame(vec![egui::Event::PointerMoved(at)]);
+            scene.frame(vec![button(true)]);
+            scene.frame(vec![button(false)]);
+        };
+        click(&mut scene, two.center());
+        for _ in 0..3 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let sp = |scene: &EasyScene| scene.canvas.snarl.get_node(scene.oid).and_then(|n| n.subpatch.as_ref()).map(|sp| (sp.active_tab, sp.layout_tabs.clone()));
+        assert_eq!(sp(&scene).map(|s| s.0), Some(1), "the click showed the second tab");
+        assert!(rect_of(&shapes, green).is_some(), "the second tab's object shows");
+        assert!(rect_of(&shapes, red).is_none(), "the first tab's doesn't");
+
+        // Editing: the + at the row's end adds a tab, which shows.
+        if let Some(n) = scene.canvas.snarl.get_node_mut(scene.oid) {
+            n.extra.layout_unlocked = true;
+        }
+        for _ in 0..3 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let two = text_of(&shapes, "Two").expect("the second tab");
+        // The tab showing is lit, and has its × now; the + is just past it, the last tab.
+        let lit = scene.ctx.style().visuals.selection.bg_fill;
+        let cell = painted_rects(&shapes).into_iter()
+            .find(|(r, f)| *f == lit && r.contains(two.center()))
+            .map(|(r, _)| r)
+            .expect("the second tab's cell, lit");
+        assert!(cell.right() > two.right() + 14.0, "room for its ×: {cell:?} past {two:?}");
+        click(&mut scene, egui::pos2(cell.right() + 2.0 + (crate::canvas::viewer::TAB_ROW_H - 4.0) * 0.5, cell.center().y));
+        assert_eq!(sp(&scene).map(|s| s.1.len()), Some(3), "the row's + added a tab: {:?}", sp(&scene));
+        assert_eq!(sp(&scene).map(|s| s.0), Some(2), "and it shows");
+        // A double click renames a tab in place (well after the + click, or egui counts three).
+        for _ in 0..30 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let one = text_of(&shapes, "One").expect("the first tab");
+        let at = one.center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        scene.frame(vec![egui::Event::PointerMoved(at)]);
+        scene.frame(vec![button(true)]);
+        scene.frame(vec![button(false)]);
+        scene.frame(vec![button(true)]);
+        scene.frame(vec![button(false)]);
+        scene.frame(vec![]);
+        let select_all = egui::Event::Key { key: egui::Key::A, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::COMMAND };
+        scene.frame(vec![select_all]);
+        scene.frame(vec![egui::Event::Text("Aim".into())]);
+        let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+        scene.frame(vec![enter]);
+        scene.frame(vec![egui::Event::PointerMoved(away)]);
+        assert_eq!(sp(&scene).map(|s| s.1[0].clone()), Some("Aim".to_string()), "renamed: {:?}", sp(&scene));
+    }
+
+    /// A module pinned whole is drawn as a widget of its own size - its body laid out at
+    /// that size - and offers its parts (the graph, the option rows) for the pad to walk.
+    #[test]
+    fn a_module_pinned_whole_draws_its_body_and_offers_its_parts() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+        let curve_desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.response_curve")
+            .expect("the curve module");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [320.0, 300.0],
+            })).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        for _ in 0..6 {
+            scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 580.0))]);
+        }
+        let parts: Option<(u64, Vec<(String, egui::Rect)>)> = widget_parts(&scene.ctx, inner.0);
+        let (_, parts) = parts.expect("the widget published its parts");
+        let names: Vec<&str> = parts.iter().map(|(e, _)| e.as_str()).collect();
+        assert!(names.contains(&"curve"), "the graph is a part: {names:?}");
+        assert!(names.len() >= 2, "and the option rows: {names:?}");
+        // All inside the widget's box, which is the size it was given - on the screen, where
+        // Easy mode scales the layout to its panel (here as far as it goes, 1.5x).
+        let union = parts.iter().fold(egui::Rect::NOTHING, |u, (_, r)| u.union(*r));
+        assert!(union.width() <= 1.5 * 330.0 && union.height() <= 1.5 * 310.0, "laid out within the widget: {union:?}");
+        // A curve's rows aren't drawn a control per field the pad walks (its range row walks
+        // four, and draws three): no field rects are made up for them.
+        let node = scene.canvas.snarl.get_node(scene.oid).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner).cloned());
+        for (part, _) in &parts {
+            let want = crate::app::element_fields("module.response_curve", part, node.as_ref()).len();
+            let fields: Option<(u64, Vec<egui::Rect>)> =
+                scene.ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, part.clone()))));
+            if let Some((_, fields)) = fields {
+                assert_eq!(fields.len(), want, "{part}: a rect per field, or none");
+            }
+        }
+    }
+
+    /// A module pinned whole and zoomed out is laid out bigger and drawn smaller: its rows
+    /// come out shorter and its graph takes the room they leave, all still inside the widget.
+    #[test]
+    fn a_zoomed_out_module_widget_draws_its_rows_smaller_and_its_graph_larger() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let parts_at = |zoom: Option<f32>| -> Vec<(String, egui::Rect)> {
+            let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+            let curve_desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == "module.response_curve")
+                .expect("the curve module");
+            let inner = {
+                let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+                sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [320.0, 300.0],
+                    "zoom": zoom,
+                })).expect("a pin")));
+                sp.selected_item = None;
+                sp.selected_items.clear();
+                inner
+            };
+            for _ in 0..8 {
+                scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 580.0))]);
+            }
+            let parts: Option<(u64, Vec<(String, egui::Rect)>)> = widget_parts(&scene.ctx, inner.0);
+            parts.expect("the widget published its parts").1
+        };
+        let rect_of = |parts: &[(String, egui::Rect)], e: &str| parts.iter().find(|(p, _)| p == e).map(|(_, r)| *r).unwrap_or_else(|| panic!("{e}: {parts:?}"));
+        let whole = parts_at(None);
+        let half = parts_at(Some(0.5));
+        let (graph1, graph2) = (rect_of(&whole, "curve"), rect_of(&half, "curve"));
+        let (row1, row2) = (rect_of(&whole, "range_row"), rect_of(&half, "range_row"));
+        assert!(graph2.height() > graph1.height() * 1.05, "the graph takes more room: {graph1:?} -> {graph2:?}");
+        assert!((row2.height() - row1.height() * 0.5).abs() < row1.height() * 0.15, "a row comes out half as tall: {row1:?} -> {row2:?}");
+        let outer = whole.iter().fold(egui::Rect::NOTHING, |u, (_, r)| u.union(*r));
+        let zoomed = half.iter().fold(egui::Rect::NOTHING, |u, (_, r)| u.union(*r));
+        assert!(outer.expand(2.0).contains(zoomed.min) && zoomed.width() <= outer.width() + 2.0, "still inside the widget: {zoomed:?} in {outer:?}");
+    }
+
+    /// Editing the layout, a zoomed widget is an object like any other: a right-click on it
+    /// opens its menu (its own layer took the pointer from the layout's handles).
+    #[test]
+    fn a_zoomed_widget_keeps_its_menu_while_the_layout_is_edited() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let curve_desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.response_curve")
+            .expect("the curve module");
+        let mut scene = EasyScene::new(Vec::new(), 0, true, egui::vec2(1100.0, 600.0));
+        {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [320.0, 300.0],
+                "zoom": 0.6,
+            })).expect("a pin")));
+            sp.selected_item = Some(0);
+            sp.selected_items = vec![0];
+        }
+        let away = egui::pos2(1000.0, 580.0);
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let outline = selection_outline(&shapes).expect("the widget's outline");
+        let at = outline.center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        scene.frame(vec![egui::Event::PointerMoved(at)]);
+        scene.frame(vec![button(true)]);
+        scene.frame(vec![button(false)]);
+        for _ in 0..2 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(at)]);
+        }
+        assert!(painted_texts(&shapes).iter().any(|(t, _, _)| t == "Send to surface"), "the menu opened");
+    }
+
+    /// Editing the layout, a zoomed module's card window - 3DOF to 2D's Lean cards - is
+    /// drawn zoomed with the rest, inside the widget, and leaves the pointer to the layout: a
+    /// right-click on its Learn button opens the widget's menu. On a layer of its own it came
+    /// out full size, past the widget's edge.
+    #[test]
+    fn a_zoomed_widgets_cards_scale_with_it_while_the_layout_is_edited() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, true, egui::vec2(1300.0, 700.0));
+        {
+            let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+                .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [0.0, 0.0], "size": [988.0, 592.0],
+                "zoom": 0.74,
+            })).expect("a pin")));
+            sp.selected_item = Some(0);
+            sp.selected_items = vec![0];
+        }
+        let away = egui::pos2(1290.0, 690.0);
+        let mut shapes = Vec::new();
+        for _ in 0..8 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let outline = selection_outline(&shapes).expect("the widget's outline");
+        let learn: Vec<egui::Rect> = painted_texts(&shapes).into_iter().filter(|(t, _, _)| t == "Learn").map(|(_, r, _)| r).collect();
+        assert!(!learn.is_empty(), "the Lean cards' Learn buttons are drawn");
+        let tune: Vec<egui::Rect> = painted_texts(&shapes).into_iter().filter(|(t, _, _)| t == "lean threshold").map(|(_, r, _)| r).collect();
+        let tune = tune.first().copied().expect("the lean threshold pill");
+        for r in &learn {
+            assert!(outline.expand(1.0).contains_rect(*r), "inside the widget {outline:?}: {r:?}");
+            assert!(r.height() < tune.height() * 1.25, "zoomed as the rest is: {r:?} beside {tune:?}");
+        }
+        let at = learn[0].center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        scene.frame(vec![egui::Event::PointerMoved(at)]);
+        scene.frame(vec![button(true)]);
+        scene.frame(vec![button(false)]);
+        for _ in 0..2 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(at)]);
+        }
+        assert!(painted_texts(&shapes).iter().any(|(t, _, _)| t == "Send to surface"), "the menu opened");
+    }
+
+    /// A zoomed widget answers the pointer where it's drawn: dragging its trail pill, drawn
+    /// smaller, changes the trail.
+    #[test]
+    fn a_zoomed_module_widget_answers_the_pointer_where_it_is_drawn() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+        let curve_desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.response_curve")
+            .expect("the curve module");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [320.0, 300.0],
+                "zoom": 0.6,
+            })).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        let away = egui::pos2(1000.0, 580.0);
+        let mut shapes = Vec::new();
+        for _ in 0..8 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let pill = painted_texts(&shapes).into_iter().find(|(t, _, _)| t.ends_with(" ms")).map(|(_, r, _)| r).expect("the trail pill");
+        let trail = |scene: &EasyScene| scene.canvas.snarl.get_node(scene.oid).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner)).and_then(|n| n.params.get("trail_ms").and_then(|v| v.as_i64()));
+        let before = trail(&scene);
+        let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let at = pill.center();
+        scene.frame(vec![egui::Event::PointerMoved(at)]);
+        scene.frame(vec![button(at, true)]);
+        for k in 1..=10 {
+            scene.frame(vec![egui::Event::PointerMoved(at + egui::vec2(6.0 * k as f32, 0.0))]);
+        }
+        scene.frame(vec![button(at + egui::vec2(60.0, 0.0), false)]);
+        assert_ne!(trail(&scene), before, "the drag on the pill changed the trail");
+    }
+
+    /// The pad walks a module pinned whole stop by stop - its graph whole, each of its rows'
+    /// fields on its own - with nothing to go into first: the curve's Log/Exp, Abs and Snap
+    /// are three stops, each inside its row.
+    #[test]
+    fn a_module_widget_offers_each_field_as_a_stop() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+        let curve_desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.automap_response_curve")
+            .expect("the AutoMap curve module");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [320.0, 300.0],
+            })).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        for _ in 0..6 {
+            scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 580.0))]);
+        }
+        let mid = scene.canvas.snarl.get_node(scene.oid).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .map(|n| crate::canvas::viewer::curve_ui_module_id(n).to_string())
+            .expect("the curve node");
+        let stops = crate::app::FlexInputApp::nav_widget_stops(&scene.ctx, &mid, "whole_module", inner.0, egui::ViewportId::ROOT)
+            .expect("the widget has stops");
+        assert!(stops.iter().any(|(p, f, _)| p == "curve" && f.is_none()), "the graph is one stop: {stops:?}");
+        let scale: Vec<_> = stops.iter().filter(|(p, _, _)| p == "scale_row").collect();
+        assert_eq!(scale.iter().map(|(_, f, _)| *f).collect::<Vec<_>>(), [Some(0), Some(1), Some(2)], "Log/Exp, Abs and Snap: {stops:?}");
+        let (_, parts) = widget_parts(&scene.ctx, inner.0).expect("the parts");
+        let row = parts.iter().find(|(e, _)| e == "scale_row").map(|(_, r)| *r).expect("the scale row");
+        assert!(scale.iter().all(|(_, _, r)| row.expand(1.0).contains(r.center())), "each inside its row {row:?}: {scale:?}");
+    }
+
+    /// The fields of a part of a module pinned whole, where its row doesn't say where they
+    /// are, are the controls drawn in it - when there are as many as the pad walks there - so
+    /// the pad's field ring has somewhere to go.
+    #[test]
+    fn a_module_widgets_fields_are_found_where_its_rows_draw_them() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "module.delay")
+            .expect("the delay module");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [220.0, 90.0],
+            })).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        for _ in 0..6 {
+            scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1000.0, 580.0))]);
+        }
+        let parts: Option<(u64, Vec<(String, egui::Rect)>)> = widget_parts(&scene.ctx, inner.0);
+        let (_, parts) = parts.expect("the widget published its parts");
+        let (part, row) = parts.iter().find(|(e, _)| e == "ms").cloned().expect("its delay is a part");
+        let want = crate::app::element_fields("module.delay", "ms", None).len();
+        let fields: Option<(u64, Vec<egui::Rect>)> =
+            scene.ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner.0, part.clone()))));
+        let (_, fields) = fields.expect("the delay's field was found");
+        assert_eq!(fields.len(), want, "a rect per field");
+        assert!(fields.iter().all(|f| row.expand(1.0).contains(f.center())), "inside its row {row:?}: {fields:?}");
+    }
+
+    /// A module node pinned whole on the Easy body, its params set from `params`.
+    fn pin_whole(scene: &mut EasyScene, module: &str, params: serde_json::Value, size: [f32; 2]) -> egui_snarl::NodeId {
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == module)
+            .unwrap_or_else(|| panic!("{module}"));
+        let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+        let mut node = NodeData::from(&desc);
+        if let serde_json::Value::Object(m) = params {
+            node.params.extend(m);
+        }
+        let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), node);
+        sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+            "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": size,
+        })).expect("a pin")));
+        sp.selected_item = None;
+        sp.selected_items.clear();
+        inner
+    }
+
+    /// A stick's AutoMap curve - drawn by the vector curve body, not the plain one a gyro's
+    /// gets - tells the pad where its graph is (for the cursor's adds and deletes) and rings
+    /// the dot the pad has selected. It did neither, so only the gyro's curve answered.
+    #[test]
+    fn a_sticks_curve_shows_the_pads_selected_dot() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 600.0));
+        let pin_key = flexinput_engine::eval::AUTOMAP_CURVE_PIN_PARAM;
+        let inner = pin_whole(&mut scene, "module.automap_response_curve", serde_json::json!({ pin_key: "left_stick" }), [340.0, 330.0]);
+        let mid = scene.canvas.snarl.get_node(scene.oid).and_then(|n| n.subpatch.as_ref())
+            .and_then(|sp| sp.snarl.get_node(inner))
+            .map(|n| crate::canvas::viewer::curve_ui_module_id(n).to_string())
+            .expect("the curve node");
+        assert_eq!(mid, "module.vec_response_curve", "a stick's curve is the vector body");
+        let accent = scene.ctx.style().visuals.selection.stroke.color;
+        let rings = |shapes: &[egui::epaint::ClippedShape]| -> Vec<egui::Pos2> {
+            fn walk(s: &egui::Shape, accent: egui::Color32, out: &mut Vec<egui::Pos2>) {
+                match s {
+                    // The ring round the selected dot: radius 7 at a 2-point stroke, drawn
+                    // at the widget's scale.
+                    egui::Shape::Circle(c) if c.stroke.color == accent && c.stroke.width > 0.0 && (c.radius / c.stroke.width - 3.5).abs() < 0.05 => out.push(c.center),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, accent, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            shapes.iter().for_each(|c| walk(&c.shape, accent, &mut out));
+            out
+        };
+        let away = egui::pos2(1000.0, 580.0);
+        let mut shapes = Vec::new();
+        for _ in 0..6 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        assert!(rings(&shapes).is_empty(), "no dot ringed before the pad selects one");
+        let geom: Option<(u64, egui::Rect, f32, f32, f32, f32)> =
+            scene.ctx.data(|d| d.get_temp(crate::canvas::viewer::nav_curve_geom_id(inner.0, egui::ViewportId::ROOT)));
+        let (_, graph, ..) = geom.expect("the graph told the pad where it is");
+        let (_, parts) = widget_parts(&scene.ctx, inner.0).expect("the parts");
+        let part = parts.iter().find(|(e, _)| e == "curve").map(|(_, r)| *r).expect("the graph part");
+        assert!(part.expand(1.0).contains(graph.center()), "where it's drawn: {graph:?} in {part:?}");
+        for _ in 0..3 {
+            let pass = crate::widgets::nav_pass(&scene.ctx);
+            scene.ctx.data_mut(|d| d.insert_temp(egui::Id::new(("gp_nav_curve_sel", inner.0)), (pass, 0usize, false)));
+            shapes = scene.frame(vec![egui::Event::PointerMoved(away)]);
+        }
+        let ringed = rings(&shapes);
+        assert_eq!(ringed.len(), 1, "the selected dot is ringed: {ringed:?}");
+        assert!(graph.expand(8.0).contains(ringed[0]), "on the graph: {ringed:?} in {graph:?}");
+    }
+
+    /// 3DOF to 2D pinned whole: every setting its body draws live is a stop for the pad - the
+    /// Orientation row's rotation, drift fix and re-centre too, which weren't - and a row
+    /// that's all greyed out (the Orientation row on the pad's own pose, the steering options
+    /// while it points) is passed by. Each section's heading is a stop too, so a folded one
+    /// can be opened.
+    #[test]
+    fn a_3dof_widget_offers_each_of_its_settings_as_a_stop() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stops_with = |params: serde_json::Value| {
+            let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 800.0));
+            let inner = pin_whole(&mut scene, "processing.gyro_3dof", params, [520.0, 760.0]);
+            for _ in 0..6 {
+                scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1090.0, 790.0))]);
+            }
+            let stops = crate::app::FlexInputApp::nav_widget_stops(&scene.ctx, "processing.gyro_3dof", "whole_module", inner.0, egui::ViewportId::ROOT)
+                .expect("the widget has stops");
+            let (_, parts) = widget_parts(&scene.ctx, inner.0).expect("the parts");
+            for (p, f, r) in &stops {
+                if f.is_some() {
+                    let row = parts.iter().find(|(e, _)| e == p).map(|(_, r)| *r).unwrap_or_else(|| panic!("{p}: {parts:?}"));
+                    assert!(row.expand(1.0).contains(r.center()), "{p} {f:?} inside its row {row:?}: {r:?}");
+                }
+            }
+            stops.into_iter().map(|(p, f, _)| (p, f)).collect::<Vec<_>>()
+        };
+        let fields_of = |stops: &[(String, Option<usize>)], part: &str| -> Vec<Option<usize>> {
+            stops.iter().filter(|(p, _)| p == part).map(|(_, f)| *f).collect()
+        };
+        // Folded, as the Orientation and Invert sections start: their headings are stops, so
+        // the pad can open them - and nothing in them is.
+        let stops = stops_with(serde_json::json!({}));
+        for heading in ["fold:mode", "fold:orient", "fold:axes", "fold:lean"] {
+            assert_eq!(fields_of(&stops, heading), [None], "{heading}: {stops:?}");
+        }
+        assert!(fields_of(&stops, "orient_scale").is_empty() && fields_of(&stops, "gyro_invert").is_empty(), "{stops:?}");
+
+        let open = |mut m: serde_json::Value| {
+            m["fold_orient"] = false.into();
+            m["fold_axes"] = false.into();
+            m
+        };
+        let stops = stops_with(open(serde_json::json!({ "orient_auto_recenter": true })));
+        assert_eq!(fields_of(&stops, "orient_scale"), [Some(0)], "Rotation ×: {stops:?}");
+        assert_eq!(fields_of(&stops, "orient_drift"), [Some(0)], "Drift fix: {stops:?}");
+        assert_eq!(fields_of(&stops, "orient_recenter"), [Some(0), Some(1)], "Re-center and Still below: {stops:?}");
+        assert_eq!(fields_of(&stops, "orient_source"), [Some(0)], "the source: {stops:?}");
+        assert_eq!(fields_of(&stops, "hold_offset"), [Some(0), Some(1), Some(2)], "the hold offsets: {stops:?}");
+        assert_eq!(fields_of(&stops, "gyro_invert"), [Some(0), Some(1), Some(2)], "gyro inverts: {stops:?}");
+        assert!(fields_of(&stops, "edge_turn").len() >= 2, "Edge turn's settings: {stops:?}");
+        assert_eq!(fields_of(&stops, "lean_threshold"), [Some(0)], "the lean threshold: {stops:?}");
+        assert!(fields_of(&stops, "steering_opts").is_empty(), "steering's options pass by while it points: {stops:?}");
+
+        // Re-centring off: its Still below greys out and is passed by.
+        let stops = stops_with(open(serde_json::json!({})));
+        assert_eq!(fields_of(&stops, "orient_recenter"), [Some(0)], "only the switch: {stops:?}");
+
+        // On the pad's own pose, rotation and drift fix grey out and pass by.
+        let stops = stops_with(open(serde_json::json!({ "orient_source": "device" })));
+        assert!(fields_of(&stops, "orient_scale").is_empty() && fields_of(&stops, "orient_drift").is_empty(), "{stops:?}");
+    }
+
+    /// A picture of a Response Curve pinned whole, the pad on its range row:
+    /// `cargo test -p flexinput-ui --lib shoot_easy_module_widget -- --ignored`, PNG
+    /// `target/module_shots/easy_module_widget.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_module_widget() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // As it is, and zoomed out to 60%.
+        for (zoom, name) in [(None, "easy_module_widget"), (Some(0.6_f32), "easy_module_widget_zoomed")] {
+            let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(800.0, 700.0));
+            let curve_desc = flexinput_modules::all_modules()
+                .into_iter()
+                .map(|r| r.descriptor)
+                .find(|d| d.id == "module.response_curve")
+                .expect("the curve module");
+            let inner = {
+                let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&curve_desc));
+                sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [340.0, 330.0],
+                    "zoom": zoom,
+                })).expect("a pin")));
+                sp.selected_item = None;
+                sp.selected_items.clear();
+                inner
+            };
+            let mut shapes = Vec::new();
+            for _ in 0..8 {
+                let pass = scene.ctx.cumulative_pass_nr();
+                scene.ctx.data_mut(|d| d.insert_temp(crate::canvas::viewer::module_part_focus_id(inner.0), (pass, "range_row".to_string(), None::<usize>, false)));
+                shapes = scene.frame(vec![]);
+            }
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../target/module_shots/{name}.png"));
+            scene.shot.save(&scene.ctx, &shapes, scene.screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// Pictures of 3DOF to 2D pinned whole and zoomed to 74%, browsing and editing the layout:
+    /// `cargo test -p flexinput-ui --lib shoot_easy_3dof_zoomed -- --ignored`, PNGs
+    /// `target/module_shots/easy_3dof_zoomed_{browse,editing}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_3dof_zoomed() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for editing in [false, true] {
+            let mut scene = EasyScene::new(Vec::new(), 0, editing, egui::vec2(1300.0, 700.0));
+            let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+                .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+            {
+                let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                let mut node = NodeData::from(&desc);
+                node.params.insert("axis".into(), serde_json::json!("orient"));
+                node.params.insert("fold_orient".into(), serde_json::json!(false));
+                node.params.insert("fold_axes".into(), serde_json::json!(false));
+                let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), node);
+                sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": inner.0, "element_id": "whole_module", "pos": [0.0, 0.0], "size": [988.0, 592.0],
+                    "zoom": 0.74,
+                })).expect("a pin")));
+                sp.selected_item = None;
+                sp.selected_items.clear();
+            }
+            let mut shapes = Vec::new();
+            for _ in 0..8 {
+                shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1290.0, 690.0))]);
+            }
+            let name = if editing { "easy_3dof_zoomed_editing" } else { "easy_3dof_zoomed_browse" };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots").join(format!("{name}.png"));
+            scene.shot.save(&scene.ctx, &shapes, scene.screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// Pictures of the Easy header at a narrow width - browsing and editing - so nothing in the
+    /// row runs into the mode buttons:
+    /// `cargo test -p flexinput-ui --lib shoot_easy_narrow_header -- --ignored`, PNGs
+    /// `target/module_shots/easy_header_narrow_{browse,editing}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_narrow_header() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for editing in [false, true] {
+            let items = vec![rect_item([16.0, 16.0], [120.0, 80.0], [60, 60, 60, 180], None)];
+            let mut scene = EasyScene::new(items, 0, editing, egui::vec2(430.0, 160.0));
+            let mut shapes = Vec::new();
+            for _ in 0..8 {
+                shapes = scene.frame(vec![]);
+            }
+            let name = if editing { "easy_header_narrow_editing" } else { "easy_header_narrow_browse" };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots").join(format!("{name}.png"));
+            scene.shot.save(&scene.ctx, &shapes, scene.screen, 2.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// Every painted rect in `shapes`, with its fill.
+    fn painted_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Rect, egui::Color32)> {
+        fn walk(s: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+
+    /// Editing a layout, an object is drawn whole until the pointer is over it, and then
+    /// eases see-through so what it covers shows.
+    #[test]
+    fn a_layout_object_goes_see_through_under_the_pointer() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "subpatch")
+            .expect("the sub-patch module");
+        let ctx = egui::Context::default();
+        let mut canvas = Canvas::new();
+        let oid = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+        let fill = egui::Color32::from_rgba_unmultiplied(200, 40, 40, 255);
+        if let Some(n) = canvas.snarl.get_node_mut(oid) {
+            let mut sp = UiSubPatch::default();
+            sp.items.push(LayoutItem::Deco(crate::canvas::node::LayoutDecoration::Rect { tab: 0, fill_gradient: None,
+                pos: [16.0, 16.0],
+                size: [120.0, 80.0],
+                fill: fill.to_srgba_unmultiplied(),
+                stroke: [0; 4],
+                stroke_px: 0.0,
+                corner_radius: 0.0,
+                anchor: Default::default(),
+            }));
+            n.subpatch = Some(Box::new(sp));
+            n.extra.layout_unlocked = true;
+        }
+        let mut easy_state = EasyState::default();
+        let (mut overlay, mut config) = Default::default();
+        let mut nav = crate::gamepad_nav::GamepadNav::default();
+        let mut favorites = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 600.0));
+        let mut run = |i: u32, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(i as f64 / 30.0),
+                events,
+                ..Default::default()
+            };
+            ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui, &mut canvas, &mut easy_state, &mut overlay, &mut config, None,
+                        Default::default(), &[], &[], &Default::default(), &Default::default(),
+                        &Default::default(), &Default::default(), &mut favorites, &mut nav,
+                    );
+                });
+            })
+            .shapes
+        };
+        // The object: the rect painted in its red, as opaque as it was set.
+        let red = |c: egui::Color32| c.r() > 0 && c.g() < c.r() / 3 && c.b() < c.r() / 3;
+        let mut shapes = Vec::new();
+        for i in 0..6 {
+            shapes = run(i, vec![]);
+        }
+        let (at, whole) = painted_rects(&shapes).into_iter().find(|(_, c)| red(*c)).expect("the object is painted");
+        assert_eq!(whole.a(), 255, "away from the pointer it's drawn whole");
+        for i in 6..20 {
+            shapes = run(i, vec![egui::Event::PointerMoved(at.center())]);
+        }
+        let (_, under) = painted_rects(&shapes).into_iter().find(|(_, c)| red(*c)).expect("the object is painted");
+        assert!(under.a() < 140, "under the pointer it goes see-through: {under:?}");
+    }
+
+    /// An Easy layout with mapping cards pinned smaller than their design - a Remapper whole and
+    /// a 3DOF Lean list - locked or being edited, scrolled a little so the top of the layout is
+    /// under the header row: the last frame's shapes, and its textures for a picture.
+    fn pinned_cards_frame(editing: bool) -> (egui::Context, Vec<egui::epaint::ClippedShape>, crate::canvas::shot::Shot) {
+        let module = |id: &str| flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == id)
+            .expect("the module");
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut canvas = Canvas::new();
+        let oid = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&module("subpatch")));
+        if let Some(n) = canvas.snarl.get_node_mut(oid) {
+            let mut sp = UiSubPatch::default();
+            let remap = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&module("module.remapper")));
+            let gyro = sp.snarl.insert_node(egui::pos2(400.0, 0.0), NodeData::from(&module("processing.gyro_3dof")));
+            let pin = |node: egui_snarl::NodeId, element: &str, pos: [f32; 2], size: [f32; 2]| {
+                LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": node.0, "element_id": element, "pos": pos, "size": size,
+                })).expect("a pin"))
+            };
+            sp.items.push(pin(remap, "whole_module", [16.0, 16.0], [250.0, 200.0]));
+            sp.items.push(pin(gyro, "lean_left", [300.0, 16.0], [300.0, 160.0]));
+            sp.items.push(LayoutItem::Deco(crate::canvas::viewer::make_default_decoration("rect")));
+            if let Some(LayoutItem::Deco(crate::canvas::node::LayoutDecoration::Rect { pos, size, .. })) = sp.items.last_mut() {
+                *pos = [16.0, 900.0];
+                *size = [100.0, 40.0];
+            }
+            n.subpatch = Some(Box::new(sp));
+            n.extra.layout_unlocked = editing;
+        }
+        let mut easy_state = EasyState::default();
+        let (mut overlay, mut config) = Default::default();
+        let mut nav = crate::gamepad_nav::GamepadNav::default();
+        let mut favorites = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 420.0));
+        let mut shot = crate::canvas::shot::Shot::default();
+        let mut shapes = Vec::new();
+        for i in 0..12 {
+            let events = if (5..9).contains(&i) {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -12.0), modifiers: Default::default(),
+                }]
+            } else {
+                // Away from the pins, so none of them is see-through under it.
+                vec![egui::Event::PointerMoved(egui::pos2(1000.0, 400.0))]
+            };
+            let raw = egui::RawInput { screen_rect: Some(screen), time: Some(i as f64 / 30.0), events, ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(
+                        ui, &mut canvas, &mut easy_state, &mut overlay, &mut config, None,
+                        Default::default(), &[], &[], &Default::default(), &Default::default(),
+                        &Default::default(), &Default::default(), &mut favorites, &mut nav,
+                    );
+                });
+            });
+            shot.absorb(&out.textures_delta);
+            shapes = out.shapes;
+        }
+        (ctx, shapes, shot)
+    }
+
+    /// Every painted text in `shapes` with its words, where it lands and what it's clipped to.
+    fn painted_texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Rect, egui::Rect)> {
+        fn walk(s: &egui::Shape, clip: egui::Rect, out: &mut Vec<(String, egui::Rect, egui::Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()), clip)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, clip, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|c| walk(&c.shape, c.clip_rect, &mut out));
+        out
+    }
+
+    /// A pinned mapping list being edited is drawn as it is locked: its words the size they
+    /// are locked, so they stay inside their buttons on a pin smaller than its design (they came
+    /// out the design's size), and cut where the layout is cut (they drew over the header row
+    /// above a layout scrolled down).
+    #[test]
+    fn edited_pins_draw_their_cards_as_locked() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let find = |texts: &[(String, egui::Rect, egui::Rect)], words: &str| {
+            texts.iter().find(|(t, _, _)| t.starts_with(words)).cloned().unwrap_or_else(|| panic!("{words:?} is painted"))
+        };
+        let locked = painted_texts(&pinned_cards_frame(false).1);
+        let edited = painted_texts(&pinned_cards_frame(true).1);
+        for words in ["Learn", "Choose"] {
+            let (_, l, lclip) = find(&locked, words);
+            let (_, e, eclip) = find(&edited, words);
+            assert!((l.height() - e.height()).abs() < 1.0 && (l.width() - e.width()).abs() < 2.0,
+                "{words:?} is drawn {e:?} being edited, {l:?} locked");
+            assert!(eclip.top() >= lclip.top() - 1.0,
+                "{words:?} is cut at {eclip:?} being edited, {lclip:?} locked: it reaches over the header");
+        }
+    }
+
+    /// Pictures of [`pinned_cards_frame`], locked and being edited:
+    /// `cargo test -p flexinput-ui --lib shoot_easy_pinned_cards -- --ignored`, PNGs
+    /// `target/module_shots/easy_cards_{locked,editing}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_pinned_cards() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for editing in [false, true] {
+            let (ctx, shapes, shot) = pinned_cards_frame(editing);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 420.0));
+            let name = if editing { "easy_cards_editing" } else { "easy_cards_locked" };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/module_shots")
+                .join(format!("{name}.png"));
+            shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// Pictures of Easy mode's header row and left panel, the layout being edited and not:
+    /// `cargo test -p flexinput-ui --lib shoot_easy_layout_editor -- --ignored`, PNGs in
+    /// `target/module_shots/easy_header_{browse,editing}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_layout_editor() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == "subpatch")
+            .expect("the sub-patch module");
+        // Browsing; editing with the gradient rectangle selected; editing with a pinned
+        // Response Curve selected; editing a layout with tabs, its strip selected.
+        for (editing, curve, tabs) in [(false, false, false), (true, false, false), (true, true, false), (true, false, true)] {
+            let ctx = egui::Context::default();
+            crate::app::fonts::setup_fonts(&ctx);
+            let mut canvas = Canvas::new();
+            let oid = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+            if let Some(n) = canvas.snarl.get_node_mut(oid) {
+                let mut sp = UiSubPatch::default();
+                sp.display_name = "Shooter".into();
+                if curve {
+                    let curve_desc = flexinput_modules::all_modules()
+                        .into_iter()
+                        .map(|r| r.descriptor)
+                        .find(|d| d.id == "module.response_curve")
+                        .expect("the curve module");
+                    let mut node = NodeData::from(&curve_desc);
+                    node.display_name = "Left stick curve".into();
+                    let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), node);
+                    sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                        "inner_node_id": inner.0, "element_id": "curve", "pos": [16.0, 16.0], "size": [296.0, 232.0],
+                    })).expect("a pin")));
+                }
+                use crate::canvas::node::{Gradient, GradientKind, LayoutDecoration};
+                let mut rect = crate::canvas::viewer::make_default_decoration("rect");
+                if let LayoutDecoration::Rect { fill_gradient, size, .. } = &mut rect {
+                    *size = [220.0, 120.0];
+                    let mut g = Gradient::new(GradientKind::Linear, [40, 120, 255, 255], [255, 80, 160, 255]);
+                    g.add_stop_at(0.6);
+                    g.stops[1].color = [255, 230, 90, 255];
+                    *fill_gradient = Some(g);
+                }
+                let mut ellipse = crate::canvas::viewer::make_default_decoration("ellipse");
+                if let LayoutDecoration::Ellipse { fill_gradient, pos, .. } = &mut ellipse {
+                    *pos = [280.0, 30.0];
+                    *fill_gradient = Some(Gradient::new(GradientKind::Radial, [255, 255, 255, 255], [20, 160, 120, 0]));
+                }
+                sp.items.push(LayoutItem::Deco(rect));
+                sp.items.push(LayoutItem::Deco(ellipse));
+                sp.selected_item = Some(0);
+                sp.selected_items = vec![0];
+                if tabs {
+                    sp.layout_tabs = vec!["Aim".into(), "Move".into(), "Menu".into()];
+                    if let Some(it) = sp.items.last_mut() {
+                        it.set_tab(Some(1));
+                    }
+                }
+                n.subpatch = Some(Box::new(sp));
+                n.extra.layout_unlocked = editing;
+            }
+            let mut easy_state = EasyState::default();
+            let (mut overlay, mut config) = Default::default();
+            let mut nav = crate::gamepad_nav::GamepadNav::default();
+            let mut favorites = Vec::new();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 560.0));
+            let mut shot = crate::canvas::shot::Shot::default();
+            let mut shapes = Vec::new();
+            for i in 0..8 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(i as f64 / 30.0),
+                    ..Default::default()
+                };
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let total = ui.available_rect_before_wrap();
+                        let left = egui::Rect::from_min_size(total.min, egui::vec2(280.0, total.height()));
+                        let center = egui::Rect::from_min_max(egui::pos2(left.right() + 6.0, total.top()), total.max);
+                        ui.painter().rect_filled(left, 0.0, egui::Color32::from_gray(0x1a));
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(left.shrink2(egui::vec2(10.0, 0.0))), |ui| {
+                            match layout_editing_subpatch(&canvas) {
+                                Some(id) => show_layout_inspector(ui, &mut canvas, id),
+                                None => {
+                                    ui.add_space(44.0);
+                                    ui.label("(the Devices panel)");
+                                }
+                            }
+                        });
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(center), |ui| {
+                            show(
+                                ui, &mut canvas, &mut easy_state, &mut overlay, &mut config, None,
+                                Default::default(), &[], &[], &Default::default(), &Default::default(),
+                                &Default::default(), &Default::default(), &mut favorites, &mut nav,
+                            );
+                        });
+                    });
+                });
+                shot.absorb(&out.textures_delta);
+                shapes = out.shapes;
+            }
+            let name = match (editing, curve) {
+                _ if tabs => "easy_layout_tabs",
+                (_, true) => "easy_inspector_curve",
+                (true, _) => "easy_header_editing",
+                _ => "easy_header_browse",
+            };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/module_shots")
+                .join(format!("{name}.png"));
+            shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
         }
     }
 }

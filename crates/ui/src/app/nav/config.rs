@@ -145,9 +145,32 @@ impl FlexInputApp {
         // pin's passthrough set: right-stick felt → LEFT adjusts; left felt →
         // RIGHT adjusts; BOTH felt → the D-pad adjusts and neither stick is
         // repurposed. D-pad works as the discrete alternative in every case.
+        if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+            self.nav_publish_module_part_focus(ctx, outer);
+        }
+
         use crate::app::ControlInput;
         let editing = self.gamepad_nav.edit_level != EditLevel::Widget;
         let control = if editing { self.config_control_input() } else { ControlInput::LeftStick };
+        // A curve edited with the right stick standing in for the left (the left passes
+        // through, to be felt): while a dot is being picked the right stick still leads the
+        // cursor over the graph - to add, delete or grab a dot where it points - and the
+        // D-pad steps between dots; once a dot is grabbed, the right stick moves it, and the
+        // cursor waits out of sight to come back on the dot.
+        let rs_cursor = matches!(control, ControlInput::RightStick)
+            && self.gamepad_nav.edit_level == EditLevel::CurveDots;
+        if matches!(control, ControlInput::RightStick) && self.gamepad_nav.edit_level == EditLevel::CurveDot {
+            self.gamepad_nav.cursor_visible = false;
+        }
+        if rs_cursor && !self.gamepad_nav.cursor_visible && nav.rstick.length() > 0.08 {
+            if let Some((outer, inner, _)) = self.gamepad_nav.config_nav_sel.clone() {
+                if let Some(p) = self.nav_curve_dot_screen(ctx, outer, inner, self.gamepad_nav.curve_dot) {
+                    self.gamepad_nav.cursor_pos = p;
+                    self.gamepad_nav.cursor_visible = true;
+                    self.gamepad_nav.cursor_last_move = std::time::Instant::now();
+                }
+            }
+        }
 
         // Shared RS/gyro cursor (drives `cursor_pos`, monitor-clamped for the
         // fullscreen overlay). The shared editors read `cursor_pos` in screen
@@ -156,6 +179,7 @@ impl FlexInputApp {
         // sticks pass through) so aiming the game doesn't fling the cursor.
         let cursor_nav = match control {
             ControlInput::LeftStick => nav.clone(),
+            ControlInput::RightStick if rs_cursor => nav.clone(),
             ControlInput::RightStick | ControlInput::Dpad => {
                 let mut n = nav.clone();
                 n.rstick = egui::Vec2::ZERO;
@@ -171,8 +195,8 @@ impl FlexInputApp {
         // != Widget), so it never touches the sub-patch's own selection.
         if editing {
             if let Some((outer, inner, elem)) = self.gamepad_nav.config_nav_sel.clone() {
-                let rt_rising = nav.rt > 0.5 && !self.gamepad_nav.prev_rt;
-                let lt_rising = nav.lt > 0.5 && !self.gamepad_nav.prev_lt;
+                let rt_rising = nav.rt_down && !self.gamepad_nav.prev_rt;
+                let lt_rising = nav.lt_down && !self.gamepad_nav.prev_lt;
                 // The measure widget: bespoke South/East flow (not field-walking).
                 // RWS Aim's and the JSM Config one are the same procedure on the
                 // same params, so one driver serves both.
@@ -188,6 +212,13 @@ impl FlexInputApp {
                 let dnav = match control {
                     // LS already drives the editor's stick role.
                     ControlInput::LeftStick => nav.clone(),
+                    // Picking a dot: the right stick is the cursor, the D-pad steps.
+                    ControlInput::RightStick if rs_cursor => {
+                        let mut n = nav.clone();
+                        n.lstick = egui::Vec2::ZERO;
+                        n.rstick = egui::Vec2::ZERO;
+                        n
+                    }
                     // RS → the editor's "left stick" role; LS freed for passthrough.
                     ControlInput::RightStick => {
                         let mut n = nav.clone();
@@ -212,11 +243,15 @@ impl FlexInputApp {
         }
 
         // ── Widget level: focus nav between config pins ──────────────────────
-        // The cursor focuses whatever pin it hovers (pointer-style pick).
+        // The walk's stops: each pin, and on a module pinned whole each of its fields and
+        // parts (`nav_widget_stops`) - nothing to go into and out of.
+        let stops = self.config_stops(ctx, &targets);
+        // The cursor focuses whatever stop it hovers (pointer-style pick): the smallest.
         if self.gamepad_nav.cursor_visible {
             let cp = self.gamepad_nav.cursor_pos;
-            if let Some((idx, _)) = targets.iter().rev().find(|(_, r)| r.contains(cp)) {
-                self.gamepad_nav.config_index = Some(*idx);
+            if let Some(stop) = stops.iter().filter(|s| s.3.contains(cp)).min_by(|a, b| a.3.area().total_cmp(&b.3.area())) {
+                let stop = stop.clone();
+                self.config_select_stop(&stop);
             }
         }
 
@@ -226,7 +261,7 @@ impl FlexInputApp {
 
         // South / RT → enter the SAME editor the sub-patch canvas would, chosen
         // by widget kind (mirrors the Widget-level enters in nav_drive_subpatch).
-        if nav.is_rising("btn_south") || (nav.rt > 0.5 && !self.gamepad_nav.prev_rt) {
+        if nav.is_rising("btn_south") || (nav.rt_down && !self.gamepad_nav.prev_rt) {
             // Real World Calibration is one button: South presses it, starting the guided
             // calibration's choose step rather than entering an editor.
             if let Some((outer, inner, elem)) = self.gamepad_nav.config_nav_sel.clone() {
@@ -239,6 +274,20 @@ impl FlexInputApp {
                 }
             }
             if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+                // On a section heading of a module pinned whole: South folds or unfolds it.
+                if self.nav_flip_section_fold(ctx, outer) {
+                    return;
+                }
+                // On a field of a module pinned whole that flips (a toggle in a row): South
+                // flips it there and then.
+                if matches!(self.nav_selected_kind(outer), NavWidgetKind::MultiField | NavWidgetKind::Value) {
+                    if let Some(k) = self.gamepad_nav.module_field {
+                        if self.nav_flip_toggle_field(outer, k) {
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
                 match self.nav_selected_kind(outer) {
                     NavWidgetKind::Curve => {
                         self.gamepad_nav.edit_level = EditLevel::CurveDots;
@@ -254,7 +303,8 @@ impl FlexInputApp {
                         let kind = self.nav_selected_kind(outer);
                         self.gamepad_nav.edit_level = EditLevel::Editing;
                         self.gamepad_nav.fine_increment = false;
-                        self.gamepad_nav.field_index = 0;
+                        // On a field of a module pinned whole: that field.
+                        self.gamepad_nav.field_index = self.gamepad_nav.module_field.unwrap_or(0);
                         self.gamepad_nav.edit_baseline =
                             Some(Box::new(self.tabs[self.active_tab].canvas.snapshot_for_undo()));
                         if matches!(kind, NavWidgetKind::Dropdown) {
@@ -321,11 +371,8 @@ impl FlexInputApp {
             }
         }
         if let Some(step) = step {
-            let cur_pos = self
-                .gamepad_nav
-                .config_index
-                .and_then(|item| targets.iter().position(|(idx, _)| *idx == item));
-            let rects: Vec<egui::Rect> = targets.iter().map(|(_, r)| *r).collect();
+            let cur_pos = self.config_stop_at(&stops);
+            let rects: Vec<egui::Rect> = stops.iter().map(|s| s.3).collect();
             let next_pos = match cur_pos {
                 // Keeping to its lane, as the Easy body's walk does.
                 Some(cur) => gn::step_in_lane(
@@ -335,10 +382,58 @@ impl FlexInputApp {
                 None => nearest_rect_in_dir(&rects, None, step),
             };
             if let Some(next_pos) = next_pos {
-                self.gamepad_nav.config_index = Some(targets[next_pos].0);
+                let stop = stops[next_pos].clone();
+                self.config_select_stop(&stop);
             }
             ctx.request_repaint();
         }
+    }
+
+    /// The config overlay walk's stops, on the screen: each of its pad-navigable pins
+    /// (`targets`), and for a module pinned whole its own stops instead (`nav_widget_stops`,
+    /// as drawn on the overlay) - as `(item, part, field, rect)`.
+    fn config_stops(&self, ctx: &egui::Context, targets: &[(usize, egui::Rect)]) -> Vec<super::fields::EasyStop> {
+        use crate::canvas::node::LayoutItem;
+        let Some(tab) = self.tabs.get(self.active_tab) else { return Vec::new() };
+        let mut out = Vec::new();
+        for (idx, rect) in targets {
+            let widget = match tab.config.items.get(*idx) {
+                Some(LayoutItem::Module(m)) => self
+                    .picker_node(&m.source_path, egui_snarl::NodeId(m.inner_node_id))
+                    .and_then(|n| Self::nav_widget_stops(
+                        ctx, crate::canvas::viewer::curve_ui_module_id(n), &m.element_id, m.inner_node_id,
+                        crate::canvas::viewer::config_overlay_viewport(),
+                    )),
+                _ => None,
+            };
+            match widget {
+                Some(stops) => out.extend(stops.into_iter().map(|(p, f, r)| (*idx, Some(p), f, r))),
+                None => out.push((*idx, None, None, *rect)),
+            }
+        }
+        out
+    }
+
+    /// Which of `stops` the config overlay's walk is on: its focused pin, and on a module
+    /// pinned whole its stop there - or the first of that pin's, where its stop is gone.
+    fn config_stop_at(&self, stops: &[super::fields::EasyStop]) -> Option<usize> {
+        let i = self.gamepad_nav.config_index?;
+        let (part, field) = if self.gamepad_nav.module_part_item == Some(i) {
+            (self.gamepad_nav.module_part.clone(), self.gamepad_nav.module_field)
+        } else {
+            (None, None)
+        };
+        stops.iter().position(|s| s.0 == i && s.1 == part && s.2 == field)
+            .or_else(|| stops.iter().position(|s| s.0 == i))
+    }
+
+    /// Put the config overlay's walk on `stop`: its pin focused, and on a module pinned whole
+    /// its part and field.
+    fn config_select_stop(&mut self, stop: &super::fields::EasyStop) {
+        self.gamepad_nav.config_index = Some(stop.0);
+        self.gamepad_nav.module_part = stop.1.clone();
+        self.gamepad_nav.module_field = stop.2;
+        self.gamepad_nav.module_part_item = stop.1.as_ref().map(|_| stop.0);
     }
 
     /// Right-stick virtual cursor, clamped to the monitor (the overlay covers it
@@ -559,8 +654,15 @@ impl FlexInputApp {
             return None;
         }
         let (_, inner, elem) = self.gamepad_nav.config_nav_sel.as_ref()?;
-        Some((inner.0, elem.clone(), self.gamepad_nav.field_index))
+        // Working in a part of a whole-module pin: the part's field.
+        let elem = match (&self.gamepad_nav.module_part, elem.as_str()) {
+            (Some(part), "whole_module") => part.clone(),
+            _ => elem.clone(),
+        };
+        Some((inner.0, elem, self.gamepad_nav.field_index))
     }
+
+
 }
 
 /// Redraw the focused value-field's bloom ring in the config overlay's OWN
@@ -575,20 +677,29 @@ pub(crate) fn draw_config_field_glow(
     ctx: &egui::Context,
     target: Option<(usize, String, usize)>,
     host: egui::LayerId,
+    pin: Option<egui::Rect>,
 ) {
     let Some((inner_uid, elem, field_idx)) = target else { return };
+    let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
     let field_rects: Option<(u64, Vec<egui::Rect>)> =
         ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_field_rects", inner_uid, elem))));
-    let Some((pass, frs)) = field_rects else { return };
-    if pass != ctx.cumulative_pass_nr() {
-        return;
-    }
-    if let Some(fr) = frs
-        .get(field_idx)
+    if let Some(fr) = field_rects
+        .filter(|(pass, _)| *pass == ctx.cumulative_pass_nr())
+        .and_then(|(_, frs)| frs.get(field_idx).copied())
         .filter(|r| FlexInputApp::nav_ring_is_worth_drawing(r))
     {
-        let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
-        FlexInputApp::paint_field_glow_ring(ctx, *fr, accent, host, ctx.content_rect());
+        FlexInputApp::paint_field_glow_ring(ctx, fr, accent, host, ctx.content_rect());
+    }
+    // The field's name and value, over the part it's in (inside a whole-module pin) or the
+    // pin - the one sign of which field it is where its row doesn't say where its fields are.
+    let label = ctx.data(|d| d.get_temp::<(u64, String)>(super::fields::config_field_hud_id()))
+        .filter(|(p, _)| crate::widgets::nav_pass_matches(ctx, *p))
+        .map(|(_, l)| l);
+    let item = crate::canvas::viewer::module_part_focus_rect(ctx, inner_uid).or(pin);
+    if let (Some(label), Some(item)) = (label, item) {
+        super::fields::paint_field_label_pill(
+            ctx, egui::Id::new("gp_nav_config_field_hud"), item, &label, accent, host, ctx.content_rect(),
+        );
     }
 }
 
@@ -660,6 +771,36 @@ pub(crate) fn nav_reserved_pins(
 mod tests {
     use super::nav_reserved_pins;
     use crate::app::ControlInput;
+
+    // A field edited on the config overlay is named over its pin: handing the overlay the
+    // label and drawing it go through without the context deadlocking - asking for the pass
+    // inside `data_mut` hung the app the moment a field was edited there.
+    #[test]
+    fn a_config_fields_label_is_handed_over_and_drawn() {
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 400.0));
+        let pin = egui::Rect::from_min_size(egui::pos2(100.0, 200.0), egui::vec2(200.0, 60.0));
+        let mut drawn = false;
+        for t in 0..3 {
+            let raw = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 30.0), ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                super::super::fields::publish_config_field_label(ctx, "Exp = 0.500".into());
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::draw_config_field_glow(ui.ctx(), Some((7, "scale_row".into(), 0)), ui.layer_id(), Some(pin));
+                });
+            });
+            fn has(s: &egui::Shape, words: &str) -> bool {
+                match s {
+                    egui::Shape::Text(t) => t.galley.text() == words,
+                    egui::Shape::Vec(v) => v.iter().any(|s| has(s, words)),
+                    _ => false,
+                }
+            }
+            drawn = out.shapes.iter().any(|c| has(&c.shape, "Exp = 0.500"));
+        }
+        assert!(drawn, "the field's label is drawn over its pin");
+    }
 
     // Walking between pins uses the d-pad, the left stick and the face buttons: none of
     // them may reach the game, whatever the focused pin passes through. The right stick

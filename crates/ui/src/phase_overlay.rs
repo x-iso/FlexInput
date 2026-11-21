@@ -16,7 +16,7 @@ use std::time::Duration;
 use eframe::egui::{self, Align2, Color32, Pos2, Rect, Stroke};
 use flexinput_core::Signal;
 
-use crate::gamepad_nav::{merge_nav_input, read_nav_input, NavInput};
+use crate::gamepad_nav::{merge_nav_input, read_nav_input_calibrated, NavInput};
 use crate::settings::{self, AppSettings};
 
 type LiveSignals = HashMap<(String, String), Signal>;
@@ -67,18 +67,32 @@ struct Nav {
     last_t: Option<f64>,
     /// Moved since it was last saved: saved when the input lets go.
     unsaved: bool,
+    /// Per pad, its triggers against their calibrated points.
+    triggers: HashMap<String, [flexinput_core::automap::TriggerCrossing; 2]>,
 }
 
-/// The pads' nav input this frame, merged into one controller.
-fn read_pads(live: &LiveSignals, nav: &mut Nav, first: bool) -> NavInput {
+/// The pads' nav input this frame, each through its calibration (`cals`, stock for a pad
+/// with none), merged into one controller.
+fn read_pads(
+    live: &LiveSignals,
+    cals: &HashMap<String, flexinput_engine::eval::PadCalibration>,
+    nav: &mut Nav,
+    first: bool,
+    dt: f32,
+) -> NavInput {
     let pads: HashSet<&str> = live.keys()
         .map(|(dev, _)| dev.as_str())
         .filter(|dev| crate::app::graph::is_physical_pad_id(dev))
         .collect();
     let mut merged: Option<NavInput> = None;
     let mut prev = HashMap::new();
+    let stock = flexinput_engine::eval::PadCalibration::default();
+    nav.triggers.retain(|id, _| pads.contains(id.as_str()));
     for dev in pads {
-        let mut input = read_nav_input(live, dev, nav.prev.get(dev).unwrap_or(&HashSet::new()));
+        let cal = cals.get(dev).unwrap_or(&stock);
+        let triggers = nav.triggers.entry(dev.to_string()).or_default();
+        let held = nav.prev.get(dev).cloned().unwrap_or_default();
+        let mut input = read_nav_input_calibrated(live, dev, &held, cal, triggers, dt);
         if first {
             input.rising.clear();
         }
@@ -96,6 +110,8 @@ fn read_pads(live: &LiveSignals, nav: &mut Nav, first: bool) -> NavInput {
         rstick: egui::Vec2::ZERO,
         lt: 0.0,
         rt: 0.0,
+        lt_down: false,
+        rt_down: false,
         gyro_pitch: 0.0,
         gyro_yaw: 0.0,
     })
@@ -151,6 +167,7 @@ pub(crate) fn show(
     settings: &mut AppSettings,
     settings_dirty: &mut bool,
     live: &LiveSignals,
+    cals: &HashMap<String, flexinput_engine::eval::PadCalibration>,
     overlay_fps: u32,
 ) {
     if !visible(ctx) {
@@ -162,8 +179,8 @@ pub(crate) fn show(
     let stored = ctx.data_mut(|d| d.remove_temp::<Nav>(nav_id()));
     let first = stored.is_none();
     let mut nav = stored.unwrap_or_default();
-    let input = read_pads(live, &mut nav, first);
     let dt = nav.last_t.map_or(0.0, |t| (now - t).clamp(0.0, 0.1)) as f32;
+    let input = read_pads(live, cals, &mut nav, first, dt);
     nav.last_t = Some(now);
 
     if input.is_rising("btn_east") {
@@ -315,6 +332,8 @@ mod tests {
             rstick: egui::Vec2::ZERO,
             lt: 0.0,
             rt: 0.0,
+            lt_down: false,
+            rt_down: false,
             gyro_pitch: 0.0,
             gyro_yaw: 0.0,
         }

@@ -102,6 +102,9 @@ pub struct ChordWatchConfig {
     pub config: Option<ShortcutSpec>,
     /// The phase tuner over the game: from any pad, like the config overlay's.
     pub phase: Option<ShortcutSpec>,
+    /// The previous / next patch tab: from the nav pads, like the window shortcuts.
+    pub tab_prev: Option<ShortcutSpec>,
+    pub tab_next: Option<ShortcutSpec>,
 }
 
 /// The six toggle flags the watcher raises; the UI loop consumes each once per
@@ -115,6 +118,8 @@ pub struct ShortcutToggles {
     pub pin: Arc<AtomicBool>,
     pub config: Arc<AtomicBool>,
     pub phase: Arc<AtomicBool>,
+    pub tab_prev: Arc<AtomicBool>,
+    pub tab_next: Arc<AtomicBool>,
 }
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
@@ -123,6 +128,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(33); // ~30 Hz
 /// machine has been seen surfacing outright duplicate pads); the window absorbs
 /// that echo. Longer than any loopback latency, shorter than a human re-toggle.
 const TOGGLE_REFRACTORY_MS: u64 = 400;
+/// The refractory of the tab shortcuts: short enough to step along several tabs in a row
+/// with Home held, still past a loopback echo of the press.
+const TAB_REFRACTORY_MS: u64 = 150;
 /// Grace window after the thread starts before any fire is honored. Covers a
 /// controller present at launch whose BT handshake / first raw-HID reports can
 /// momentarily latch buttons true.
@@ -169,6 +177,43 @@ fn chord_group(dev: &str) -> &str {
         return "joycon";
     }
     dev
+}
+
+/// Each trigger's analog pin, and the button a shortcut names it by.
+const TRIGGER_BUTTONS: [(&str, &str); 2] = [("left_trigger", "btn_lt_dig"), ("right_trigger", "btn_rt_dig")];
+
+/// `snap` with each pad's trigger buttons pressed where its calibration presses them - its
+/// point on the travel within its range, with its band and its debounce - rather than where
+/// the pad's own flag does, which can be early. `crossings` carries each pad's triggers from
+/// poll to poll, `dt` seconds apart; a pad with no calibration has the stock one.
+fn calibrated_triggers(
+    snap: &SignalMap,
+    cals: &HashMap<String, flexinput_engine::eval::PadCalibration>,
+    crossings: &mut HashMap<String, [flexinput_core::automap::TriggerCrossing; 2]>,
+    dt: f32,
+) -> SignalMap {
+    let mut out = snap.clone();
+    let stock = flexinput_engine::eval::PadCalibration::default();
+    let pads: HashSet<&String> = snap.keys()
+        .filter(|(_, pin)| TRIGGER_BUTTONS.iter().any(|(analog, _)| pin == analog))
+        .map(|(dev, _)| dev)
+        .collect();
+    crossings.retain(|dev, _| pads.contains(dev));
+    for dev in pads {
+        let cal = cals.get(dev).unwrap_or(&stock);
+        let cross = crossings.entry(dev.clone()).or_default();
+        for (side, (analog, button)) in TRIGGER_BUTTONS.into_iter().enumerate() {
+            let Some(raw) = snap.get(&(dev.clone(), analog.to_string())) else { continue };
+            let right = side == 1;
+            let (edges, hold) = cal.trigger_edges(right, crate::gamepad_nav::NAV_TRIGGER_LEAST);
+            cross[side].step(&edges, cal.trigger(right, raw.as_float()), dt, hold);
+            // An analog trigger that stays at zero while its button presses is a digital one.
+            let button_down = snap.get(&(dev.clone(), button.to_string())).is_some_and(|b| b.as_bool());
+            let down = cross[side].down() || (raw.as_float() <= 0.0 && button_down);
+            out.insert((dev.clone(), button.to_string()), Signal::Bool(down));
+        }
+    }
+    out
 }
 
 /// True when one physical controller holds every button in `combo`.
@@ -232,6 +277,7 @@ fn service_target(
     superset_assigned: bool,
     superset_held: bool,
     started_at: Instant,
+    refractory_ms: u64,
 ) -> bool {
     let Some(spec) = spec else {
         // Unassigned (or handled elsewhere): clear state so a later re-assign
@@ -259,7 +305,7 @@ fn service_target(
         let in_grace = now.duration_since(started_at)
             < Duration::from_millis(STARTUP_GRACE_MS);
         let in_refractory = tw.last_toggle
-            .map(|t| now.duration_since(t) < Duration::from_millis(TOGGLE_REFRACTORY_MS))
+            .map(|t| now.duration_since(t) < Duration::from_millis(refractory_ms))
             .unwrap_or(false);
         if !in_grace && !in_refractory {
             toggle.store(true, Ordering::Relaxed);
@@ -448,6 +494,9 @@ pub fn spawn_chord_watcher(
     // Devices currently selected for UI navigation, republished by the UI each
     // frame. Consulted only when `nav_only` is set.
     nav_devices: Arc<RwLock<HashSet<String>>>,
+    // Each pad's calibration, republished by the UI when it changes: a shortcut with a
+    // trigger in it presses where the trigger is calibrated to (`calibrated_triggers`).
+    pad_cals: Arc<RwLock<HashMap<String, flexinput_engine::eval::PadCalibration>>>,
     proc_device_signals: flexinput_engine::ArcSignals,
     // Where the owned buttons are published: the engine blocks them from the
     // game, gamepad nav masks them. See [`owned_pins`].
@@ -460,10 +509,11 @@ pub fn spawn_chord_watcher(
         .name("gamepad-shortcut-watcher".into())
         .spawn(move || {
             let started_at = Instant::now();
-            let mut watches: [TargetWatch; 6] = Default::default();
+            let mut watches: [TargetWatch; 8] = Default::default();
             let mut owned: Keys = Keys::new();
             let mut leaders = Leaders::default();
             let mut replay: Keys = Keys::new();
+            let mut crossings: HashMap<String, [flexinput_core::automap::TriggerCrossing; 2]> = HashMap::new();
 
             loop {
                 let cfg = config.read().map(|c| c.clone()).unwrap_or_default();
@@ -471,7 +521,7 @@ pub fn spawn_chord_watcher(
                 // Snapshot the signal map. With the ArcSwap publish model the
                 // load is a refcount bump and iteration walks the snapshot
                 // without contending the I/O thread.
-                let snap = proc_device_signals.load_full();
+                let raw = proc_device_signals.load_full();
 
                 // The four window shortcuts restrict to the nav-selected pads
                 // when nav-only is on; the config and phase chords always fire
@@ -479,22 +529,39 @@ pub fn spawn_chord_watcher(
                 let nav_set = nav_devices.read().map(|s| s.clone()).unwrap_or_default();
                 let window_filter = if cfg.nav_only { Some(&nav_set) } else { None };
 
-                let targets: [Target; 6] = [
+                let targets: [Target; 8] = [
                     (&cfg.seethrough, window_filter),
                     (&cfg.panic, window_filter),
                     (&cfg.overlay, window_filter),
                     (&cfg.pin, window_filter),
                     (&cfg.config, None),
                     (&cfg.phase, None),
+                    (&cfg.tab_prev, window_filter),
+                    (&cfg.tab_next, window_filter),
                 ];
                 let flags = [&toggles.seethrough, &toggles.panic, &toggles.overlay,
-                    &toggles.pin, &toggles.config, &toggles.phase];
-                let combos: [Option<&[String]>; 6] = targets.map(|(s, _)|
+                    &toggles.pin, &toggles.config, &toggles.phase, &toggles.tab_prev, &toggles.tab_next];
+                // The tab shortcuts step: a short refractory, so a run of presses steps on.
+                let refractory: [u64; 8] = std::array::from_fn(|i|
+                    if i >= 6 { TAB_REFRACTORY_MS } else { TOGGLE_REFRACTORY_MS });
+                let combos: [Option<&[String]>; 8] = targets.map(|(s, _)|
                     s.as_ref().map(|s| s.combo.as_slice()).filter(|c| !c.is_empty()));
-                let held: [bool; 6] = std::array::from_fn(|i| combos[i]
+                // A shortcut with a trigger in it reads the trigger where its calibration
+                // presses it; the rest read the snapshot as it is.
+                let uses_triggers = combos.iter().flatten()
+                    .any(|c| c.iter().any(|p| TRIGGER_BUTTONS.iter().any(|(_, b)| b == p)));
+                let calibrated;
+                let snap: &SignalMap = if uses_triggers {
+                    let cals = pad_cals.read().map(|c| c.clone()).unwrap_or_default();
+                    calibrated = calibrated_triggers(&raw, &cals, &mut crossings, POLL_INTERVAL.as_secs_f32());
+                    &calibrated
+                } else {
+                    &raw
+                };
+                let held: [bool; 8] = std::array::from_fn(|i| combos[i]
                     .map_or(false, |c| combo_held(&snap, c, targets[i].1)));
 
-                let mut fired = [false; 6];
+                let mut fired = [false; 8];
                 #[cfg(target_os = "linux")]
                 let pin_raised_before = watches[3].last_toggle;
                 for i in 0..targets.len() {
@@ -509,7 +576,7 @@ pub fn spawn_chord_watcher(
                         }
                     }
                     fired[i] = service_target(&mut watches[i], targets[i].0, flags[i], held[i],
-                        superset_assigned, superset_held, started_at);
+                        superset_assigned, superset_held, started_at, refractory[i]);
                 }
                 // Linux: a minimized window's UI thread can sit idle until it is
                 // shown again (Wayland stops its frames), so the pin also goes to
@@ -640,17 +707,17 @@ mod chord_tests {
     fn a_larger_chord_cancels_the_long_press_inside_it() {
         let (mut tw, flag, t0) = (TargetWatch::default(), AtomicBool::new(false), long_ago());
         let home = spec(&["btn_guide"], "long");
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
-        service_target(&mut tw, &home, &flag, true, true, true, t0);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
+        service_target(&mut tw, &home, &flag, true, true, true, t0, TOGGLE_REFRACTORY_MS);
         std::thread::sleep(Duration::from_millis(5));
         // D-pad let go, Home still held past the threshold: still the chord's.
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(!flag.load(Ordering::Relaxed));
         // A fresh hold of Home alone works again.
-        service_target(&mut tw, &home, &flag, false, true, false, t0);
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
+        service_target(&mut tw, &home, &flag, false, true, false, t0, TOGGLE_REFRACTORY_MS);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
         std::thread::sleep(Duration::from_millis(5));
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(flag.load(Ordering::Relaxed));
     }
 
@@ -660,15 +727,15 @@ mod chord_tests {
     fn an_on_press_subset_fires_on_release_unless_the_larger_chord_happened() {
         let (mut tw, flag, t0) = (TargetWatch::default(), AtomicBool::new(false), long_ago());
         let home = spec(&["btn_guide"], "down");
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(!flag.load(Ordering::Relaxed), "must not fire at the press edge");
-        service_target(&mut tw, &home, &flag, false, true, false, t0);
+        service_target(&mut tw, &home, &flag, false, true, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(flag.load(Ordering::Relaxed));
 
         let (mut tw, flag) = (TargetWatch::default(), AtomicBool::new(false));
-        service_target(&mut tw, &home, &flag, true, true, false, t0);
-        service_target(&mut tw, &home, &flag, true, true, true, t0);
-        service_target(&mut tw, &home, &flag, false, true, false, t0);
+        service_target(&mut tw, &home, &flag, true, true, false, t0, TOGGLE_REFRACTORY_MS);
+        service_target(&mut tw, &home, &flag, true, true, true, t0, TOGGLE_REFRACTORY_MS);
+        service_target(&mut tw, &home, &flag, false, true, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(!flag.load(Ordering::Relaxed));
     }
 
@@ -676,7 +743,7 @@ mod chord_tests {
     #[test]
     fn an_on_press_shortcut_with_nothing_larger_fires_at_the_press() {
         let (mut tw, flag, t0) = (TargetWatch::default(), AtomicBool::new(false), long_ago());
-        service_target(&mut tw, &spec(&["btn_guide"], "down"), &flag, true, false, false, t0);
+        service_target(&mut tw, &spec(&["btn_guide"], "down"), &flag, true, false, false, t0, TOGGLE_REFRACTORY_MS);
         assert!(flag.load(Ordering::Relaxed));
     }
 
@@ -711,6 +778,26 @@ mod chord_tests {
 
         s.insert(key(pad, "dpad_up"), Signal::Bool(false));
         assert_eq!(owned_pins(&s, &targets, &trailing), idle);
+    }
+
+    /// A shortcut with a trigger in it presses where the trigger is calibrated to, not where
+    /// the pad's own flag says - which can be at the first touch of the trigger.
+    #[test]
+    fn a_shortcut_trigger_presses_at_its_calibrated_point() {
+        let pad = "gilrs:ds4:0";
+        let mut cals = HashMap::new();
+        let params: HashMap<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({ "ltrig_digital_threshold": 0.5 })).unwrap();
+        cals.insert(pad.to_string(), flexinput_engine::eval::PadCalibration::from_params(&params));
+        let mut crossings = HashMap::new();
+        let mut s = SignalMap::new();
+        s.insert(key(pad, "btn_lt_dig"), Signal::Bool(true));
+        s.insert(key(pad, "left_trigger"), Signal::Float(0.3));
+        let out = calibrated_triggers(&s, &cals, &mut crossings, 0.033);
+        assert_eq!(out.get(&key(pad, "btn_lt_dig")), Some(&Signal::Bool(false)), "short of the point");
+        s.insert(key(pad, "left_trigger"), Signal::Float(0.6));
+        let out = calibrated_triggers(&s, &cals, &mut crossings, 0.033);
+        assert_eq!(out.get(&key(pad, "btn_lt_dig")), Some(&Signal::Bool(true)), "past it");
     }
 
     /// Mic-mute may bind alone but games bind it natively: it's no leader, so

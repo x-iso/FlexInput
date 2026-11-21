@@ -329,6 +329,50 @@ impl Rig {
     }
 }
 
+/// Picking an element to pin, a ring round each module's fold chevron pins the whole module:
+/// a click on it asks for the module whole, at the size its body took on the canvas.
+#[test]
+fn the_ring_round_the_chevron_pins_the_whole_module() {
+    let (mut rig, ids) = Rig::real("module.response_curve", &[egui::pos2(100.0, 100.0)]);
+    crate::canvas::viewer::set_overlay_pick_active(&rig.ctx, true);
+    rig.idle(3);
+    let amber = egui::Color32::from_rgb(245, 180, 60);
+    let back = rig.to_global.inverse();
+    let ring = rig.shapes.iter().find_map(|cs| match &cs.shape {
+        egui::epaint::Shape::Circle(c) if c.stroke.color == amber => Some(back * c.center),
+        _ => None,
+    });
+    let ring = ring.expect("the ring is drawn while picking");
+    let frame = rig.frame_rect(ids[0]);
+    assert!(ring.x < frame.left() + 30.0 && ring.y < frame.top() + 30.0, "at the header's left: {ring:?} in {frame:?}");
+    // It glows round itself, so it stands out among the module's controls.
+    let glows = rig.shapes.iter().filter(|cs| matches!(&cs.shape,
+        egui::epaint::Shape::Circle(c) if c.fill == egui::Color32::TRANSPARENT && (back * c.center).distance(ring) < 0.5)).count();
+    assert!(glows >= 3, "a glow round the ring ({glows} rings)");
+    // Under the pointer, the whole module it would pin glows round its frame.
+    let hot = egui::Color32::from_rgb(255, 220, 140);
+    rig.frame(vec![egui::Event::PointerMoved(rig.to_global * ring)]);
+    rig.idle(2);
+    let outlined = rig.shapes.iter().any(|cs| match &cs.shape {
+        egui::epaint::Shape::Rect(r) => r.stroke.color == hot && (back * r.rect.center()).distance(frame.center()) < 2.0
+            && (back * r.rect.min).distance(frame.min) < 3.0,
+        _ => false,
+    });
+    assert!(outlined, "the module's frame glows under the pointer");
+    if std::env::var("SHOOT_RING").is_ok() {
+        println!("{}", rig.snapshot("module_pin_ring_hover", ids[0]).display());
+    }
+    rig.click(ring);
+    let picked = crate::canvas::viewer::take_overlay_pick_pending(&rig.ctx).expect("the click asked for a pin");
+    assert_eq!(picked.0, ids[0].0);
+    assert_eq!(picked.1, "whole_module");
+    assert!(picked.2[0] > 100.0 && picked.2[1] > 100.0, "the body's size: {:?}", picked.2);
+    // Not picking, no ring.
+    crate::canvas::viewer::set_overlay_pick_active(&rig.ctx, false);
+    rig.idle(2);
+    assert!(!rig.shapes.iter().any(|cs| matches!(&cs.shape, egui::epaint::Shape::Circle(c) if c.stroke.color == amber)));
+}
+
 fn whole_blocks(v: f32) -> bool {
     ((v / B) - (v / B).round()).abs() < 1e-3
 }

@@ -14,6 +14,48 @@ use super::*;
 // register anything, so they're invisible to the layout selector.
 
 pub(crate) const LAYOUT_ACTIVE_KEY:  &str = "fxi_layout_active";
+/// While a whole-module widget draws its module (the inner node id): the parts its body
+/// offers to pin are kept for the pad to walk instead of lighting up for a pick.
+pub(crate) const MODULE_PARTS_COLLECT_KEY: &str = "fxi_module_parts_collect";
+
+/// The parts a whole-module widget's body offered this pass, being collected.
+pub(crate) fn module_parts_collect_id() -> egui::Id {
+    egui::Id::new("fxi_module_parts_list")
+}
+
+/// The field rects a part's row published before it was offered, waiting for its name.
+pub(crate) fn module_part_fields_pending_id() -> egui::Id {
+    egui::Id::new("fxi_module_part_fields")
+}
+
+/// A whole-module widget's parts as drawn in `viewport`, `(nav pass, [ModulePart])`. Per
+/// viewport: the same module can be pinned whole on the Easy body and on the config overlay at
+/// once, and the pad walks the one in front of it.
+pub(crate) fn module_parts_id(inner: usize, viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::new(("fxi_module_parts", inner, viewport))
+}
+
+/// One part a whole-module widget's body offers - a graph, a row - as its widget drew it: its
+/// element, its rect on the screen, and its fields' rects in the order the pad walks them
+/// (none where they aren't known). Taken as the widget draws it, so a copy of the same module
+/// in another viewport can't stand in for it.
+#[derive(Clone, Debug)]
+pub(crate) struct ModulePart {
+    pub element: String,
+    pub rect: egui::Rect,
+    pub fields: Vec<egui::Rect>,
+}
+
+/// The viewport of the config overlay, where its whole-module pins publish their parts.
+pub(crate) fn config_overlay_viewport() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("fxi_config_overlay")
+}
+
+/// The stop of a whole-module widget the pad is on, `(pass, element, field, worked in)`: the
+/// part, and the field in it where the walk stops on fields one by one.
+pub(crate) fn module_part_focus_id(inner: usize) -> egui::Id {
+    egui::Id::new(("fxi_module_part_focus", inner))
+}
 pub(crate) const LAYOUT_PENDING_KEY: &str = "fxi_layout_pending";
 
 // ── Overlay pick mode ─────────────────────────────────────────────────────────
@@ -356,6 +398,109 @@ pub fn take_layout_pending(ctx: &egui::Context) -> Option<(usize, String, [f32; 
     ctx.data_mut(|d| d.remove_temp::<(usize, String, [f32; 2])>(egui::Id::new(LAYOUT_PENDING_KEY)))
 }
 
+/// Inside a whole-module widget only, a part for the pad to walk: a group of a module body's
+/// settings that isn't an element of its own to pin. Elsewhere nothing - it isn't offered for
+/// pinning, having no pinned look.
+pub(crate) fn register_widget_part(ui: &egui::Ui, node_id: NodeId, element_id: &str, rect: egui::Rect) {
+    let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));
+    if collecting != Some(node_id.0) || rect.area() < 4.0 {
+        return;
+    }
+    ui.ctx().data_mut(|d| {
+        let parts = d.get_temp_mut_or_default::<Vec<(String, egui::Rect)>>(module_parts_collect_id());
+        parts.retain(|(e, _)| e != element_id);
+        parts.push((element_id.to_string(), rect));
+    });
+}
+
+/// What a section heading's part in a whole-module widget is called: this, then the section's
+/// key (`curve_rows::section`).
+pub(crate) const WIDGET_FOLD_PREFIX: &str = "fold:";
+
+/// Whether section `key` of node `node` was open when its whole-module widget last drew it -
+/// what South on its heading turns round, as a click on it does.
+pub(crate) fn section_open_id(node: usize, key: &str) -> egui::Id {
+    egui::Id::new(("widget_section_open", node, key))
+}
+
+/// Inside a whole-module widget only, a section's heading (`rect`) as a part for the pad to
+/// stop on and fold or unfold with South: a folded section's settings are out of the pad's
+/// reach otherwise.
+pub(crate) fn register_widget_fold(ui: &egui::Ui, node_id: NodeId, key: &str, rect: egui::Rect, open: bool) {
+    let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));
+    if collecting != Some(node_id.0) {
+        return;
+    }
+    register_widget_part(ui, node_id, &format!("{WIDGET_FOLD_PREFIX}{key}"), rect);
+    ui.ctx().data_mut(|d| d.insert_temp(section_open_id(node_id.0, key), open));
+}
+
+/// Picking an element to pin: a ring round a module's fold chevron (`chevron`) that pins the
+/// whole module - a widget of its own size, starting at the size the module's body took on
+/// the canvas (`size`). No-op unless something is being picked.
+pub(crate) fn register_whole_module_ring(
+    ui: &mut egui::Ui,
+    node_id: NodeId,
+    chevron: egui::Rect,
+    size: Option<egui::Vec2>,
+    frame: Option<egui::Rect>,
+) {
+    let layout = layout_mode_active(ui.ctx());
+    let picking = !layout && overlay_pick_active(ui.ctx());
+    if !layout && !picking {
+        return;
+    }
+    let c = chevron.center();
+    let r = chevron.width() * 0.8;
+    let hit = egui::Rect::from_center_size(c, egui::Vec2::splat(2.0 * r + 8.0));
+    let resp = ui
+        .interact(hit, egui::Id::new(("fxi_whole_module_ring", node_id.0)), egui::Sense::click())
+        .on_hover_text("Pin the whole module: a widget of its own size, laid out as the module is at that size");
+    // The colours the element highlights wear: blue picking for a layout, amber for an overlay.
+    let hot = resp.hovered();
+    let (fill, outline) = match (picking, hot) {
+        (false, true) => (egui::Color32::from_rgba_unmultiplied(120, 200, 255, 130), egui::Color32::from_rgb(180, 230, 255)),
+        (false, false) => (egui::Color32::from_rgba_unmultiplied(80, 160, 220, 70), egui::Color32::from_rgb(110, 190, 245)),
+        (true, true) => (egui::Color32::from_rgba_unmultiplied(255, 200, 90, 130), egui::Color32::from_rgb(255, 220, 140)),
+        (true, false) => (egui::Color32::from_rgba_unmultiplied(230, 160, 40, 70), egui::Color32::from_rgb(245, 180, 60)),
+    };
+    let [gr, gg, gb, _] = outline.to_array();
+    let glow = |a: f32| egui::Color32::from_rgba_unmultiplied(gr, gg, gb, a.clamp(0.0, 255.0) as u8);
+    let painter = ui.painter();
+    // A glow that breathes round the ring, so it stands out among the module's controls -
+    // brighter and still under the pointer.
+    let t = ui.input(|i| i.time) as f32;
+    let breath = if hot { 1.0 } else { 0.55 + 0.45 * (t * 2.6).sin().abs() };
+    for k in 1..=5 {
+        let f = k as f32 / 5.0;
+        painter.circle_stroke(c, r + 1.5 + f * 7.0, egui::Stroke::new(2.0_f32, glow(150.0 * breath * (1.0 - f))));
+    }
+    painter.circle(c, r, fill, egui::Stroke::new(if hot { 2.0 } else { 1.5_f32 }, outline));
+    if !hot {
+        ui.ctx().request_repaint();
+    }
+    // Under the pointer, what it will pin - the whole module - glows round its frame.
+    if let Some(frame) = frame.filter(|_| hot) {
+        for k in 1..=6 {
+            let f = k as f32 / 6.0;
+            painter.rect_stroke(
+                frame.expand(f * 8.0),
+                8.0 + f * 8.0,
+                egui::Stroke::new(2.0_f32, glow(170.0 * (1.0 - f))),
+                egui::StrokeKind::Outside,
+            );
+        }
+        painter.rect_stroke(frame, 8.0, egui::Stroke::new(2.0_f32, outline), egui::StrokeKind::Outside);
+    }
+    if resp.clicked() {
+        let size = size.filter(|s| s.x >= 40.0 && s.y >= 20.0).unwrap_or(egui::vec2(300.0, 200.0));
+        let key = if picking { OVERLAY_PICK_PENDING_KEY } else { LAYOUT_PENDING_KEY };
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(egui::Id::new(key), (node_id.0, "whole_module".to_string(), [size.x, size.y]));
+        });
+    }
+}
+
 /// Draws a tinted highlight + click target on `rect`. No-op when layout mode
 /// is off, so callers can sprinkle it around without conditionals. The rect's
 /// size is captured into the pin request so the new pinned widget inherits
@@ -366,6 +511,23 @@ pub(crate) fn register_exposable_element(
     element_id: &str,
     rect: egui::Rect,
 ) {
+    // Inside a whole-module widget: a part for the pad to walk, with the fields its row
+    // published just before (which went out under the widget's own name).
+    let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));
+    if let Some(inner) = collecting {
+        if inner == node_id.0 && rect.area() >= 4.0 {
+            let pass = ui.ctx().cumulative_pass_nr();
+            ui.ctx().data_mut(|d| {
+                let parts = d.get_temp_mut_or_default::<Vec<(String, egui::Rect)>>(module_parts_collect_id());
+                parts.retain(|(e, _)| e != element_id);
+                parts.push((element_id.to_string(), rect));
+                if let Some(fields) = d.remove_temp::<Vec<egui::Rect>>(module_part_fields_pending_id()) {
+                    d.insert_temp(egui::Id::new(("gp_nav_field_rects", inner, element_id.to_string())), (pass, fields));
+                }
+            });
+        }
+        return;
+    }
     let layout = layout_mode_active(ui.ctx());
     let picking = !layout && overlay_pick_active(ui.ctx());
     if !layout && !picking { return; }

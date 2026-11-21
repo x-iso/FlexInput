@@ -195,6 +195,13 @@ pub(crate) fn show_gyro_3dof_body(
     let mut lean_rect:    Option<egui::Rect> = None;
     let mut lean_left_rect:  Option<egui::Rect> = None;
     let mut lean_right_rect: Option<egui::Rect> = None;
+    // Inside a whole-module widget, each row's fields as drawn - `Rect::NOTHING` for one
+    // greyed out, which the pad passes by - for the pad to walk them one by one
+    // (`publish_widget_row_fields`); and the groups of settings that aren't elements of
+    // their own to pin but are parts of the widget (`register_widget_part`).
+    let mut row_fields: Vec<(&'static str, Vec<egui::Rect>)> = Vec::new();
+    let mut widget_parts: Vec<(&'static str, egui::Rect)> = Vec::new();
+    let on = |enabled: bool, r: egui::Rect| if enabled { r } else { egui::Rect::NOTHING };
 
     ui.vertical(|ui| {
         // One surface and the rows under it, the whole of it sized by the module's corner
@@ -369,6 +376,7 @@ pub(crate) fn show_gyro_3dof_body(
                 changed = true;
             }
             *out = Some(row);
+            row_fields.push((if want == "steering" { "steering_mode" } else { "pointer_mode" }, vec![row]));
         }
 
         // Steering's own settings straight under the Steering row they belong to, then the
@@ -382,11 +390,13 @@ pub(crate) fn show_gyro_3dof_body(
         {
             let r = cell(0);
             let each = (r.width() - 2.0 * super::kit::GAP) / 3.0;
+            let mut fields = Vec::new();
             for (i, tip) in GYRO_HOLD_AXIS_TIPS.into_iter().enumerate() {
                 let pr = egui::Rect::from_min_size(
                     egui::pos2(r.left() + i as f32 * (each + super::kit::GAP), r.center().y - ctrl * 0.5),
                     egui::vec2(each, ctrl),
                 );
+                fields.push(pr);
                 let shown = format!("{:+.0}°", hold[i]);
                 changed |= pill_in(
                     ui, true, node_id, &format!("gyro_hold_{i}"), pr,
@@ -394,6 +404,7 @@ pub(crate) fn show_gyro_3dof_body(
                 );
             }
             hold_rect = Some(r);
+            row_fields.push(("hold_offset", fields));
         }
 
         // Roll mixed into the turn, and the Lean threshold with its live reading beside it.
@@ -403,6 +414,7 @@ pub(crate) fn show_gyro_3dof_body(
             let shown = format!("{roll_mix:+.0} %");
             changed |= pill_in(ui, roll_mix_on, node_id, "gyro_roll_mix", pr, "mix|roll mix", &mut roll_mix, &shown, -100.0..=100.0, 0.4, GYRO_ROLL_MIX_TIP);
             roll_mix_rect = Some(r);
+            row_fields.push(("roll_mix", vec![on(roll_mix_on, pr)]));
         }
         // The steering accumulators: what pulls them toward a heading, and how fast a Reset
         // lets go.
@@ -433,6 +445,7 @@ pub(crate) fn show_gyro_3dof_body(
             changed |= pill_in(ui, steering_on, node_id, "gyro_ease", ease, "ease|reset ease", &mut reset_ease_in, &shown, 0.0..=2.0, 0.01,
                 "Reset eases steering toward 0 over this many seconds.");
             stopts_rect = Some(r);
+            row_fields.push(("steering_opts", vec![on(steering_on, excl), on(steering_on && centres, ctr), on(steering_on, ease)]));
         }
 
         // ── Edge turn ───────────────────────────────────────────────────────
@@ -450,9 +463,10 @@ pub(crate) fn show_gyro_3dof_body(
                 if edge.ui_rects(ui, node_id, w, true, &mut fr) {
                     changed = true;
                 }
-                ui.min_rect()
+                fr
             });
             edge_rect = Some(block.response.rect);
+            row_fields.push(("edge_turn", block.inner.to_vec()));
         }
 
         }
@@ -471,6 +485,7 @@ pub(crate) fn show_gyro_3dof_body(
                 changed = true;
             }
             source_rect = Some(r);
+            row_fields.push(("orient_source", vec![pill]));
         }
 
         // What is done to that pose on the way out. Both settings are about the integration,
@@ -479,6 +494,8 @@ pub(crate) fn show_gyro_3dof_body(
             let r = cell(1);
             let pr = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - ctrl * 0.5), egui::vec2(r.width(), ctrl));
             let shown = format!("{orient_scale:.2}");
+            widget_parts.push(("orient_scale", r));
+            row_fields.push(("orient_scale", vec![on(pose_rows_on, pr)]));
             changed |= pill_in(ui, pose_rows_on, node_id, "gyro_rot", pr, "rot ×|rotation ×", &mut orient_scale, &shown, 0.05..=5.0, 0.01,
                 "Rotation scale for the 3D Orientation output only.\n1.0 = physically 1:1 on known controllers. If the\non-screen model over- or under-rotates vs. your real\ncontroller, adjust here. Applied to the integration rate\nso it never flips; does NOT affect pointer/steering.");
         }
@@ -486,6 +503,8 @@ pub(crate) fn show_gyro_3dof_body(
             let r = cell(2);
             let pr = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - ctrl * 0.5), egui::vec2(r.width(), ctrl));
             let shown = format!("{orient_drift:.2}");
+            widget_parts.push(("orient_drift", r));
+            row_fields.push(("orient_drift", vec![on(pose_rows_on, pr)]));
             changed |= pill_in(ui, pose_rows_on, node_id, "gyro_drift", pr, "drift|drift fix", &mut orient_drift, &shown, 0.0..=1.0, 0.01,
                 "Accelerometer drift correction for the 3D Orientation\noutput. While the controller is held steady, gravity\npulls accumulated pitch/roll drift back out (yaw can't\nbe corrected — reset for that). OFF by default: linear\nmotion (shakes/swings) is indistinguishable from tilt\nand can rotate the model falsely — prefer Auto re-center.\nHigher = faster pull; reference pose captured on Reset.");
         }
@@ -504,6 +523,8 @@ pub(crate) fn show_gyro_3dof_body(
             changed |= word_toggle(ui, tog, recenter_on, &mut yaw_recenter, "auto re-center",
                 "When gyro readings stay under the threshold for 3 s,\ngradually re-center the 3D Orientation output (all axes)\nuntil it's centered or the threshold is exceeded again.\nIn Orient mode it also eases the pointer back onto the\npad's nose and the heading back to forward, as a Reset\nwould, sending no movement: a pad whose gyro read a turn\nit didn't make (just connected, still calibrating) lines\nup with its pointer again once it lies still.",
                 ("gyro_recenter_toggle", node_id));
+            widget_parts.push(("orient_recenter", r));
+            row_fields.push(("orient_recenter", vec![on(recenter_on, tog), on(recenter_on && yaw_recenter, thr)]));
             let shown = format!("{yaw_thresh:.4}");
             changed |= pill_in(ui, recenter_on && yaw_recenter, node_id, "gyro_thr", thr, "still|still below", &mut yaw_thresh, &shown, 0.0005..=0.2, 0.0005,
                 "Gyro magnitude (normalized, 1.0 = 2000 dps) that counts\nas \"not moving\". With the noise-floor deadzone armed,\nresting readings are exactly 0, so the default is fine.");
@@ -533,13 +554,16 @@ pub(crate) fn show_gyro_3dof_body(
             let weak = ui.visuals().weak_text_color();
             ui.painter().text(egui::pos2(cell.left(), cell.center().y), egui::Align2::LEFT_CENTER, caption, font.clone(), weak);
             let mut x = cell.left() + text_w(ui, caption) + 6.0;
+            let mut fields = Vec::new();
             for (i, (label, tip)) in labels.iter().enumerate() {
                 let bw = word_w(ui, label);
                 let br = egui::Rect::from_min_size(egui::pos2(x, cell.center().y - ctrl * 0.5), egui::vec2(bw, ctrl));
                 changed |= word_toggle(ui, br, true, &mut values[i], label, tip, (caption, i));
+                fields.push(br);
                 x += bw + super::kit::GAP;
             }
             *out = Some(cell);
+            row_fields.push((if caption == "Gyro" { "gyro_invert" } else { "accel_invert" }, fields));
         }
 
         }
@@ -569,6 +593,7 @@ pub(crate) fn show_gyro_3dof_body(
                 ui, node_id, "gyro_lean", pr, "lean|lean threshold", &mut lean_threshold, &shown, 0.01..=4.0, 0.01,
                 "|Lean| ≥ threshold triggers the Lean! Bool output.",
             );
+            row_fields.push(("lean_threshold", vec![pr]));
             // Painted, not laid out: the reading moves every frame and the module must not.
             ui.painter().text(
                 egui::pos2(pr.right() + 4.0, r.center().y),
@@ -671,6 +696,12 @@ pub(crate) fn show_gyro_3dof_body(
     if let Some(r) = lean_rect       { register_exposable_element(ui, node_id, "lean_threshold", r); }
     if let Some(r) = lean_left_rect  { register_exposable_element(ui, node_id, "lean_left",     r); }
     if let Some(r) = lean_right_rect { register_exposable_element(ui, node_id, "lean_right",    r); }
+    for (element, r) in &widget_parts {
+        register_widget_part(ui, node_id, element, *r);
+    }
+    for (element, fields) in &row_fields {
+        publish_widget_row_fields(ui, node_id, element, fields);
+    }
 
     if changed {
         if let Some(node) = snarl.get_node_mut(node_id) {

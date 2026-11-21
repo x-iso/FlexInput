@@ -343,6 +343,7 @@ pub(crate) fn section(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id: N
         .map_or(default_open, |folded| !folded);
     let h = 20.0;
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    super::register_widget_fold(ui, node_id, key, rect, open);
     let v = ui.visuals();
     let col = if resp.hovered() { v.strong_text_color() } else { v.text_color() };
     let c = egui::pos2(rect.left() + 6.0, rect.center().y);
@@ -1042,6 +1043,31 @@ fn range_link_hover(linked: bool) -> &'static str {
     }
 }
 
+/// A curve option row's fields - `scale_row`, `range_row` or `grid_row` - in the order the pad
+/// walks them (`app::nav::fields`), from where `rows` drew each by the param it sets
+/// (`Rect::NOTHING` for one not drawn: the low ends of a range drawn as its ±max).
+pub(crate) fn curve_row_field_rects(rows: &CurveRows, element: &str, vec_curve: bool) -> Vec<egui::Rect> {
+    let order: &[&str] = match element {
+        "scale_row" if vec_curve => &["scale_t", "snap"],
+        "scale_row" => &["scale_t", "absolute", "snap"],
+        "range_row" if vec_curve => &["in_max", "out_max"],
+        "range_row" => &["in_min", "in_max", "out_min", "out_max"],
+        _ => &["grid_x", "grid_y", "trail_ms"],
+    };
+    order
+        .iter()
+        .map(|k| rows.fields.iter().find(|(f, _)| f == k).map_or(egui::Rect::NOTHING, |(_, r)| *r))
+        .collect()
+}
+
+/// A curve module body's option rows, inside a whole-module widget: each row's fields for the
+/// pad's field ring (`publish_widget_row_fields`), the body drawing them as one block.
+pub(crate) fn publish_curve_rows_in_widget(ui: &egui::Ui, inner_id: NodeId, rows: &CurveRows, vec_curve: bool) {
+    for element in ["scale_row", "range_row", "grid_row"] {
+        publish_widget_row_fields(ui, inner_id, element, &curve_row_field_rects(rows, element, vec_curve));
+    }
+}
+
 /// A pinned curve row in the new style - `scale_row`, `range_row` or `grid_row` - laid out
 /// across the pin's frame, for the Response Curve family. See `pin_style2`.
 pub(crate) fn render_curve_row_style2(
@@ -1099,19 +1125,7 @@ pub(crate) fn render_curve_row_style2(
     if vec_curve || twoway {
         (range[1], range[3]) = (i1, o1);
     }
-    // The fields in the order the gamepad walks this element (`app::nav::fields`).
-    let order: &[&str] = match element {
-        "scale_row" if vec_curve => &["scale_t", "snap"],
-        "scale_row" => &["scale_t", "absolute", "snap"],
-        "range_row" if vec_curve => &["in_max", "out_max"],
-        "range_row" => &["in_min", "in_max", "out_min", "out_max"],
-        _ => &["grid_x", "grid_y", "trail_ms"],
-    };
-    let rects: Vec<egui::Rect> = order
-        .iter()
-        .map(|k| rows.fields.iter().find(|(f, _)| f == k).map_or(egui::Rect::NOTHING, |(_, r)| *r))
-        .collect();
-    publish_nav_field_rects(ui, inner_id, &rects);
+    publish_nav_field_rects(ui, inner_id, &curve_row_field_rects(&rows, element, vec_curve));
     if changed {
         if let Some(node) = snarl.get_node_mut(inner_id) {
             node.params.insert("absolute".into(), Value::Bool(abs));

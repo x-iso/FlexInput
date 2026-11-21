@@ -491,6 +491,19 @@ impl FlexInputApp {
         // the D-pad when both pass through. Remap the left-stick glyphs to match.
         use crate::app::ControlInput;
         let control = if editing { self.config_control_input() } else { ControlInput::LeftStick };
+        // Picking a curve's dot with the right stick standing in: it leads the cursor, and
+        // the D-pad steps between dots (`nav_drive_config_overlay`).
+        let mut hints = hints;
+        if matches!(control, ControlInput::RightStick)
+            && self.gamepad_nav.edit_level == crate::gamepad_nav::EditLevel::CurveDots
+        {
+            for (pins, label) in hints.iter_mut() {
+                if *label == "Pick dot" {
+                    *pins = vec!["dpad"];
+                }
+            }
+            hints.insert(1, (vec!["right_stick"], "Cursor"));
+        }
         let remap = move |pin: &'static str| -> &'static str {
             match control {
                 ControlInput::LeftStick => pin,

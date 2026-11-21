@@ -31,7 +31,7 @@ mod controller3d;
 mod gyro_view;
 mod expose;
 mod glow;
-mod glyphs;
+pub(crate) mod glyphs;
 pub(crate) mod gyro_body;
 mod jsm;
 mod jsm_cal;
@@ -53,6 +53,12 @@ mod kit_bodies;
 mod module_icons;
 pub(crate) use kit_bodies::*;
 mod layout_edit;
+mod gradient;
+pub(crate) use gradient::*;
+mod inspector;
+pub(crate) use inspector::*;
+mod layout_tabs;
+pub(crate) use layout_tabs::*;
 mod midi;
 mod net;
 mod osc_envelope;
@@ -241,8 +247,10 @@ impl FlexViewer<'_> {
     fn keep_grip_floor(&self, ui: &egui::Ui, node: NodeId, floor: f32, frame_w: Option<f32>) {
         let ctx = ui.ctx();
         let around = frame_w.map_or(0.0, |w| w - ui.available_width());
+        // Outside `data`: the context asked again while it's held can deadlock.
+        let viewport = ctx.viewport_id();
         let rows: egui::Vec2 = ctx
-            .data(|d| d.get_temp(egui::Id::new(("kit_surface", ctx.viewport_id(), ui.layer_id(), node.0))))
+            .data(|d| d.get_temp(egui::Id::new(("kit_surface", viewport, ui.layer_id(), node.0))))
             .unwrap_or_default();
         let narrowest = floor.max(if rows.x > 0.0 { rows.x + around } else { 0.0 });
         ctx.data_mut(|d| d.insert_temp(self.snarl_id.with(("grip-floor", node.0)), narrowest));
@@ -273,6 +281,173 @@ fn default_frame_h(module_id: &str, block: Option<f32>) -> Option<f32> {
         _ => kit::surface_spec(module_id).map(|s| s.default_blocks.1 * block.unwrap_or(28.0)),
     }
 }
+/// Where the size a module's body took on a canvas is kept (`snarl_id` tells canvases apart):
+/// a pick of the whole module starts its widget at it.
+pub(crate) fn module_body_size_id(snarl_id: egui::Id, node: NodeId) -> egui::Id {
+    snarl_id.with(("module_body_size", node.0))
+}
+
+/// What drawing a module's body asks of the canvas afterwards: an undo step, the sub-patch
+/// editor for it.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct BodyAsks {
+    pub undo: bool,
+    pub edit_subpatch: bool,
+}
+
+/// What a module's body is drawn with beyond its node: the view's salt, the live signals,
+/// the panic shortcut and the sub-patch chain it sits in.
+pub(crate) struct BodyCtx<'a> {
+    pub view_salt: u64,
+    pub live_signals: &'a std::collections::HashMap<(String, String), Signal>,
+    pub panic_shortcut: &'a crate::app::PanicShortcut,
+    pub automap_parent: Option<&'a AutomapGlowParent<'a>>,
+}
+
+/// Draw module `module_id`'s body - node `node_id` of `snarl` - into `ui`, laid out at
+/// `body_w` x `body_h` (a stretchy or kit body; the rest take `ui`'s width), the way a canvas
+/// draws it: the canvas hands it its frame's size, a whole-module widget its own size.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn show_module_body(
+    cx: &BodyCtx<'_>,
+    module_id: &str,
+    node_id: NodeId,
+    inputs: &[InPin],
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+    kit_w: f32,
+) -> BodyAsks {
+    let mut asks = BodyAsks::default();
+    match module_id {
+        "device.sink"          => show_sink_body(node_id, inputs, ui, snarl, cx.automap_parent),
+        "module.constant"      => show_constant_body(node_id, ui, snarl, cx.view_salt),
+        "module.switch"        => show_switch_body(node_id, ui, snarl, cx.view_salt),
+        "module.knob"          => show_knob_body(node_id, ui, snarl, cx.view_salt, body_w, body_h),
+        "display.readout"       => show_readout_body(node_id, ui, snarl, cx.view_salt, body_w, body_h),
+        "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+        "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+        "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl, body_w, body_h),
+        "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w, body_h),
+        "processing.rws"   => show_rws_body(node_id, ui, snarl, body_w, body_h, cx.automap_parent),
+        "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, cx.view_salt),
+        "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, cx.view_salt),
+        "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, cx.view_salt),
+        "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl, cx.view_salt),
+        "module.response_curve" => {
+            if show_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "module.vec_response_curve" => {
+            if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "module.vec_reshape" => {
+            if show_vec_reshape_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "module.twoway_response_curve" => {
+            if show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "module.automap_response_curve" | "module.automap_twoway_response_curve" => {
+            if show_automap_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "math.negate" => show_inverse_body(node_id, ui, snarl, kit_w, cx.view_salt),
+        "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl, kit_w, cx.view_salt),
+        "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, cx.view_salt),
+        "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
+        "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
+        "module.dropdown" => show_dropdown_body(node_id, inputs, ui, snarl, cx.view_salt, kit_w),
+        "module.macro"    => show_macro_body(node_id, outputs, ui, snarl, cx.view_salt),
+        "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, cx.view_salt),
+        "module.svg"      => show_svg_body(node_id, ui, snarl, body_w, body_h),
+        "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, cx.view_salt),
+        "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w, cx.view_salt),
+        "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w, cx.view_salt),
+        "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w, cx.view_salt),
+        "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl, cx.view_salt),
+        "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl, body_w, body_h),
+        "processing.gyro_3dof"  => show_gyro_3dof_body(
+            node_id, inputs, ui, snarl, cx.live_signals,
+            cx.panic_shortcut, cx.automap_parent, body_w, body_h,
+        ),
+        "module.automap_split"     => show_automap_split_body(node_id, outputs, ui, snarl),
+        "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
+        "module.automap_fork"      => show_automap_fork_body(node_id, inputs, outputs, ui, snarl),
+        "module.automap_selector"  => show_automap_selector_body(node_id, inputs, outputs, ui, snarl),
+        "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, cx.live_signals, cx.automap_parent, false),
+        "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, cx.automap_parent, body_w, body_h),
+        "module.jsm" => show_jsm_body(
+            node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w, body_h,
+        ),
+        "module.network_send" => show_net_send_body(node_id, ui, snarl, cx.automap_parent),
+        "module.network_recv" => show_net_recv_body(node_id, ui, snarl, cx.automap_parent),
+        // The card modules are drawn the way their pinned copies are, at the size the
+        // module's corner grip gives them: the width sets the scale of the cards, the
+        // height is the window onto the list, which scrolls as it does on a widget.
+        "module.remapper" => pinned::render_remapper_whole_module(
+            node_id,
+            ui,
+            snarl,
+            egui::vec2(body_w, body_h),
+            cx.live_signals,
+            cx.panic_shortcut,
+            cx.automap_parent,
+            false,
+        ),
+        "module.map_action" => pinned::render_map_action_whole_module(
+            node_id,
+            ui,
+            snarl,
+            egui::vec2(body_w, body_h),
+            cx.live_signals,
+            cx.panic_shortcut,
+            cx.automap_parent,
+            false,
+        ),
+        "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w, body_h),
+        "module.input_viewer" => super::input_viewer::show_input_viewer_body(
+            node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w),
+        "module.menu" => super::menu_body::show_menu_body(
+            node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w, body_h),
+        "module.stick_rotation" => {
+            if show_stick_rotation_body(node_id, ui, snarl, body_w, body_h) {
+                asks.undo = true;
+            }
+        }
+        "module.area_mapper" => {
+            if super::area_body::show_area_mapper_body(
+                node_id, ui, snarl, cx.live_signals, cx.automap_parent, body_w, body_h,
+            ) {
+                asks.undo = true;
+            }
+        }
+        "subpatch" => {
+            if show_subpatch_body(
+                node_id, ui, snarl,
+                cx.live_signals, cx.panic_shortcut, cx.automap_parent, true,
+            ) {
+                asks.edit_subpatch = true;
+            }
+        }
+        "subpatch.inlet" | "subpatch.outlet" => show_inlet_outlet_body(node_id, ui, snarl),
+        // Last, so a module with a body of its own keeps it: an operation or gate
+        // drawn with its glyph and nothing else in the body.
+        m if module_icons::has_icon(m) => show_glyph_body(node_id, ui, snarl, cx.view_salt),
+        _ => {}
+    }
+    asks
+}
+
 
 /// What the node measures this frame: the frame as it is laid out now, not the one the
 /// canvas last drew. A body that sized itself off last frame's rect would overshoot
@@ -315,6 +490,18 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         // there while it eases to where it moved.
         let node_top = snarl.get_node_info(node).map(|i| i.pos.y + egui_snarl::ui::drawn_offset(ui.ctx(), node).y);
         let header_mid = ui.max_rect().top() + ui.spacing().icon_width * 0.5;
+        // Picking an element to pin: a ring round the fold chevron - the header's first
+        // square - pins the whole module.
+        {
+            let chevron = egui::Rect::from_min_size(ui.min_rect().min, egui::Vec2::splat(ui.spacing().icon_width));
+            let size: Option<egui::Vec2> = ui.ctx().data(|d| d.get_temp(module_body_size_id(self.snarl_id, node)));
+            // The module's frame as drawn last pass, for the ring to show what it pins.
+            let frame = ui.ctx()
+                .data(|d| d.get_temp::<NodeRectMap>(node_rects_id(self.view_salt)))
+                .and_then(|m| m.get(&node.0).copied())
+                .map(|[x, y, w, h]| egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)));
+            register_whole_module_ring(ui, node, chevron, size, frame);
+        }
         if let Some(top) = node_top {
             ui.ctx().data_mut(|d| d.insert_temp(header_mid_y_key(node), header_mid - top));
         }
@@ -2308,130 +2495,22 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 egui::Rect::from_min_size(ui.cursor().min, egui::vec2(body_w.max(kit_w), 1.0)),
             );
         }
-        match module_id.as_str() {
-            "device.sink"          => show_sink_body(node_id, inputs, ui, snarl, self.automap_parent.as_ref()),
-            "module.constant"      => show_constant_body(node_id, ui, snarl, self.view_salt),
-            "module.switch"        => show_switch_body(node_id, ui, snarl, self.view_salt),
-            "module.knob"          => show_knob_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
-            "display.readout"       => show_readout_body(node_id, ui, snarl, self.view_salt, body_w, body_h),
-            "display.oscilloscope"  => show_oscilloscope_body(node_id, inputs, ui, snarl, body_w, body_h),
-            "display.vectorscope"   => show_vectorscope_body(node_id, inputs, ui, snarl, body_w, body_h),
-            "display.trigscope"     => show_trigscope_body(node_id, inputs, ui, snarl, body_w, body_h),
-            "display.controller3d"  => show_controller3d_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
-            "processing.rws"   => show_rws_body(node_id, ui, snarl, body_w, body_h, self.automap_parent.as_ref()),
-            "module.delay"     => show_delay_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
-            "module.average"   => show_average_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
-            "module.dc_filter" => show_dc_filter_body(node_id, inputs, outputs, ui, snarl, self.view_salt),
-            "module.sample_hold" => show_sample_hold_body(node_id, ui, snarl, self.view_salt),
-            "module.response_curve" => {
-                if show_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "module.vec_response_curve" => {
-                if show_vec_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "module.vec_reshape" => {
-                if show_vec_reshape_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "module.twoway_response_curve" => {
-                if show_twoway_response_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "module.automap_response_curve" | "module.automap_twoway_response_curve" => {
-                if show_automap_curve_body(node_id, inputs, outputs, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "math.negate" => show_inverse_body(node_id, ui, snarl, kit_w, self.view_salt),
-            "math.quantize" => show_quantize_body(node_id, inputs, ui, snarl, kit_w, self.view_salt),
-            "module.vec_to_deflection" => show_vec_to_deflection_body(node_id, ui, snarl, kit_w, self.view_salt),
-            "module.selector" => show_selector_body(node_id, inputs, outputs, ui, snarl),
-            "module.split"    => show_split_body(node_id, inputs, outputs, ui, snarl),
-            "module.dropdown" => show_dropdown_body(node_id, inputs, ui, snarl, self.view_salt, kit_w),
-            "module.macro"    => show_macro_body(node_id, outputs, ui, snarl, self.view_salt),
-            "module.label"    => show_label_body(node_id, ui, snarl, body_w, body_h, self.view_salt),
-            "module.svg"      => show_svg_body(node_id, ui, snarl, body_w, body_h),
-            "logic.greater_than" | "logic.less_than" => show_or_equal_body(node_id, ui, snarl, self.view_salt),
-            "logic.has_changed" => show_has_changed_body(node_id, ui, snarl, kit_w, self.view_salt),
-            "logic.delay"   => show_logic_delay_body(node_id, ui, snarl, kit_w, self.view_salt),
-            "logic.counter"        => show_counter_body(node_id, inputs, ui, snarl, kit_w, self.view_salt),
-            "generator.oscillator"  => show_oscillator_body(node_id, inputs, ui, snarl, self.view_salt),
-            "generator.envelope"    => show_envelope_body(node_id, inputs, ui, snarl, body_w, body_h),
-            "processing.gyro_3dof"  => show_gyro_3dof_body(
-                node_id, inputs, ui, snarl, self.live_signals,
-                self.panic_shortcut, self.automap_parent.as_ref(), body_w, body_h,
-            ),
-            "module.automap_split"     => show_automap_split_body(node_id, outputs, ui, snarl),
-            "module.automap_collect"   => show_automap_collect_body(node_id, inputs, ui, snarl),
-            "module.automap_fork"      => show_automap_fork_body(node_id, inputs, outputs, ui, snarl),
-            "module.automap_selector"  => show_automap_selector_body(node_id, inputs, outputs, ui, snarl),
-            "module.automap_combiner"  => show_automap_combiner_body(node_id, inputs, ui, snarl, self.live_signals, self.automap_parent.as_ref(), false),
-            "module.audio_stream_haptics" => show_audio_stream_haptics_body(node_id, ui, snarl, self.automap_parent.as_ref(), body_w, body_h),
-            "module.jsm" => show_jsm_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h,
-            ),
-            "module.network_send" => show_net_send_body(node_id, ui, snarl, self.automap_parent.as_ref()),
-            "module.network_recv" => show_net_recv_body(node_id, ui, snarl, self.automap_parent.as_ref()),
-            // The card modules are drawn the way their pinned copies are, at the size the
-            // module's corner grip gives them: the width sets the scale of the cards, the
-            // height is the window onto the list, which scrolls as it does on a widget.
-            "module.remapper" => pinned::render_remapper_whole_module(
-                node_id,
-                ui,
-                snarl,
-                egui::vec2(body_w, body_h),
-                self.live_signals,
-                self.panic_shortcut,
-                self.automap_parent.as_ref(),
-                false,
-            ),
-            "module.map_action" => pinned::render_map_action_whole_module(
-                node_id,
-                ui,
-                snarl,
-                egui::vec2(body_w, body_h),
-                self.live_signals,
-                self.panic_shortcut,
-                self.automap_parent.as_ref(),
-                false,
-            ),
-            "module.touch_zones" => show_touch_zones_body(node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
-            "module.input_viewer" => super::input_viewer::show_input_viewer_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w),
-            "module.menu" => super::menu_body::show_menu_body(
-                node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h),
-            "module.stick_rotation" => {
-                if show_stick_rotation_body(node_id, ui, snarl, body_w, body_h) {
-                    self.push_undo_request = true;
-                }
-            }
-            "module.area_mapper" => {
-                if super::area_body::show_area_mapper_body(
-                    node_id, ui, snarl, self.live_signals, self.automap_parent.as_ref(), body_w, body_h,
-                ) {
-                    self.push_undo_request = true;
-                }
-            }
-            "subpatch" => {
-                if show_subpatch_body(
-                    node_id, ui, snarl,
-                    self.live_signals, self.panic_shortcut, self.automap_parent.as_ref(),
-                ) {
-                    self.edit_subpatch_request = Some(node_id);
-                }
-            }
-            "subpatch.inlet" | "subpatch.outlet" => show_inlet_outlet_body(node_id, ui, snarl),
-            // Last, so a module with a body of its own keeps it: an operation or gate
-            // drawn with its glyph and nothing else in the body.
-            m if module_icons::has_icon(m) => show_glyph_body(node_id, ui, snarl, self.view_salt),
-            _ => {}
+        let asks = show_module_body(
+            &BodyCtx {
+                view_salt: self.view_salt,
+                live_signals: self.live_signals,
+                panic_shortcut: self.panic_shortcut,
+                automap_parent: self.automap_parent.as_ref(),
+            },
+            &module_id, node_id, inputs, outputs, ui, snarl, body_w, body_h, kit_w,
+        );
+        self.push_undo_request |= asks.undo;
+        if asks.edit_subpatch {
+            self.edit_subpatch_request = Some(node_id);
         }
+        // What the body took, for a pick of the whole module to start its widget at.
+        let took = ui.min_rect().size();
+        ui.ctx().data_mut(|d| d.insert_temp(module_body_size_id(self.snarl_id, node_id), took));
 
         // The minimum height, said out loud. A module that paints a mark and a couple of
         // pills - Quantize, Sample and Hold, the small operations and gates - reserves

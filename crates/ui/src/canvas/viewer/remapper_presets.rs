@@ -67,7 +67,7 @@ fn cards_phrase(n: usize) -> String {
     if n == 1 { "1 card".to_string() } else { format!("{n} cards") }
 }
 
-/// The Save (💾) and Load (📂) icons, laid out right to left from the current
+/// The Save and Load buttons, laid out right to left from the current
 /// cursor. The file dialog runs on the UI thread, as the Area Mapper's presets
 /// and the curve files do, so a load lands in the same frame as its click and
 /// the canvas's edit tracking records it for undo. Returns whether the cards
@@ -82,17 +82,13 @@ pub(crate) fn remapper_preset_icons(
     let n_cards = snarl.get_node(node_id)
         .and_then(|n| n.params.get("mappings").and_then(|v| v.as_array()).map(|a| a.len()))
         .unwrap_or(0);
-    let icon = |glyph: &str| egui::Button::new(egui::RichText::new(glyph).size(crate::settings::ui_size(12.0))).small();
     let mut changed = false;
 
-    // Right to left: Load sits in the corner, Save beside it.
-    let load = ui.add(icon("📂"))
-        .on_hover_text("Load cards from a .fxremap preset (replaces this Remapper's cards)")
-        .clicked();
-    let save = ui.add_enabled(n_cards > 0, icon("💾"))
-        .on_hover_text("Save this Remapper's cards to a .fxremap preset")
-        .on_disabled_hover_text("No cards to save yet")
-        .clicked();
+    // Right to left: Load sits in the corner, Save beside it - drawings on square buttons,
+    // as every module's Save and Load are.
+    use super::glyphs::Glyph;
+    let load = super::kit::icon_button(ui, Glyph::Load, "Load cards from a .fxremap preset (replaces this Remapper's cards)", true, "");
+    let save = super::kit::icon_button(ui, Glyph::Save, "Save this Remapper's cards to a .fxremap preset", n_cards > 0, "No cards to save yet");
 
     if save {
         let contents = snarl.get_node(node_id).map(remapper_preset_contents);

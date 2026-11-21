@@ -2826,7 +2826,8 @@ impl Canvas {
             lines.push("Ctrl+C        Copy selected");
         }
 
-        if !lines.is_empty() {
+        // A sub-patch layout being edited shows what the modifiers do to it instead.
+        if !lines.is_empty() && !viewer::layout_hint_shown(ui.ctx()) {
             egui::Area::new(egui::Id::new("modifier_tooltip"))
                 .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
                 .order(egui::Order::Foreground)
@@ -4456,6 +4457,7 @@ pub fn group_into_subpatch(
         .collect();
 
     let subpatch_data = UiSubPatch {
+        active_tab: 0, layout_tabs: Vec::new(),
         display_name: "Sub-patch".to_string(),
         pins_in,
         pins_out,

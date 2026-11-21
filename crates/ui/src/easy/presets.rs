@@ -138,6 +138,11 @@ pub(super) fn hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
+/// Held by every test that reads the preset index - this one, and the ones that draw Easy
+/// mode's center panel, which reads it - since they share the process's cache.
+#[cfg(test)]
+pub(crate) static INDEX_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +150,7 @@ mod tests {
     // One test: they share the process's cache.
     #[test]
     fn the_index_is_cached_and_sees_changes_when_told() {
+        let _index = INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("fxi_presets_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("mine.fxsp");

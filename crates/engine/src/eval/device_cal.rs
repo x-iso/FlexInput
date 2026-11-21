@@ -39,7 +39,7 @@ pub const DEFAULT_STICK_DEADZONE: f32 = 0.1;
 
 /// Per-device-source calibration applied before deadzone / gyro_multiplier.
 /// All fields are no-ops when uncalibrated (centers=0, scales=1, ranges=identity).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeviceCal {
     gyro_offset:   [f32; 3], // [x, y, z] — subtracted from gyro_x/y/z
     accel_offset:  [f32; 3], // [x, y, z] — subtracted from accel_x/y/z
@@ -320,6 +320,93 @@ pub(crate) fn apply_stick_scale(x: f32, y: f32, profile: &[f32; STICK_RADIAL_BUC
     (x * s, y * s)
 }
 
+/// A gyro triple through its calibration: offset, orientation matrix, per-axis sign, then
+/// the noise-floor deadzone. Not the gyro multiplier, which is applied per pin after.
+pub(crate) fn calibrate_gyro(cal: &DeviceCal, g: [f32; 3]) -> [f32; 3] {
+    let v = [g[0] - cal.gyro_offset[0], g[1] - cal.gyro_offset[1], g[2] - cal.gyro_offset[2]];
+    let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
+    let out = [v[0] * cal.gyro_sign[0], v[1] * cal.gyro_sign[1], v[2] * cal.gyro_sign[2]];
+    // Noise-floor deadzone: gate on the MAGNITUDE of the triple so a slow diagonal rotation
+    // never steps per axis. Below the floor the whole vector is noise → zero it (this is what
+    // stops the 3D-orientation drift and lean bias at rest). Crossing the border eases in
+    // exponentially over ~3 border-widths instead of snapping from 0 to the full value.
+    if cal.gyro_dz > 0.0 {
+        let mag = (out[0] * out[0] + out[1] * out[1] + out[2] * out[2]).sqrt();
+        let s = gyro_dz_ease(mag, cal.gyro_dz);
+        return [out[0] * s, out[1] * s, out[2] * s];
+    }
+    out
+}
+
+/// One pad's calibration as the engine applies it to the pad's own signals, for something
+/// that reads the pad straight from its device rather than through a patch - gamepad
+/// navigation and its cursor - so the pad answers there as it does everywhere else: its
+/// sticks centred, scaled round and deadzoned, its triggers read within their range and
+/// pressing at their point, its gyro without its bias. Built from a `device.source`'s
+/// settings (what the Calibration window writes), or for a pad with none, the stock ones.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PadCalibration {
+    deadzone: f32,
+    cal: DeviceCal,
+}
+
+impl Default for PadCalibration {
+    fn default() -> Self {
+        Self { deadzone: DEFAULT_STICK_DEADZONE, cal: DeviceCal::default() }
+    }
+}
+
+impl PadCalibration {
+    /// From a `device.source`'s settings, or a pad's remembered calibration in their shape.
+    pub fn from_params(params: &HashMap<String, Value>) -> Self {
+        let deadzone = params
+            .get("deadzone")
+            .and_then(|v| v.as_f64())
+            .map_or(DEFAULT_STICK_DEADZONE, |v| v as f32);
+        Self { deadzone, cal: load_device_cal(params) }
+    }
+
+    /// A stick, the right or the left: through its centre, its radial scale and its deadzone
+    /// (the right stick's own when it has one).
+    pub fn stick(&self, right: bool, v: Vec2) -> Vec2 {
+        let pin = if right { "right_stick" } else { "left_stick" };
+        match post_process_device_pin(pin, Signal::Vec2(v), self.deadzone, 1.0, &self.cal, false) {
+            Signal::Vec2(out) => out,
+            _ => v,
+        }
+    }
+
+    /// A trigger's travel within its calibrated range, 0 to 1.
+    pub fn trigger(&self, right: bool, v: f32) -> f32 {
+        apply_trigger_range(v, if right { self.cal.rtrig_range } else { self.cal.ltrig_range })
+    }
+
+    /// Where a trigger presses as a button - its point, but no nearer rest than `least` of its
+    /// travel, the band round it, on the calibrated travel [`Self::trigger`] gives - and how
+    /// long it waits out the band, in seconds: what "Digital triggers" steps a
+    /// `TriggerCrossing` with. A point at rest (a game sees the lightest touch) lets go only
+    /// at exactly zero, so a pad resting a hair off it, or a finger resting on the trigger,
+    /// would hold it down for good: what wants a deliberate pull - navigation, shortcuts -
+    /// asks for one with `least`.
+    pub fn trigger_edges(&self, right: bool, least: f32) -> (flexinput_core::automap::TriggerEdges, f32) {
+        use flexinput_core::automap::{trigger_band_width, trigger_edges};
+        let (point, range) = if right {
+            (self.cal.rtrig_threshold, self.cal.rtrig_range)
+        } else {
+            (self.cal.ltrig_threshold, self.cal.ltrig_range)
+        };
+        let point = point.max(least);
+        let edges = trigger_edges(point, (0.0, 1.0), trigger_band_width(self.cal.trig_hysteresis, range));
+        (edges, self.cal.trig_debounce)
+    }
+
+    /// The gyro's three axes, x y z, through its offset, orientation, signs and noise floor.
+    /// Not its multiplier: that is a patch's sensitivity, not the pad's calibration.
+    pub fn gyro(&self, g: [f32; 3]) -> [f32; 3] {
+        calibrate_gyro(&self.cal, g)
+    }
+}
+
 /// Renormalise a trigger reading from [raw_min, raw_max] to [0, 1] clamped.
 pub(crate) fn apply_trigger_range(v: f32, (mn, mx): (f32, f32)) -> f32 {
     if (mx - mn).abs() < 1e-4 { return v; }
@@ -488,28 +575,7 @@ pub(crate) fn preprocess_dev_sigs_into<S: std::hash::BuildHasher>(
         };
         let gxyz = (read_f("gyro_x"), read_f("gyro_y"), read_f("gyro_z"));
         if let (Some(gx), Some(gy), Some(gz)) = gxyz {
-            let v = [
-                gx - cal.gyro_offset[0],
-                gy - cal.gyro_offset[1],
-                gz - cal.gyro_offset[2],
-            ];
-            let v = if cal.orient_active { mat3_apply(&cal.orient_matrix, v) } else { v };
-            let mut out = [
-                v[0] * cal.gyro_sign[0],
-                v[1] * cal.gyro_sign[1],
-                v[2] * cal.gyro_sign[2],
-            ];
-            // Noise-floor deadzone: gate on the MAGNITUDE of the triple so a
-            // slow diagonal rotation never steps per axis. Below the floor
-            // the whole vector is noise → zero it (this is what stops the
-            // 3D-orientation drift and lean bias at rest). Crossing the
-            // border eases in exponentially over ~3 border-widths instead of
-            // snapping from 0 to the full value.
-            if cal.gyro_dz > 0.0 {
-                let mag = (out[0] * out[0] + out[1] * out[1] + out[2] * out[2]).sqrt();
-                let s = gyro_dz_ease(mag, cal.gyro_dz);
-                out = [out[0] * s, out[1] * s, out[2] * s];
-            }
+            let out = calibrate_gyro(cal, [gx, gy, gz]);
             imu_override.set_pin(&dev_id, "gyro_x", Signal::Float(out[0]));
             imu_override.set_pin(&dev_id, "gyro_y", Signal::Float(out[1]));
             imu_override.set_pin(&dev_id, "gyro_z", Signal::Float(out[2]));

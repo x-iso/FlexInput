@@ -130,6 +130,26 @@ pub(crate) fn jsm_nav_chord(ui: &egui::Ui, inner_id: NodeId) -> bool {
     })
 }
 
+/// Inside a whole-module widget (its parts being collected for `inner_id`), the fields of its
+/// row `element` - `local_rects`, in this ui's coordinates, in the order the pad walks them,
+/// `Rect::NOTHING` for one not drawn - for a module body that draws several rows as one block
+/// and so can't publish them row by row as a pinned row does. Elsewhere nothing: a pinned
+/// row of the same element publishes its own.
+pub(crate) fn publish_widget_row_fields(ui: &egui::Ui, inner_id: NodeId, element: &str, local_rects: &[egui::Rect]) {
+    let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));
+    if collecting != Some(inner_id.0) {
+        return;
+    }
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let rects: Vec<egui::Rect> = local_rects
+        .iter()
+        .map(|r| if r.is_finite() && r.is_positive() { to_global * *r } else { egui::Rect::NOTHING })
+        .collect();
+    let pass = ui.ctx().cumulative_pass_nr();
+    let id = egui::Id::new(("gp_nav_field_rects", inner_id.0, element.to_string()));
+    ui.ctx().data_mut(|d| d.insert_temp(id, (pass, rects)));
+}
+
 pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rects: &[egui::Rect]) {
     if local_rects.is_empty() { return; }
     let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
@@ -141,7 +161,12 @@ pub(crate) fn publish_nav_field_rects(ui: &egui::Ui, inner_id: NodeId, local_rec
     let element: String = ui.ctx().data(|d|
         d.get_temp(egui::Id::new(("gp_nav_cur_element", inner_id.0)))).unwrap_or_default();
     ui.ctx().data_mut(|d| d.insert_temp(
-        egui::Id::new(("gp_nav_field_rects", inner_id.0, element)), (pass, rects)));
+        egui::Id::new(("gp_nav_field_rects", inner_id.0, element)), (pass, rects.clone())));
+    // Inside a whole-module widget, these are the fields of the part about to be offered.
+    let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));
+    if collecting == Some(inner_id.0) {
+        ui.ctx().data_mut(|d| d.insert_temp(module_part_fields_pending_id(), rects.clone()));
+    }
 }
 
 /// Ctx-data slot of the visible band a whole-module pin shows of its list, keyed

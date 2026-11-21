@@ -307,6 +307,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     let gp_focus = app.config_nav_focus();
     // Gamepad state for the legend: (editing?, a pad is driving?).
     let (gp_editing, gp_pad_active) = app.config_nav_state();
+    let ring_editing = gp_editing;
     ctx.data_mut(|d| d.insert_temp(pad_active_id(), gp_pad_active));
     // Controller-icon legend groups, matching the Easy-mode bottom bar.
     let legend = if gp_pad_active { app.config_legend_specs(ctx) } else { Vec::new() };
@@ -375,6 +376,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     (monitor_size.y - init_size[1]) * 0.5 + cascade,
                 ];
                 config_layout.items.push(LayoutItem::Module(ExposedModule {
+                    tab: config_layout.new_item_tab(),
                     inner_node_id: inner_uid,
                     element_id: eid,
                     pos,
@@ -388,6 +390,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     keep_aspect: false,
                     anchor: Default::default(),
                     pin_style: Some(2),
+                    zoom: None,
                 }));
                 let idx = config_layout.items.len() - 1;
                 config_layout.selected_item = Some(idx);
@@ -406,7 +409,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         }
     }
 
-    let viewport_id = egui::ViewportId::from_hash_of("fxi_config_overlay");
+    let viewport_id = crate::canvas::viewer::config_overlay_viewport();
     let builder = egui::ViewportBuilder::default()
         .with_app_id(crate::APP_ID)
         .with_title(CONFIG_OVERLAY_TITLE)
@@ -438,22 +441,31 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // Screen-anchor resolution for hit-test / passthrough / nav targets, so
         // these match the displayed (re-anchored) rects `show_overlay_body`
         // paints. Current overlay size = the monitor it fills.
-        let cur_size: [f32; 2] = child_monitor
+        let screen_size: [f32; 2] = child_monitor
             .or_else(|| inner_rect.map(|r| r.size()))
             .map(|s| [s.x.max(1.0), s.y.max(1.0)])
             .unwrap_or([1920.0, 1080.0]);
+        // With two tabs or more, their row across the top of the screen: the pins are laid
+        // out beneath it (`overlay_body::overlay_layout_rect`).
+        let row_h = crate::canvas::viewer::tab_row_h(config_layout.layout_tabs.len());
+        let cur_size = [screen_size[0], (screen_size[1] - row_h).max(1.0)];
+        let row_rect = (row_h > 0.0).then(|| egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(screen_size[0], row_h)));
         let authored = config_layout.authored_size.unwrap_or(cur_size);
         // Resolve every pin's rect up front (screen-anchored or following a
         // linked target), so hit-test / passthrough / nav targets match what
         // `show_overlay_body` paints. Precomputed into an owned Vec so the
         // closure doesn't borrow `config_layout` (which is mutated below).
+        // A pin on another tab of the overlay than the one showing is nowhere.
         let resolved_rects: Vec<egui::Rect> = (0..config_layout.items.len())
             .map(|i| {
+                if !config_layout.items[i].on_tab(config_layout.active_tab, config_layout.layout_tabs.len()) {
+                    return egui::Rect::NOTHING;
+                }
                 let (p, s) = crate::canvas::node::resolve_layout_rect(
                     &config_layout.items, i, authored, cur_size,
                 );
                 egui::Rect::from_min_size(
-                    egui::pos2(p[0], p[1]),
+                    egui::pos2(p[0], p[1] + row_h),
                     egui::vec2(s[0].max(8.0), s[1].max(8.0)),
                 )
             })
@@ -483,10 +495,13 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                 .enumerate()
                 .filter_map(|(i, it)| {
                     let LayoutItem::Module(m) = it else { return None };
+                    if !it.on_tab(config_layout.active_tab, config_layout.layout_tabs.len()) {
+                        return None;
+                    }
                     let editable = crate::canvas::overlay_body::resolve_overlay_module(
                         tab_snarl, &m.source_path, m.inner_node_id,
                     )
-                    .map(|n| FlexInputApp::elem_is_nav_target(
+                    .map(|n| FlexInputApp::pin_is_nav_target(
                         crate::canvas::viewer::curve_ui_module_id(n), &m.element_id))
                     .unwrap_or(false);
                     editable.then(|| (i, item_rect(i)))
@@ -530,9 +545,17 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         // letting it hover-steal onto another pin would suppress the very input
         // being tweaked. A pure-mouse session (no gamepad focus) still hover-picks
         // the pin under the cursor.
+        // The mouse used on the overlay since the pad last moved: its hover picks, as in a
+        // pure-mouse session, until the pad takes over again. A click, a scroll or a touch -
+        // not a move: over a game the cursor is moved by the game itself, and by whatever
+        // passes through to it.
+        if live && !hands_off && crate::widgets::pointer_pressed(vctx) {
+            crate::widgets::note_pointer_activity(vctx);
+        }
+        let pointer_owns = crate::widgets::pointer_owns(vctx);
         let active_idx = if !live {
             None
-        } else if gp_focus.is_some() {
+        } else if gp_focus.is_some() && !pointer_owns {
             gp_active
         } else {
             hovered_module_idx.or(gp_active)
@@ -580,12 +603,13 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             false
         } else {
             let over_toolbar = cursor.zip(toolbar_rect).is_some_and(|(c, r)| r.contains(c));
+            let over_row = cursor.zip(row_rect).is_some_and(|(c, r)| r.contains(c));
             let over_item = cursor
                 .map(|c| (0..config_layout.items.len()).any(|i| item_rect(i).expand(HIT_MARGIN).contains(c)))
                 .unwrap_or(false);
             // No cursor reading on Windows → stay interactive. On Linux it
             // only means the cursor is off the input region.
-            whole || over_toolbar || over_item || (cfg!(not(target_os = "linux")) && cursor.is_none())
+            whole || over_toolbar || over_row || over_item || (cfg!(not(target_os = "linux")) && cursor.is_none())
         };
         let want_passthrough = !interactive;
         // Linux: the same rects become the window's input region (see
@@ -597,6 +621,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             None
         } else {
             Some(toolbar_rect.into_iter()
+                .chain(row_rect)
                 .chain((0..config_layout.items.len()).map(|i| item_rect(i).expand(HIT_MARGIN)))
                 .collect())
         });
@@ -719,7 +744,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
                 // Value-field bloom ring (knob / min-max / range rows). nav draws
                 // this on the main window; redraw it here so it shows over the game.
-                crate::app::draw_config_field_glow(ui.ctx(), field_glow_target.clone(), ui.layer_id());
+                crate::app::draw_config_field_glow(
+                    ui.ctx(), field_glow_target.clone(), ui.layer_id(),
+                    active_idx.filter(|&i| i < config_layout.items.len()).map(item_rect),
+                );
 
                 // Focus ring on the active pin (its input is passing through);
                 // brighter + larger while it's being edited, like Easy mode.
@@ -729,8 +757,13 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     // Resolve to the re-anchored rect (not the raw authored bbox)
                     // so the ring tracks the pin after a cross-resolution shift —
                     // matching what `show_overlay_body` paints.
-                    let r = item_rect(i);
-                    paint_focus_ring(ui, r, gp_editing);
+                    // On a stop of a module pinned whole: that stop, not the whole pin.
+                    let stop = match config_layout.items.get(i) {
+                        Some(LayoutItem::Module(m)) => crate::canvas::viewer::module_part_focus_rect(ui.ctx(), m.inner_node_id),
+                        _ => None,
+                    };
+                    let r = stop.unwrap_or_else(|| item_rect(i));
+                    paint_focus_ring(ui, r, ring_editing);
                 }
 
                 paint_reject_hint(ui, rect);
@@ -805,9 +838,11 @@ fn config_toolbar(
     passthrough_default: bool,
     set_passthrough_default: &mut Option<bool>,
 ) {
+    // Under the overlay's row of tabs, where it has one.
+    let below = crate::canvas::viewer::tab_row_h(config_layout.layout_tabs.len());
     let area = egui::Area::new(egui::Id::new("fxi_config_toolbar"))
         .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0 + below))
         .interactable(true);
     let area_resp = area.show(ui.ctx(), |ui| {
         let bg = ui.visuals().window_fill();
@@ -859,9 +894,8 @@ fn config_toolbar(
                         }
                         if edit {
                             ui.separator();
-                            if ui.button("➕ Add element")
-                                .on_hover_text("Pick an adjustable control to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window. Non-adjustable elements are ignored. Esc cancels.")
-                                .clicked()
+                            if crate::canvas::viewer::layout_tool_word(ui, "+ Add element",
+                                "Pick an adjustable control to pin: the overlay collapses to a\nglowing border and pinnable elements light up amber in the\nFlexInput window. Non-adjustable elements are ignored. Esc cancels.", false)
                             {
                                 crate::canvas::viewer::set_overlay_pick_active(ui.ctx(), true);
                                 crate::canvas::viewer::set_overlay_pick_dest_config(ui.ctx(), true);
@@ -881,7 +915,7 @@ fn config_toolbar(
                         }
                     });
                     if edit {
-                        crate::canvas::viewer::layout_inspector_strip_core(ui, &mut state, sel_module);
+                        crate::canvas::viewer::overlay_inspector_strip(ui, &mut state, sel_module);
                     }
                 });
             });
@@ -1014,7 +1048,9 @@ fn paint_config_legend(ui: &mut egui::Ui, rect: egui::Rect, legend: &[(Vec<Confi
 fn paint_focus_ring(ui: &mut egui::Ui, rect: egui::Rect, editing: bool) {
     let accent = ui.visuals().selection.stroke.color;
     let [r, g, b, _] = accent.to_array();
-    let p = ui.painter();
+    let mut p = ui.painter().clone();
+    p.multiply_opacity(crate::widgets::nav_highlight_alpha(ui.ctx()));
+    let p = &p;
     // Editing reads as a stronger, wider bloom than plain focus.
     let (rings, spread, peak) = if editing { (8, 12.0f32, 210.0f32) } else { (6, 7.0, 150.0) };
     for i in 0..rings {

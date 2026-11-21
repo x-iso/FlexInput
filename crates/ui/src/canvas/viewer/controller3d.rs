@@ -535,20 +535,6 @@ pub(crate) fn c3d_xray_visible(snarl: &Snarl<NodeData>, node_id: NodeId) -> Opti
         .map(|v| v as f32)
 }
 
-/// The X-ray setting's slider, in percent of the facing surface. Returns the
-/// new share when moved.
-pub(crate) fn c3d_xray_slider(ui: &mut egui::Ui, visible: Option<f32>) -> Option<f32> {
-    let mut pct = visible.unwrap_or(crate::model::callback::GHOST_VIS_LOW) * 100.0;
-    ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%").fixed_decimals(0))
-        .on_hover_text(
-            "When a pressed input shows through the shell: once less than this\n\
-             much of it is in view. Raise it for inputs that only peek out past\n\
-             the shell, like a pad's back buttons, which at a small size read as\n\
-             barely lit. 0 = never.",
-        )
-        .changed()
-        .then_some(pct / 100.0)
-}
 
 /// The node's Motion cue amount (`motion_cue`, 0 = off).
 pub(crate) fn c3d_motion_amount(snarl: &Snarl<NodeData>, node_id: NodeId) -> f32 {

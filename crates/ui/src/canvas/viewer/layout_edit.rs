@@ -39,6 +39,9 @@ pub(crate) struct LayoutStateMut<'a> {
     /// anchor picker to show what an `Auto` axis resolves to). `None` for
     /// sub-patch layouts and un-baked overlays.
     pub authored_size: Option<[f32; 2]>,
+    /// The layout's tabs (`UiSubPatch::layout_tabs`) and the one showing.
+    pub layout_tabs: &'a mut Vec<String>,
+    pub active_tab: &'a mut usize,
 }
 
 impl<'a> LayoutStateMut<'a> {
@@ -51,6 +54,8 @@ impl<'a> LayoutStateMut<'a> {
             selected_items: &mut sp.selected_items,
             is_overlay: false,
             authored_size: None,
+            layout_tabs: &mut sp.layout_tabs,
+            active_tab: &mut sp.active_tab,
         }
     }
     pub fn of_overlay(ov: &'a mut crate::canvas::node::OverlayLayout) -> Self {
@@ -63,6 +68,8 @@ impl<'a> LayoutStateMut<'a> {
             selected_items: &mut ov.selected_items,
             is_overlay: true,
             authored_size,
+            layout_tabs: &mut ov.layout_tabs,
+            active_tab: &mut ov.active_tab,
         }
     }
 }
@@ -89,89 +96,118 @@ pub(crate) fn layout_editing_controls_core(
     layout_inspector_strip_core(ui, state, sel_module);
 }
 
-/// The snap + decoration-adder controls, WITHOUT a row wrapper — the caller
-/// supplies the layout (a `ui.horizontal` in the sub-patch wrapper; the
-/// overlay toolbar keeps these on its main row while the inspector strip drops
-/// to a second row below). Split out of `layout_editing_controls_core` so the
-/// selected-item properties can always live on their own row.
+/// How tall the layout editor's tool buttons are.
+const TOOL_H: f32 = 24.0;
+
+/// The layout editor's tools, in a row at the cursor (the caller's layout runs it across):
+/// snap - the magnet - and its grid as a value pill, then a drawing for each thing to add. On
+/// an overlay, the selection's anchor and whether a stretched pin keeps its shape too. No row
+/// wrapper: Easy mode puts these in its header row, an overlay on its toolbar's first row.
+/// A word button in the layout toolbar's look: as tall as its squares, in the control font,
+/// `accent` lit like a switch that's on (the toolbar's way out).
+pub(crate) fn layout_tool_word(ui: &mut egui::Ui, word: &str, hover: &str, accent: bool) -> bool {
+    let w = curve_rows::word_w(ui, word) + 6.0;
+    let v = ui.visuals();
+    let mut text = egui::RichText::new(word).font(simple_bodies::control_font());
+    if accent {
+        text = text.color(v.strong_text_color());
+    }
+    let mut button = egui::Button::new(text).min_size(egui::vec2(w, TOOL_H));
+    if accent {
+        button = button.fill(v.selection.bg_fill);
+    }
+    ui.add(button).on_hover_text(hover).clicked()
+}
+
 pub(crate) fn layout_toolbar_controls_core(
     ui: &mut egui::Ui,
     state: &mut LayoutStateMut<'_>,
 ) {
+    use super::glyphs::Glyph;
     let mut add_kind: Option<&'static str> = None;
-    ui.checkbox(state.snap_enabled, egui::RichText::new("Snap").small())
-        .on_hover_text("Snap pinned-element positions and sizes to a grid in Layout mode");
+    let node = NodeId(egui::Id::new("layout_toolbar").value() as usize);
+    let square = |ui: &mut egui::Ui| ui.allocate_exact_size(egui::vec2(TOOL_H, TOOL_H), egui::Sense::hover()).0;
+
+    let r = square(ui);
+    curve_rows::icon_toggle(ui, r, Glyph::Magnet, state.snap_enabled, true,
+        "Snap: positions and sizes land on the grid", "layout_snap");
     let overlay = state.is_overlay;
-    ui.add_enabled_ui(*state.snap_enabled, |ui| {
-        ui.label(egui::RichText::new("grid").small().weak());
+    let enabled = *state.snap_enabled;
+    ui.add_enabled_ui(enabled, |ui| {
+        let (r, _) = ui.allocate_exact_size(egui::vec2(104.0, TOOL_H), egui::Sense::hover());
+        // The grid shows while its pill is under the pointer, so a change to it can be seen.
+        if ui.rect_contains_pointer(r) {
+            let ctx = ui.ctx().clone();
+            // Both read before `data_mut` takes the context: asking it again inside deadlocks.
+            let (id, pass) = (grid_peek_id(&ctx), ctx.cumulative_pass_nr());
+            ctx.data_mut(|d| d.insert_temp(id, pass));
+        }
         if overlay {
-            // Overlays snap on a % division of the viewport. The control edits
-            // the per-cell % directly (so dragging right = bigger % = COARSER,
-            // dragging left = smaller % = FINER), quantized to zone-aligned cell
-            // counts (multiples of 3, so the grid nests in the 3×3 anchor zones).
+            // Overlays snap on a share of the screen: the pill is the cell's size, quantized
+            // to cell counts that nest in the 3x3 anchor zones (multiples of 3).
             let cells = (((*state.snap_grid_px).max(9) / 3) * 3).clamp(9, 99);
-            let mut pct = 100.0 / cells as f64;
-            // px → cells: nearest multiple of 3 in [9, 99].
-            let to_cells = |p: f64| (((100.0 / p) / 3.0).round() * 3.0).clamp(9.0, 99.0) as u32;
-            if ui.add(
-                egui::DragValue::new(&mut pct)
-                    .speed(0.05)
-                    .range(100.0 / 99.0..=100.0 / 9.0)
-                    .suffix("%")
-                    .max_decimals(2),
-            )
-                .on_hover_text("Grid cell size as % of the viewport per axis (lower = finer). Quantized so the grid lines up with the 3×3 anchor zones.")
-                .changed()
+            let mut pct = 100.0 / cells as f32;
+            let shown = format!("{pct:.1}%");
+            if curve_rows::real_pill(ui, node, "grid_pct", r, "grid", &mut pct, &shown, 100.0 / 99.0..=100.0 / 9.0, 0.02,
+                "The grid's cell, as a share of the screen each way (smaller is finer). It lines up with the 3x3 anchor zones.")
             {
-                *state.snap_grid_px = to_cells(pct.max(0.01));
+                *state.snap_grid_px = (((100.0 / pct.max(0.01)) / 3.0).round() * 3.0).clamp(9.0, 99.0) as u32;
             }
         } else {
-            // Sub-patch bodies snap on a px grid (rounded to multiples of 2).
-            let mut g = *state.snap_grid_px as i32;
-            if ui.add(egui::DragValue::new(&mut g).speed(0.5).range(2i32..=64).suffix("px"))
-                .on_hover_text("Grid step in pixels (rounded to multiples of 2)")
-                .changed()
+            let mut g = f64::from(*state.snap_grid_px);
+            let shown = format!("{g:.0} px");
+            if curve_rows::count_pill(ui, node, "grid_px", r, "grid", &mut g, &shown, 2.0..=64.0, 0.25,
+                "The grid's step, in points (even numbers)")
             {
-                *state.snap_grid_px = ((g.max(2)) / 2 * 2) as u32;
+                *state.snap_grid_px = ((g.round() as u32).max(2) / 2) * 2;
             }
         }
     });
 
-    // Overlay-only: explicit anchoring + keep-aspect for the selected
-    // element(s).
+    // Overlay-only: every element's anchor shown, or only the selection's.
+    if overlay {
+        let r = square(ui);
+        let mut all = overlay_all_anchors(ui.ctx());
+        if curve_rows::icon_toggle(ui, r, Glyph::Anchors, &mut all, true,
+            "Anchors: show what every element is anchored to, not only the selected one", "layout_all_anchors")
+        {
+            ui.ctx().data_mut(|d| d.insert_persisted(overlay_all_anchors_id(), all));
+        }
+    }
+
+    // Overlay-only: anchoring and keep-aspect for the selected element(s).
     if overlay {
         let sel: Vec<usize> = if state.selected_items.is_empty() {
             state.selected_item.iter().copied().collect()
         } else {
             state.selected_items.clone()
         };
-        // While a target pick is armed, replace the picker with a clear
-        // "selecting…" indicator + Cancel, so the mode is obvious.
         if let Some(followers) = crate::canvas::overlay_body::anchor_pick_armed(ui.ctx()) {
             ui.label(
                 egui::RichText::new(format!("⚓ Click a target for {} element(s)…", followers.len()))
                     .small()
                     .color(egui::Color32::from_rgb(150, 200, 255)),
             );
-            if ui.small_button("Cancel").clicked() {
+            if layout_tool_word(ui, "Cancel", "Stop picking a target", false) {
                 crate::canvas::overlay_body::clear_anchor_pick(ui.ctx());
             }
         } else if !sel.is_empty() {
-            anchor_picker(ui, state, &sel);
+            // The anchor's menu button as tall as the toolbar's squares, in the control font.
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = TOOL_H;
+                ui.style_mut().override_font_id = Some(simple_bodies::control_font());
+                anchor_picker(ui, state, &sel);
+            });
         }
-        // Keep-aspect (module pins only): when the element stretches across
-        // anchor zones it scales uniformly instead of distorting.
         let modules: Vec<usize> = sel.iter().copied()
             .filter(|&i| matches!(state.items.get(i), Some(LayoutItem::Module(_))))
             .collect();
         if !modules.is_empty() {
-            // Checkbox reflects the primary/first selected module; toggling
-            // applies to all selected modules.
             let mut ka = modules.iter().any(|&i| matches!(
                 state.items.get(i), Some(LayoutItem::Module(m)) if m.keep_aspect));
-            if ui.checkbox(&mut ka, egui::RichText::new("Keep aspect").small())
-                .on_hover_text("When this element stretches across screen zones, scale it uniformly (no distortion)")
-                .changed()
+            let (r, _) = ui.allocate_exact_size(egui::vec2(curve_rows::word_w(ui, "keep shape") + 8.0, TOOL_H), egui::Sense::hover());
+            if curve_rows::word_toggle(ui, r, &mut ka, "keep shape",
+                "Stretched across the screen's zones, the pin scales evenly instead of distorting", "layout_keep_aspect")
             {
                 for &i in &modules {
                     if let Some(LayoutItem::Module(m)) = state.items.get_mut(i) {
@@ -182,24 +218,29 @@ pub(crate) fn layout_toolbar_controls_core(
         }
     }
     ui.separator();
-    ui.label(egui::RichText::new("Add:").small().weak());
-    if ui.small_button("T").on_hover_text("Add Text label").clicked() {
-        add_kind = Some("text");
+    for (glyph, kind, hover) in [
+        (Glyph::AddText, "text", "Add a text"),
+        (Glyph::AddRect, "rect", "Add a rectangle"),
+        (Glyph::AddEllipse, "ellipse", "Add an ellipse"),
+        (Glyph::AddLine, "line", "Add a line"),
+        (Glyph::AddPicture, "svg", "Add a picture (an SVG, an icon, a pad's button)"),
+    ] {
+        // What doesn't fit whole is left out, not cut at the row's end.
+        if ui.available_width() < TOOL_H {
+            break;
+        }
+        let r = square(ui);
+        if kit::header_icon_button(ui, glyph, hover, r, ("layout_add", kind)) {
+            add_kind = Some(kind);
+        }
     }
-    if ui.small_button("▢").on_hover_text("Add Rectangle").clicked() {
-        add_kind = Some("rect");
-    }
-    if ui.small_button("◯").on_hover_text("Add Ellipse").clicked() {
-        add_kind = Some("ellipse");
-    }
-    if ui.small_button("╱").on_hover_text("Add Line").clicked() {
-        add_kind = Some("line");
-    }
-    if ui.small_button("SVG").on_hover_text("Add SVG").clicked() {
-        add_kind = Some("svg");
+    if ui.available_width() >= layout_tab_picker_w(ui, state) + 12.0 {
+        ui.separator();
+        layout_tab_picker(ui, state, TOOL_H);
     }
     if let Some(kind) = add_kind {
-        let deco = make_default_decoration(kind);
+        let mut deco = make_default_decoration(kind);
+        deco.set_tab(state.new_item_tab());
         state.items.push(LayoutItem::Deco(deco));
         let idx = state.items.len() - 1;
         *state.selected_item = Some(idx);
@@ -395,136 +436,269 @@ pub(crate) fn layout_inspector_strip_core(
     state: &mut LayoutStateMut<'_>,
     sel_module: SelectedModuleInfo,
 ) {
-    let Some(idx) = *state.selected_item else { return };
+    let room = ui.available_width();
+    layout_inspector(ui, state, sel_module, None, Some(room));
+}
 
-    let inner_mid = sel_module.as_ref().map(|(mid, _)| mid.as_str());
-    let is_text_pin   = inner_mid == Some("module.label");
-    let is_switch_pin = inner_mid == Some("module.switch");
-    let is_input_viewer_pin = inner_mid == Some("module.input_viewer");
-    // The 3D controller viewer shares the Input Viewer's style-override STORAGE
-    // but has its own inspector (adds view angle / opacity / highlight fade).
-    let is_c3d_pin = inner_mid == Some("display.controller3d");
-    // 3DOF to 2D's 3D preview: its frame and how it draws the pad.
-    let is_gyro_preview_pin = inner_mid == Some("processing.gyro_3dof")
-        && matches!(state.items.get(idx), Some(LayoutItem::Module(m)) if m.element_id == "preview");
-    // Touch Zones / Virtual Menu pins: pad colour + visibility overrides. The
-    // override only affects the "field" element's render; on cards/options
-    // pins the controls are inert.
-    let is_zone_pad_pin = matches!(
-        inner_mid,
-        Some("module.touch_zones") | Some("module.menu")
-    );
-    let is_graph_pin = matches!(
-        inner_mid,
-        Some("module.response_curve")
-            | Some("module.vec_response_curve")
-            | Some("module.twoway_response_curve")
-            | Some("display.oscilloscope")
-            | Some("display.vectorscope")
-            | Some("display.trigscope")
-            | Some("generator.envelope")
-            // The Audio Stream Haptics scope pin honors background + outline (the
-            // EQ/spectrum draw their own contents, so gridline/channel controls
-            // are inert on it — same "only some fields apply" rule as the pad pins).
-            | Some("module.audio_stream_haptics")
-            // JSM Config: the curve pin uses every field (channel 1 = the
-            // sensitivity line, channel 2 = the camera-speed line); the editor
-            // and fader pins honour background / outline, and a fader also takes
-            // gridline as its track and channel 1 as its fill.
-            | Some("module.jsm")
-    );
-    let graph_channels = sel_module.as_ref().map(|(_, ch)| *ch).unwrap_or(1);
+/// An overlay toolbar's Inspector strip: one slim line, up to about two thirds of the screen
+/// - past that its sections go to tabs.
+pub(crate) fn overlay_inspector_strip(
+    ui: &mut egui::Ui,
+    state: &mut LayoutStateMut<'_>,
+    sel_module: SelectedModuleInfo,
+) {
+    let screen = ui.ctx().content_rect().width();
+    let room = (screen * 0.7).min(screen - 64.0).max(240.0);
+    layout_inspector(ui, state, sel_module, None, Some(room));
+}
 
-    // Snapshot the primary's style BEFORE the inspector edits it (only when a
-    // multi-selection is active — single-select needs no propagation).
-    let multi: Vec<usize> = state.selected_items.clone();
-    let before: Option<ItemStyle> = if multi.len() > 1 {
-        state.items.get(idx).map(item_style_of)
-    } else { None };
+/// Whether an overlay's editor shows every element's anchor - its point, and the line to what
+/// it is anchored to - rather than only the selected elements' (the toolbar's anchor switch).
+/// Remembered across runs.
+pub(crate) fn overlay_all_anchors_id() -> egui::Id {
+    egui::Id::new("fxi_overlay_all_anchors")
+}
 
-    // A redesigned row can be drawn the way it was (Style 1) or the way the module now is
-    // (Style 2): an overlay built round the old rows' proportions keeps them.
-    if let (Some(mid), Some(LayoutItem::Module(m))) = (inner_mid, state.items.get_mut(idx)) {
-        if super::pin_style2::supported(mid, &m.element_id) {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("look").small().weak()).on_hover_text(
-                    "Style 1: the row as it was before the module redesign.
-                     Style 2: the module's own look - value pills and joined switches.",
-                );
-                let cur = m.pin_style.unwrap_or(1);
-                for (v, lbl) in [(1u8, "style 1"), (2u8, "style 2")] {
-                    if ui.selectable_label(cur == v, egui::RichText::new(lbl).small()).clicked() {
-                        m.pin_style = Some(v);
-                    }
-                }
-            });
+pub(crate) fn overlay_all_anchors(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| *d.get_persisted_mut_or_default::<bool>(overlay_all_anchors_id()))
+}
+
+/// How much of a layout's snap grid (and an overlay's anchor zones) shows, 0 to 1: it eases
+/// in while an object of the layout is moved or resized - `layout_set_moving`, from the frame
+/// before, since the grid goes under the objects - or the pointer is on the grid's pill in the
+/// toolbar, and out again after. It was there the whole time an object could be moved.
+pub(crate) fn layout_grid_t(ctx: &egui::Context, id: egui::Id) -> f32 {
+    let moving: bool = ctx.data(|d| d.get_temp(id.with("moving"))).unwrap_or(false);
+    let peek_id = grid_peek_id(ctx);
+    let peek = ctx.data(|d| d.get_temp::<u64>(peek_id)).is_some_and(|pass| pass + 1 >= ctx.cumulative_pass_nr());
+    ctx.animate_bool_with_time(id.with("grid_fade"), moving || peek, 0.15)
+}
+
+/// Whether an object of the layout `id` is being moved or resized this frame: the grid shows
+/// while one is (`layout_grid_t`).
+pub(crate) fn layout_set_moving(ctx: &egui::Context, id: egui::Id, moving: bool) {
+    ctx.data_mut(|d| d.insert_temp(id.with("moving"), moving));
+}
+
+/// Where the toolbar notes the pass its grid pill was last under the pointer, per viewport (an
+/// overlay's toolbar counts its own passes).
+fn grid_peek_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new(("layout_grid_peek", ctx.viewport_id()))
+}
+
+/// How opaque a layout object is drawn while its layout is edited: whole, easing to
+/// see-through while the pointer is over it (`hovered`) so whatever it covers shows, and
+/// back once the pointer leaves. Keyed per object by `id`.
+pub(crate) fn layout_hover_opacity(ctx: &egui::Context, id: egui::Id, hovered: bool) -> f32 {
+    const SEE_THROUGH: f32 = 0.4;
+    1.0 - (1.0 - SEE_THROUGH) * layout_hover_t(ctx, id, hovered)
+}
+
+/// How far a layout object being edited has eased into its hovered look - see-through, its
+/// outline showing - 0 to 1, by the same easing every frame however often it's asked.
+pub(crate) fn layout_hover_t(ctx: &egui::Context, id: egui::Id, hovered: bool) -> f32 {
+    ctx.animate_bool_with_time(id, hovered, 0.15)
+}
+
+/// The pointer in `ui`'s layer's own coordinates, while it's over `area` there and not over
+/// a popup or window above the layer: where a layout being edited looks for what's under it.
+pub(crate) fn layout_pointer_local(ui: &egui::Ui, area: egui::Rect) -> Option<egui::Pos2> {
+    let global = ui.ctx().input(|i| i.pointer.hover_pos())?;
+    let above = ui.ctx().layer_id_at(global).is_some_and(|l| (l.order as u8) > (ui.layer_id().order as u8));
+    if above {
+        return None;
+    }
+    let to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let local = to_global.inverse() * global;
+    (area.contains(local) && ui.clip_rect().contains(local)).then_some(local)
+}
+
+/// Which of a dragged layout object's lines catch on the other objects': its edges on theirs
+/// (Shift held), or its centre on theirs (Ctrl held).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObjectSnap {
+    Edges,
+    Centres,
+}
+
+impl ObjectSnap {
+    /// What the held modifiers ask a move for, if anything: Shift edges, else Ctrl centres.
+    pub(crate) fn held(ui: &egui::Ui) -> Option<Self> {
+        let m = ui.input(|i| i.modifiers);
+        if m.shift {
+            Some(Self::Edges)
+        } else if m.ctrl || m.mac_cmd {
+            Some(Self::Centres)
+        } else {
+            None
         }
     }
+}
 
-    if idx < state.items.len() {
-        match &mut state.items[idx] {
-            LayoutItem::Deco(_) => {
-                decoration_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_text_pin => {
-                text_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_switch_pin => {
-                switch_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_input_viewer_pin => {
-                input_viewer_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_zone_pad_pin => {
-                menu_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_c3d_pin => {
-                controller3d_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_gyro_preview_pin => {
-                gyro_preview_pin_inspector_strip_item(ui, state.items, idx);
-            }
-            LayoutItem::Module(_) if is_graph_pin => {
-                graph_pin_inspector_strip_item(
-                    ui,
-                    state.items,
-                    idx,
-                    graph_channels,
-                    // Which of the module's graph switches a pinned copy can set for itself.
-                    match inner_mid {
-                        Some("generator.envelope") => 3,
-                        Some(
-                            "module.response_curve"
-                            | "module.vec_response_curve"
-                            | "module.twoway_response_curve"
-                            | "module.automap_response_curve"
-                            | "module.automap_vec_response_curve"
-                            | "module.automap_twoway_response_curve",
-                        ) => 2,
-                        _ => 0,
-                    },
-                );
-            }
+/// How far to move a dragged object at `rect` so its edges - or its centre - land on the
+/// nearest of the `others`', each axis on its own, within `reach`; and the lines it landed on,
+/// across then down, for the editor to draw as guides. All in the same coordinates.
+pub(crate) fn snap_to_objects(
+    rect: egui::Rect,
+    others: &[egui::Rect],
+    mode: ObjectSnap,
+    reach: f32,
+) -> (egui::Vec2, Option<f32>, Option<f32>) {
+    let lines = |r: egui::Rect, across: bool| -> [Option<f32>; 2] {
+        match (mode, across) {
+            (ObjectSnap::Edges, true) => [Some(r.left()), Some(r.right())],
+            (ObjectSnap::Edges, false) => [Some(r.top()), Some(r.bottom())],
+            (ObjectSnap::Centres, true) => [Some(r.center().x), None],
+            (ObjectSnap::Centres, false) => [Some(r.center().y), None],
+        }
+    };
+    let nearest = |across: bool| -> Option<(f32, f32)> {
+        let mine = lines(rect, across);
+        others
+            .iter()
+            .flat_map(|o| lines(*o, across).into_iter().flatten())
+            .flat_map(|line| mine.into_iter().flatten().map(move |m| (line - m, line)))
+            .filter(|(d, _)| d.abs() <= reach)
+            .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+    };
+    let (x, y) = (nearest(true), nearest(false));
+    (egui::vec2(x.map_or(0.0, |b| b.0), y.map_or(0.0, |b| b.0)), x.map(|b| b.1), y.map(|b| b.1))
+}
+
+/// A resize with Ctrl held: the object at `pos`, `size` big, has its moving edges - its right
+/// and bottom - caught on the nearest of the `others`' edges or centres within `reach`, each
+/// axis on its own. About its centre (Alt), the opposite edges move as far the other way.
+/// Keeping its shape (Shift, `aspect` = width over height), only the nearer catch holds and
+/// the other side follows the shape. Returns the place and size it ends at and the lines it
+/// caught on, across then down, for guides. All in the layout's coordinates.
+pub(crate) fn snap_resize_to_objects(
+    pos: [f32; 2],
+    size: [f32; 2],
+    others: &[egui::Rect],
+    reach: f32,
+    about_centre: bool,
+    aspect: Option<f32>,
+) -> ([f32; 2], [f32; 2], Option<f32>, Option<f32>) {
+    let catch = |edge: f32, across: bool| -> Option<(f32, f32)> {
+        others
+            .iter()
+            .filter(|o| o.is_positive())
+            .flat_map(|o| if across { [o.left(), o.center().x, o.right()] } else { [o.top(), o.center().y, o.bottom()] })
+            .map(|line| (line - edge, line))
+            .filter(|(d, _)| d.abs() <= reach)
+            .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+    };
+    let mut x = catch(pos[0] + size[0], true);
+    let mut y = catch(pos[1] + size[1], false);
+    if aspect.is_some() {
+        match (x, y) {
+            (Some(a), Some(b)) if a.0.abs() <= b.0.abs() => y = None,
+            (Some(_), Some(_)) => x = None,
             _ => {}
         }
-    } else {
-        *state.selected_item = None;
     }
-
-    // Diff the primary against its pre-edit snapshot and apply the changed
-    // style fields to the rest of the selection.
-    if let Some(before) = before {
-        if let Some(after) = state.items.get(idx).map(item_style_of) {
-            let changed = before.diff(&after);
-            if changed.any() {
-                for &j in multi.iter() {
-                    if j == idx { continue; }
-                    if let Some(it) = state.items.get_mut(j) {
-                        changed.apply_to(it);
-                    }
-                }
-            }
+    let k = if about_centre { 2.0 } else { 1.0 };
+    let (mut pos, mut size) = (pos, size);
+    if let Some((d, _)) = x {
+        size[0] += k * d;
+        if about_centre {
+            pos[0] -= d;
         }
+    }
+    if let Some((d, _)) = y {
+        size[1] += k * d;
+        if about_centre {
+            pos[1] -= d;
+        }
+    }
+    if let Some(aspect) = aspect.filter(|a| *a > 0.0) {
+        if x.is_some() {
+            let h = size[0] / aspect;
+            if about_centre {
+                pos[1] -= (h - size[1]) * 0.5;
+            }
+            size[1] = h;
+        } else if y.is_some() {
+            let w = size[1] * aspect;
+            if about_centre {
+                pos[0] -= (w - size[0]) * 0.5;
+            }
+            size[0] = w;
+        }
+    }
+    (pos, size, x.map(|c| c.1), y.map(|c| c.1))
+}
+
+/// While a layout is edited and a modifier is held, what it does there, in a small panel at
+/// the window's bottom left - as the canvas does for its own. Once a pass per viewport, however
+/// many layouts are being edited in it.
+pub(crate) fn layout_modifier_hint(ctx: &egui::Context, overlay: bool) {
+    let m = ctx.input(|i| i.modifiers);
+    let ctrl = m.ctrl || m.mac_cmd;
+    let mut lines: Vec<&'static str> = Vec::new();
+    if m.shift && m.alt {
+        lines.push("Shift+Alt+Resize   Keep the shape, about the centre");
+    } else if m.shift {
+        lines.push("Shift+Drag         Edges catch on other objects' edges");
+        lines.push("Shift+Resize       Keep the shape");
+        lines.push("Shift+Click        Add to or take from the selection");
+        if !overlay {
+            lines.push("Shift+Drag empty   Select a region");
+        }
+        lines.push("Shift+Gradient     An end catches on edges");
+    } else if ctrl {
+        lines.push("Ctrl+Drag          Centre catches on other objects' centres");
+        lines.push("Ctrl+Resize        Edges catch on other objects' edges or centres");
+        lines.push("Ctrl+Gradient      An end catches on centres");
+    } else if m.alt {
+        lines.push("Alt+Resize         Resize about the centre");
+        lines.push("Alt+Shift+Resize   ... keeping the shape");
+    }
+    if lines.is_empty() {
+        return;
+    }
+    // Both read before `data_mut` takes the context: asking it again inside deadlocks.
+    let (key, pass) = (egui::Id::new(("layout_modifier_hint", ctx.viewport_id())), ctx.cumulative_pass_nr());
+    let first = ctx.data_mut(|d| {
+        let shown = d.get_temp::<u64>(key) == Some(pass);
+        d.insert_temp(key, pass);
+        !shown
+    });
+    if !first {
+        return;
+    }
+    egui::Area::new(egui::Id::new("layout_modifier_tooltip"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+                ui.set_min_width(180.0);
+                for line in &lines {
+                    ui.label(egui::RichText::new(*line).small().monospace());
+                }
+            });
+        });
+}
+
+/// Whether a layout is being edited in `ctx`'s viewport this pass ([`layout_modifier_hint`]
+/// ran): the canvas leaves the modifiers' hint to it.
+pub(crate) fn layout_hint_shown(ctx: &egui::Context) -> bool {
+    let (key, pass) = (egui::Id::new(("layout_modifier_hint", ctx.viewport_id())), ctx.cumulative_pass_nr());
+    ctx.data(|d| d.get_temp::<u64>(key)) == Some(pass)
+}
+
+/// Draw the guides a snapped drag landed on (`snap_to_objects`), local `across` and `down`
+/// lines placed by `origin`, through `area`.
+pub(crate) fn paint_snap_guides(painter: &egui::Painter, origin: egui::Pos2, area: egui::Rect, across: &[f32], down: &[f32]) {
+    let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 110, 200, 220));
+    for x in across {
+        let x = origin.x + x;
+        painter.line_segment([egui::pos2(x, area.top()), egui::pos2(x, area.bottom())], stroke);
+    }
+    for y in down {
+        let y = origin.y + y;
+        painter.line_segment([egui::pos2(area.left(), y), egui::pos2(area.right(), y)], stroke);
     }
 }
 
@@ -642,6 +816,7 @@ pub(crate) const DECO_DEFAULT_STROKE:  [u8; 4] = [255, 255, 255, 220];
 pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
     match kind {
         "text" => LayoutDecoration::Text {
+            tab: 0,
             pos: [16.0, 16.0],
             size: [160.0, 28.0],
             text: "Text".to_string(),
@@ -653,7 +828,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             valign: crate::canvas::node::TextVAlign::Top,
             anchor: Default::default(),
         },
-        "rect" => LayoutDecoration::Rect {
+        "rect" => LayoutDecoration::Rect { tab: 0, fill_gradient: None,
             pos: [16.0, 16.0],
             size: [120.0, 80.0],
             fill: [60, 60, 60, 180],
@@ -662,7 +837,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             corner_radius: 4.0,
             anchor: Default::default(),
         },
-        "ellipse" => LayoutDecoration::Ellipse {
+        "ellipse" => LayoutDecoration::Ellipse { tab: 0, fill_gradient: None,
             pos: [16.0, 16.0],
             size: [100.0, 100.0],
             fill: [60, 60, 60, 180],
@@ -671,13 +846,14 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             anchor: Default::default(),
         },
         "line" => LayoutDecoration::Line {
+            tab: 0,
             a: [16.0, 16.0],
             b: [136.0, 16.0],
             stroke: DECO_DEFAULT_STROKE,
             stroke_px: 1.5,
             anchor: Default::default(),
         },
-        "svg" => LayoutDecoration::Svg {
+        "svg" => LayoutDecoration::Svg { tab: 0, tint_gradient: None,
             pos: [16.0, 16.0],
             size: [120.0, 120.0],
             svg_data: String::new(),
@@ -689,7 +865,7 @@ pub(crate) fn make_default_decoration(kind: &str) -> LayoutDecoration {
             icon_key: String::new(),
             anchor: Default::default(),
         },
-        _ => LayoutDecoration::Rect {
+        _ => LayoutDecoration::Rect { tab: 0, fill_gradient: None,
             pos: [16.0, 16.0],
             size: [120.0, 80.0],
             fill: DECO_DEFAULT_FILL,
@@ -705,15 +881,6 @@ pub(crate) fn rgba_to_color32(c: [u8; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
-pub(crate) fn color_button(ui: &mut egui::Ui, label: &str, rgba: &mut [u8; 4]) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small().weak());
-        // Overlay decorations blend over a game, so alpha is always meaningful.
-        changed = fxi_color_swatch(ui, rgba, label, true);
-    });
-    changed
-}
 
 /// Flattened style snapshot of a layout item, used for bulk-style propagation
 /// across a multi-selection. Each field is `Option` so we can both (a) capture
@@ -728,6 +895,8 @@ pub(crate) struct ItemStyle {
     stroke_px: Option<f32>,
     corner_radius: Option<f32>,
     font_size: Option<f32>,
+    /// A shape's fill gradient (`Some(None)` for a solid fill), carried with its fill.
+    fill_gradient: Option<Option<crate::canvas::node::Gradient>>,
     // Graph-pin override (Response Curve / Oscilloscope / Vectorscope). Carried
     // whole so copy/paste-style and multi-select propagation transfer the
     // background, outline, and per-channel line/dot colors together. Applied
@@ -742,7 +911,7 @@ impl ItemStyle {
     pub(crate) fn any(&self) -> bool {
         self.fill.is_some() || self.stroke.is_some() || self.stroke_px.is_some()
             || self.corner_radius.is_some() || self.font_size.is_some()
-            || self.graph.is_some()
+            || self.fill_gradient.is_some() || self.graph.is_some()
     }
     /// Build the set of fields that differ between `self` (before) and `after`.
     pub(crate) fn diff(&self, after: &ItemStyle) -> ItemStyle {
@@ -755,6 +924,10 @@ impl ItemStyle {
             stroke_px: pick(self.stroke_px, after.stroke_px),
             corner_radius: pick(self.corner_radius, after.corner_radius),
             font_size: pick(self.font_size, after.font_size),
+            fill_gradient: match (&self.fill_gradient, &after.fill_gradient) {
+                (b, Some(a)) if b.as_ref() != Some(a) => Some(a.clone()),
+                _ => None,
+            },
             // Clone (not Copy) so picked by reference comparison.
             graph: match (&self.graph, &after.graph) {
                 (b, Some(a)) if b.as_ref() != Some(a) => Some(a.clone()),
@@ -785,14 +958,16 @@ impl ItemStyle {
                 if let Some(v) = self.stroke_px { *outline_px = v; }
                 if let Some(v) = self.font_size { *font_size = v; }
             }
-            LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. } => {
+            LayoutDecoration::Rect { fill, fill_gradient, stroke, stroke_px, corner_radius, .. } => {
                 if let Some(v) = self.fill { *fill = v; }
+                if let Some(v) = &self.fill_gradient { *fill_gradient = v.clone(); }
                 if let Some(v) = self.stroke { *stroke = v; }
                 if let Some(v) = self.stroke_px { *stroke_px = v; }
                 if let Some(v) = self.corner_radius { *corner_radius = v; }
             }
-            LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. } => {
+            LayoutDecoration::Ellipse { fill, fill_gradient, stroke, stroke_px, .. } => {
                 if let Some(v) = self.fill { *fill = v; }
+                if let Some(v) = &self.fill_gradient { *fill_gradient = v.clone(); }
                 if let Some(v) = self.stroke { *stroke = v; }
                 if let Some(v) = self.stroke_px { *stroke_px = v; }
             }
@@ -818,14 +993,16 @@ pub(crate) fn item_style_of(it: &LayoutItem) -> ItemStyle {
             corner_radius: None, font_size: Some(*font_size),
             ..ItemStyle::default()
         },
-        LayoutItem::Deco(LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. }) => ItemStyle {
+        LayoutItem::Deco(LayoutDecoration::Rect { fill, fill_gradient, stroke, stroke_px, corner_radius, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: Some(*corner_radius), font_size: None,
+            fill_gradient: Some(fill_gradient.clone()),
             ..ItemStyle::default()
         },
-        LayoutItem::Deco(LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. }) => ItemStyle {
+        LayoutItem::Deco(LayoutDecoration::Ellipse { fill, fill_gradient, stroke, stroke_px, .. }) => ItemStyle {
             fill: Some(*fill), stroke: Some(*stroke), stroke_px: Some(*stroke_px),
             corner_radius: None, font_size: None,
+            fill_gradient: Some(fill_gradient.clone()),
             ..ItemStyle::default()
         },
         LayoutItem::Deco(LayoutDecoration::Line { stroke, stroke_px, .. }) => ItemStyle {
@@ -849,645 +1026,29 @@ pub(crate) fn item_style_of(it: &LayoutItem) -> ItemStyle {
     }
 }
 
-/// Render the contextual inspector strip for the selected decoration inside
-/// a `LayoutItem::Deco`. Bails out cleanly if `idx` is stale or not a deco.
-/// Z-order is controlled via the right-click menu, not this strip.
-pub(crate) fn decoration_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    if idx >= items.len() { return; }
-    let deco = match &mut items[idx] {
-        LayoutItem::Deco(d) => d,
-        _ => return,
-    };
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new(deco.type_label()).small().strong());
-        ui.separator();
-        match deco {
-            LayoutDecoration::Text { text, font_size, fill, outline, outline_px, align, valign, .. } => {
-                use crate::canvas::node::TextVAlign;
-                ui.add(egui::TextEdit::singleline(text).desired_width(140.0).hint_text("text"));
-                ui.add(egui::DragValue::new(font_size).speed(0.25).range(6.0f32..=96.0).suffix("px"))
-                    .on_hover_text("Font size");
-                color_button(ui, "fill", fill);
-                color_button(ui, "outline", outline);
-                ui.add(egui::DragValue::new(outline_px).speed(0.1).range(0.0f32..=8.0).suffix("px"))
-                    .on_hover_text("Outline thickness");
-                egui::ComboBox::from_id_salt(("deco_align", idx))
-                    .width(70.0)
-                    .selected_text(match *align { TextAlign::Left => "Left", TextAlign::Center => "Center", TextAlign::Right => "Right" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(align, TextAlign::Left, "Left");
-                        ui.selectable_value(align, TextAlign::Center, "Center");
-                        ui.selectable_value(align, TextAlign::Right, "Right");
-                    });
-                egui::ComboBox::from_id_salt(("deco_valign", idx))
-                    .width(70.0)
-                    .selected_text(match *valign { TextVAlign::Top => "Top", TextVAlign::Center => "Middle", TextVAlign::Bottom => "Bottom" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(valign, TextVAlign::Top, "Top");
-                        ui.selectable_value(valign, TextVAlign::Center, "Middle");
-                        ui.selectable_value(valign, TextVAlign::Bottom, "Bottom");
-                    })
-                    .response.on_hover_text("Vertical alignment");
-            }
-            LayoutDecoration::Rect { fill, stroke, stroke_px, corner_radius, .. } => {
-                color_button(ui, "fill", fill);
-                color_button(ui, "stroke", stroke);
-                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
-                    .on_hover_text("Stroke thickness");
-                ui.add(egui::DragValue::new(corner_radius).speed(0.25).range(0.0f32..=64.0).suffix("r"))
-                    .on_hover_text("Corner radius");
-            }
-            LayoutDecoration::Ellipse { fill, stroke, stroke_px, .. } => {
-                color_button(ui, "fill", fill);
-                color_button(ui, "stroke", stroke);
-                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
-                    .on_hover_text("Stroke thickness");
-            }
-            LayoutDecoration::Line { stroke, stroke_px, .. } => {
-                color_button(ui, "stroke", stroke);
-                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.1f32..=12.0).suffix("px"))
-                    .on_hover_text("Line thickness");
-            }
-            LayoutDecoration::Svg { tint, tint_mode, stroke, stroke_px, svg_data, rev, icon_key, .. } => {
-                // Unified icon picker (shared set + "Gamepad inputs" glyphs + the
-                // custom-SVG loader), replacing the old Load-only button. It returns
-                // (icon_key, custom_svg) — mutually exclusive; a gp icon restyles to
-                // the current pad because paint resolves the key dynamically.
-                if let Some((k, s)) = crate::canvas::menu_body::icon_picker_button(
-                    ui, egui::Id::new(("deco_svg_icon", idx)), icon_key, svg_data)
-                {
-                    *icon_key = k;
-                    *svg_data = s;
-                    *rev = rev.wrapping_add(1);
-                }
-                color_button(ui, "tint", tint);
-                egui::ComboBox::from_id_salt(("deco_svg_mode", idx))
-                    .width(80.0)
-                    .selected_text(tint_mode.as_str())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(tint_mode, "override".to_string(), "override");
-                        ui.selectable_value(tint_mode, "additive".to_string(), "additive");
-                    });
-                color_button(ui, "stroke", stroke);
-                ui.add(egui::DragValue::new(stroke_px).speed(0.1).range(0.0f32..=12.0).suffix("px"))
-                    .on_hover_text("Frame stroke thickness");
-            }
-        }
-    });
-}
 
-/// Inspector strip for the per-pin Text color override (when the selected
-/// item is a Text module pin). Operates on `LayoutItem::Module`.
-pub(crate) fn text_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    let mut ov = exp.text_override.clone().unwrap_or_default();
-    let mut clear = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Text pin override").small().strong());
-        ui.separator();
-        let mut fill_rgba = ov.fill.unwrap_or([220, 220, 220, 255]);
-        if color_button(ui, "fill", &mut fill_rgba) { ov.fill = Some(fill_rgba); }
-        let mut outline_rgba = ov.outline.unwrap_or([0, 0, 0, 0]);
-        if color_button(ui, "outline", &mut outline_rgba) { ov.outline = Some(outline_rgba); }
-        let mut opx = ov.outline_px.unwrap_or(0.0);
-        if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
-            .on_hover_text("Outline thickness")
-            .changed()
-        {
-            ov.outline_px = Some(opx);
-        }
-        if ui.small_button("Reset").on_hover_text("Use Text module's own colors").clicked() {
-            clear = true;
-        }
-    });
-    if clear {
-        exp.text_override = None;
-    } else if ov.fill.is_some() || ov.outline.is_some() || ov.outline_px.is_some() {
-        exp.text_override = Some(ov);
-    }
-}
 
-/// Inspector strip for a pinned Input Viewer board's style (when the selected
-/// item is a `module.input_viewer` pin). Delegates to the board module's own
-/// control cluster; stores the result on the pin's `iv_style_override`.
-/// Inspector-strip controls for a pinned Touch Zones / Virtual Menu field pad:
-/// main / highlight colour overrides (each falls back to the module's own
-/// colour when unset) plus a visibility mode for live views (always / show on
-/// touch / touched zones only). Stored per pin on `menu_style_override`.
-pub(crate) fn menu_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    use crate::canvas::node::{MenuStyleOverride, ZoneVisibility};
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    let cleared = MenuStyleOverride { main: None, hi: None, visibility: ZoneVisibility::Always };
-    let mut ov = exp.menu_style_override.unwrap_or(cleared);
-    let before = ov;
-    let mut reset = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Zone pad style").small().strong());
-        ui.separator();
-        ui.label(egui::RichText::new("main").small().weak());
-        let mut mc = ov.main.unwrap_or(crate::canvas::menu_body::MENU_MAIN_DEFAULT);
-        if fxi_color_swatch(ui, &mut mc,
-            "Main colour for THIS pinned pad (alpha = pad opacity).\nUnset = the module's own colour.", true)
-        {
-            ov.main = Some(mc);
-        }
-        ui.label(egui::RichText::new("highlight").small().weak());
-        let mut hc = ov.hi.unwrap_or(crate::canvas::menu_body::MENU_HIGHLIGHT_DEFAULT);
-        if fxi_color_swatch(ui, &mut hc,
-            "Highlight colour for THIS pinned pad (active zone / affordances).\nUnset = the module's own colour.", true)
-        {
-            ov.hi = Some(hc);
-        }
-        ui.separator();
-        egui::ComboBox::from_id_salt(("menu_pin_vis", exp.inner_node_id, idx))
-            .selected_text(match ov.visibility {
-                ZoneVisibility::Always => "Always show",
-                ZoneVisibility::OnTouch => "Show on touch",
-                ZoneVisibility::TouchedZones => "Touched zones only",
-            })
-            .width(150.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut ov.visibility, ZoneVisibility::Always, "Always show");
-                ui.selectable_value(&mut ov.visibility, ZoneVisibility::OnTouch, "Show on touch")
-                    .on_hover_text("Hide the pad unless a touch point / zone is active.");
-                ui.selectable_value(&mut ov.visibility, ZoneVisibility::TouchedZones, "Touched zones only")
-                    .on_hover_text("Paint only the zone(s) currently touched — no pad chrome.\nRadial menus behave like Show on touch.");
-            });
-        if ui.small_button("Reset")
-            .on_hover_text("Module colours, always shown")
-            .clicked()
-        {
-            reset = true;
-        }
-    });
-    if reset {
-        exp.menu_style_override = None;
-    } else if ov != before || exp.menu_style_override.is_some() {
-        exp.menu_style_override = if ov == cleared { None } else { Some(ov) };
-    }
-}
 
-pub(crate) fn input_viewer_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    exp.iv_style_override = crate::canvas::input_viewer::iv_style_inspector(
-        ui, exp.inner_node_id, exp.iv_style_override.as_ref());
-}
 
-/// Inspector strip for a pinned 3D controller viewer: frame style (bg /
-/// highlight accent / outline) plus per-pin display settings — view angle,
-/// model opacity, and highlight fade — each overriding the module's own params
-/// for THIS pinned instance only. Reset clears the whole override.
-/// The pinned 3DOF preview's own style: its frame's fill (see-through over a game at a low
-/// alpha) and outline, and how it draws the pad - as the module does, or its icon, the icon's
-/// outline, or its 3D model. Kept on the pin (`iv_style_override`), so the module's own
-/// preview and other pins keep theirs.
-pub(crate) fn gyro_preview_pin_inspector_strip_item(ui: &mut egui::Ui, items: &mut [LayoutItem], idx: usize) {
-    use crate::canvas::node::IvStyleOverride;
-    let Some(LayoutItem::Module(exp)) = items.get_mut(idx) else { return };
-    let dark = ui.visuals().extreme_bg_color.to_srgba_unmultiplied();
-    let mut ov = exp.iv_style_override.clone().unwrap_or(IvStyleOverride {
-        bg: dark,
-        accent: C3D_DEFAULT_ACCENT,
-        tint: [255, 255, 255, 255],
-        outline: [70, 70, 75, 255],
-        outline_px: 0.0,
-        c3d_pitch: None,
-        c3d_alpha: None,
-        c3d_fade: None,
-        c3d_composite: None,
-        c3d_xray: None,
-        c3d_materials: None,
-        c3d_model: None,
-        gyro_look: None,
-    });
-    let before = ov.clone();
-    let mut reset = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("3D preview style").small().strong());
-        ui.separator();
-        ui.label(egui::RichText::new("bg").small().weak());
-        fxi_color_swatch(ui, &mut ov.bg, "Frame fill - lower the alpha for a see-through frame over a game.", true);
-        ui.label(egui::RichText::new("outline").small().weak());
-        fxi_color_swatch(ui, &mut ov.outline, "Frame outline colour.", true);
-        ui.add(egui::DragValue::new(&mut ov.outline_px).range(0.0..=6.0).speed(0.05))
-            .on_hover_text("Frame outline width (0 = none).");
-        ui.separator();
-        ui.label(egui::RichText::new("pad").small().weak());
-        for (value, label, tip) in [
-            (None, "module's", "Draw the pad as the module's own preview does."),
-            (Some("icon"), "icon", "The pad's icon."),
-            (Some("outline"), "outline", "The outline of the pad's icon."),
-            (Some("model"), "3D model", "The pad's 3D model, half see-through - the model of the device the module reads."),
-        ] {
-            let on = ov.gyro_look.as_deref() == value;
-            if ui.selectable_label(on, egui::RichText::new(label).small()).on_hover_text(tip).clicked() && !on {
-                ov.gyro_look = value.map(str::to_string);
-            }
-        }
-        ui.label(egui::RichText::new("model opacity").small().weak());
-        let mut a = ov.c3d_composite.unwrap_or(0.5);
-        if ui.add(egui::Slider::new(&mut a, 0.05..=1.0).show_value(false))
-            .on_hover_text("How opaque the pad's 3D model is in this pin (until set, the module's own).")
-            .changed()
-        {
-            ov.c3d_composite = Some(a);
-        }
-        if ui.small_button("Reset").on_hover_text("The pane's own fill, no outline, the pad as the module draws it").clicked() {
-            reset = true;
-        }
-    });
-    if reset {
-        exp.iv_style_override = None;
-    } else if ov != before || exp.iv_style_override.is_some() {
-        exp.iv_style_override = Some(ov);
-    }
-}
 
-pub(crate) fn controller3d_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    use crate::canvas::node::IvStyleOverride;
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    let mut ov = exp.iv_style_override.clone().unwrap_or(IvStyleOverride {
-        bg: [0, 0, 0, 0],
-        accent: C3D_DEFAULT_ACCENT,
-        tint: [255, 255, 255, 255],
-        outline: [70, 70, 75, 255],
-        outline_px: 0.0,
-        c3d_pitch: None,
-        c3d_alpha: None,
-        c3d_fade: None,
-        c3d_composite: None,
-        c3d_xray: None,
-        c3d_materials: None,
-        c3d_model: None,
-        gyro_look: None,
-    });
-    let before = ov.clone();
-    let mut reset = false;
 
-    ui.vertical(|ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("3D viewer style").small().strong());
-            ui.separator();
-            ui.label(egui::RichText::new("bg").small().weak());
-            fxi_color_swatch(ui, &mut ov.bg,
-                "Frame fill — lower the alpha for a see-through frame over a game.", true);
-            ui.label(egui::RichText::new("highlight").small().weak());
-            fxi_color_swatch(ui, &mut ov.accent,
-                "Active-input highlight: pressed buttons, trigger pull, stick tilt, touch dots, x-ray ghosts.", true);
-            ui.label(egui::RichText::new("outline").small().weak());
-            fxi_color_swatch(ui, &mut ov.outline, "Frame outline colour.", true);
-            ui.add(egui::DragValue::new(&mut ov.outline_px).range(0.0..=6.0).speed(0.05))
-                .on_hover_text("Frame outline width (0 = none).");
-            if ui.small_button("Reset").on_hover_text("Use default style + the module's own display settings").clicked() {
-                reset = true;
-            }
-        });
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            // Display overrides: initialized from the override, else the module
-            // defaults; touching a slider pins it for this instance.
-            let mut pitch = ov.c3d_pitch.unwrap_or(C3D_DEFAULT_PITCH_DEG);
-            ui.label(egui::RichText::new("view").small().weak());
-            if ui.add(egui::Slider::new(&mut pitch, 0.0..=85.0).suffix("°"))
-                .on_hover_text("Camera elevation for this pinned instance.")
-                .changed() { ov.c3d_pitch = Some(pitch); }
-            let mut alpha = ov.c3d_alpha.unwrap_or(1.0);
-            ui.label(egui::RichText::new("opacity").small().weak());
-            if ui.add(egui::Slider::new(&mut alpha, 0.1..=1.0))
-                .on_hover_text("Model see-through for this pinned instance.")
-                .changed() { ov.c3d_alpha = Some(alpha); }
-            let mut fade = ov.c3d_fade.unwrap_or(0.25);
-            ui.label(egui::RichText::new("fade").small().weak());
-            if ui.add(egui::Slider::new(&mut fade, 0.05..=2.0).suffix(" s"))
-                .on_hover_text("Highlight fade-out time for this pinned instance.")
-                .changed() { ov.c3d_fade = Some(fade); }
-            let mut comp = ov.c3d_composite.unwrap_or(1.0);
-            ui.label(egui::RichText::new("alpha").small().weak());
-            if ui.add(egui::Slider::new(&mut comp, 0.05..=1.0))
-                .on_hover_text("Widget composite alpha: fades the whole rendered controller as a 2D image (overlay), without the see-through look.")
-                .changed() { ov.c3d_composite = Some(comp); }
-            ui.label(egui::RichText::new("x-ray").small().weak());
-            if let Some(v) = crate::canvas::viewer::c3d_xray_slider(ui, ov.c3d_xray) {
-                ov.c3d_xray = Some(v);
-            }
-        });
 
-        // Material colours + model — this PIN's own override (the module and
-        // other pinned instances keep their own; unset groups show the
-        // module's shared colours through). Effective values are published by
-        // the pinned renderer each frame under `c3d_pub`; edits land straight
-        // in `ov`, which commits to `exp.iv_style_override` below.
-        let uid = exp.inner_node_id;
-        // Async .fxcol load result for THIS pin (worker-thread file dialog).
-        if let Some(map) = ui.ctx().data_mut(|d| {
-            d.remove_temp::<serde_json::Map<String, serde_json::Value>>(
-                egui::Id::new(("c3d_pin_matload", uid)),
-            )
-        }) {
-            ov.c3d_materials = Some(map);
-        }
-        let pub_data = ui.ctx().data(|d| {
-            d.get_temp::<(String, crate::model::Scheme)>(egui::Id::new(("c3d_pub", uid)))
-        });
-        if let Some((model, mut cur)) = pub_data {
-            // `cur` arrives as the NODE-base scheme — apply THIS pin's own
-            // overrides so the swatches show what this instance renders.
-            if let Some(m) = ov.c3d_materials.as_ref() {
-                c3d_apply_materials(&mut cur, m);
-            }
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                // Model chooser: follow the module, force auto-detect, or pin
-                // a specific model for this instance.
-                ui.label(egui::RichText::new("Model").small().strong());
-                let sel_label = match ov.c3d_model.as_deref() {
-                    None => format!("{model} (module)"),
-                    Some("") => "Auto (device)".to_string(),
-                    Some(m) => m.to_string(),
-                };
-                egui::ComboBox::from_id_salt(("c3d_pin_model", uid))
-                    .selected_text(sel_label)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(ov.c3d_model.is_none(), "Follow module").clicked() {
-                            ov.c3d_model = None;
-                        }
-                        if ui.selectable_label(ov.c3d_model.as_deref() == Some(""), "Auto (device)").clicked() {
-                            ov.c3d_model = Some(String::new());
-                        }
-                        for m in crate::model::available_models() {
-                            if ui.selectable_label(ov.c3d_model.as_deref() == Some(m.as_str()), &m).clicked() {
-                                ov.c3d_model = Some(m.clone());
-                            }
-                        }
-                    });
-                ui.separator();
-                ui.label(egui::RichText::new("Colours").small().strong())
-                    .on_hover_text("This pin's own colour overrides — groups you don't touch keep showing the module's colours.");
-                for (row_label, groups) in crate::model::material::ROWS {
-                    ui.label(egui::RichText::new(*row_label).small().weak());
-                    for &g in *groups {
-                        let mut col = cur[g as usize];
-                        if c3d_color_swatch(ui, &mut col, g.label()) {
-                            let mats = ov.c3d_materials.get_or_insert_with(Default::default);
-                            mats.insert(
-                                g.key().to_string(),
-                                serde_json::json!([col[0], col[1], col[2], col[3]]),
-                            );
-                        }
-                    }
-                }
-                if ui
-                    .small_button("Reset colours")
-                    .on_hover_text("Drop this pin's colour overrides and follow the module's colours again")
-                    .clicked()
-                {
-                    ov.c3d_materials = None;
-                }
-                if ui
-                    .small_button("Save…")
-                    .on_hover_text("Save this pin's effective colours to a .fxcol file")
-                    .clicked()
-                {
-                    controller3d_scheme_save(&cur);
-                }
-                if ui
-                    .small_button("Load…")
-                    .on_hover_text("Load colours from a .fxcol file into this pin's override")
-                    .clicked()
-                {
-                    controller3d_scheme_load_async(ui.ctx(), "c3d_pin_matload", uid);
-                }
-            });
-        }
-    });
-
-    if reset {
-        exp.iv_style_override = None;
-    } else if ov != before || exp.iv_style_override.is_some() {
-        exp.iv_style_override = Some(ov);
-    }
-}
-
-/// Inspector strip for the per-pin Switch color override (when the selected
-/// item is a Switch module pin). Exposes fill, outline, and caption colors
-/// for both ON and OFF states, plus a shared outline thickness.
-pub(crate) fn switch_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-) {
-    use crate::canvas::node::PinSwitchOverride;
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    let mut ov = exp.switch_override.clone().unwrap_or_default();
-    let mut clear = false;
-
-    ui.vertical(|ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Switch ON").small().strong());
-            let mut fill = ov.fill_on.unwrap_or([80, 140, 200, 255]);
-            if color_button(ui, "fill", &mut fill) { ov.fill_on = Some(fill); }
-            let mut outl = ov.outline_on.unwrap_or([180, 200, 220, 255]);
-            if color_button(ui, "outline", &mut outl) { ov.outline_on = Some(outl); }
-            let mut txt = ov.text_on.unwrap_or([255, 255, 255, 255]);
-            if color_button(ui, "text", &mut txt) { ov.text_on = Some(txt); }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Switch OFF").small().strong());
-            let mut fill = ov.fill_off.unwrap_or([60, 60, 65, 255]);
-            if color_button(ui, "fill", &mut fill) { ov.fill_off = Some(fill); }
-            let mut outl = ov.outline_off.unwrap_or([100, 100, 110, 255]);
-            if color_button(ui, "outline", &mut outl) { ov.outline_off = Some(outl); }
-            let mut txt = ov.text_off.unwrap_or([200, 200, 200, 255]);
-            if color_button(ui, "text", &mut txt) { ov.text_off = Some(txt); }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let mut opx = ov.outline_px.unwrap_or(1.0);
-            if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
-                .on_hover_text("Outline thickness (both states)")
-                .changed()
-            {
-                ov.outline_px = Some(opx);
-            }
-            if ui.small_button("Reset").on_hover_text("Use theme defaults").clicked() {
-                clear = true;
-            }
-        });
-    });
-    if clear {
-        exp.switch_override = None;
-    } else {
-        let any = ov.fill_on.is_some() || ov.fill_off.is_some()
-            || ov.outline_on.is_some() || ov.outline_off.is_some()
-            || ov.text_on.is_some() || ov.text_off.is_some()
-            || ov.outline_px.is_some();
-        exp.switch_override = if any { Some(PinSwitchOverride { ..ov }) } else { None };
-    }
-}
-
-/// Inspector strip for the per-pin graph color override (Response Curve,
-/// Oscilloscope, Vectorscope). Exposes background + outline + outline width,
-/// then one color swatch per input channel for the line/dot color. All controls
-/// share one wrapped row, so when there isn't enough width (e.g. Easy mode) the
-/// channel swatches wrap onto a second row automatically. `n_channels` is the
-/// inner module's resolved channel count.
-pub(crate) fn graph_pin_inspector_strip_item(
-    ui: &mut egui::Ui,
-    items: &mut Vec<LayoutItem>,
-    idx: usize,
-    n_channels: usize,
-    graph_switches: usize,
-) {
-    use crate::canvas::node::PinGraphOverride;
-    if idx >= items.len() { return; }
-    let exp = match &mut items[idx] {
-        LayoutItem::Module(m) => m,
-        _ => return,
-    };
-    let mut ov = exp.graph_override.clone().unwrap_or_default();
-    let mut clear = false;
-
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Graph pin override").small().strong());
-        ui.separator();
-
-        // Background: default is the shared 60%-opacity base.
-        let mut bg = ov.background.unwrap_or([16, 16, 16, 153]);
-        if color_button(ui, "bg", &mut bg) { ov.background = Some(bg); }
-
-        // Outline: off by default (transparent / 0px).
-        let mut outl = ov.outline.unwrap_or([180, 180, 180, 255]);
-        if color_button(ui, "outline", &mut outl) { ov.outline = Some(outl); }
-        let mut opx = ov.outline_px.unwrap_or(0.0);
-        if ui.add(egui::DragValue::new(&mut opx).speed(0.1).range(0.0f32..=8.0).suffix("px"))
-            .on_hover_text("Outline thickness")
-            .changed()
-        {
-            ov.outline_px = Some(opx);
-        }
-
-        // Gridline / axis color. Default matches the brighter label hue
-        // (unmultiplied 180,180,180,160 == GRAPH_GRID_DEFAULT premultiplied).
-        let mut grid = ov.gridline.unwrap_or([180, 180, 180, 160]);
-        if color_button(ui, "grid", &mut grid) { ov.gridline = Some(grid); }
-        // An Envelope or Response Curve graph also carries the switches its module keeps in its
-        // header, here as per-copy choices: `module` follows the module on the canvas, `on` and
-        // `off` force it for this copy alone. A pinned copy has no header to set them on, and a
-        // plain curve on an overlay is often what is wanted even while the module shows its
-        // grid. An Envelope has three (snap is one of its header's); a curve the first two.
-        if graph_switches > 0 {
-            for (name, hover, field) in [
-                ("grid", "The lines a dragged point sits on", &mut ov.show_grid),
-                ("labels", "The numbers along those lines", &mut ov.show_labels),
-                ("snap", "Dragged points settle on the nearest intersection", &mut ov.snap),
-            ]
-            .into_iter()
-            .take(graph_switches)
-            {
-                ui.label(egui::RichText::new(name).small());
-                let mut v = *field;
-                if super::kit::strip(
-                    ui,
-                    104.0,
-                    &mut v,
-                    &[
-                        (None, "module", "Follow what the module on the canvas shows"),
-                        (Some(true), "on", hover),
-                        (Some(false), "off", "Not drawn in this copy"),
-                    ],
-                ) {
-                    *field = v;
-                }
-            }
-        }
-
-        ui.separator();
-
-        // One line/dot color swatch per channel. Each defaults to the built-in
-        // palette entry for that channel.
-        ov.channel_colors.resize(n_channels, None);
-        for ch in 0..n_channels {
-            let default = MULTI_COLORS[ch % MULTI_COLORS.len()];
-            let mut col = ov.channel_colors[ch]
-                .unwrap_or([default.r(), default.g(), default.b(), 255]);
-            if color_button(ui, &format!("Ch{}", ch + 1), &mut col) {
-                ov.channel_colors[ch] = Some(col);
-            }
-        }
-
-        if ui.small_button("Reset").on_hover_text("Use the module's default colors").clicked() {
-            clear = true;
-        }
-    });
-
-    if clear {
-        exp.graph_override = None;
-    } else {
-        let any = ov.background.is_some()
-            || ov.outline.is_some()
-            || ov.outline_px.is_some()
-            || ov.gridline.is_some()
-            || ov.show_grid.is_some()
-            || ov.show_labels.is_some()
-            || ov.snap.is_some()
-            || ov.channel_colors.iter().any(|c| c.is_some());
-        // Drop trailing None channel slots so we don't serialize empty tails.
-        while matches!(ov.channel_colors.last(), Some(None)) { ov.channel_colors.pop(); }
-        exp.graph_override = if any { Some(PinGraphOverride { ..ov }) } else { None };
-    }
-}
 
 /// Paint a single decoration into the given body painter. Coordinates are in
 /// body-local space; caller already translated `origin` and provides absolute
 /// `painter` and `offset` to add to local coords.
 pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco: &LayoutDecoration) {
     match deco {
-        LayoutDecoration::Rect { pos, size, fill, stroke, stroke_px, corner_radius, .. } => {
+        LayoutDecoration::Rect { pos, size, fill, fill_gradient, stroke, stroke_px, corner_radius, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(1.0), size[1].max(1.0)),
             );
             let fcol = rgba_to_color32(*fill);
-            if fcol.a() > 0 {
+            if let Some(g) = fill_gradient {
+                let shape = egui::epaint::RectShape::filled(r, *corner_radius, egui::Color32::WHITE);
+                paint_gradient_fill(painter, egui::Shape::Rect(shape), r, g);
+            } else if fcol.a() > 0 {
                 painter.rect_filled(r, *corner_radius, fcol);
             }
             let scol = rgba_to_color32(*stroke);
@@ -1497,7 +1058,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                     egui::StrokeKind::Inside);
             }
         }
-        LayoutDecoration::Ellipse { pos, size, fill, stroke, stroke_px, .. } => {
+        LayoutDecoration::Ellipse { pos, size, fill, fill_gradient, stroke, stroke_px, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(1.0), size[1].max(1.0)),
@@ -1511,7 +1072,10 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 pts.push(egui::pos2(center.x + radius.x * t.cos(), center.y + radius.y * t.sin()));
             }
             let fcol = rgba_to_color32(*fill);
-            if fcol.a() > 0 {
+            if let Some(g) = fill_gradient {
+                let shape = egui::Shape::convex_polygon(pts.clone(), egui::Color32::WHITE, egui::Stroke::NONE);
+                paint_gradient_fill(painter, shape, r, g);
+            } else if fcol.a() > 0 {
                 painter.add(egui::Shape::convex_polygon(pts.clone(), fcol, egui::Stroke::NONE));
             }
             let scol = rgba_to_color32(*stroke);
@@ -1568,7 +1132,7 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
                 fcol,
             );
         }
-        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, stroke, stroke_px, icon_key, .. } => {
+        LayoutDecoration::Svg { pos, size, svg_data, rev, tint, tint_mode, tint_gradient, stroke, stroke_px, icon_key, .. } => {
             let r = egui::Rect::from_min_size(
                 origin + egui::vec2(pos[0], pos[1]),
                 egui::vec2(size[0].max(8.0), size[1].max(8.0)),
@@ -1608,12 +1172,25 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
             let cache_key = egui::Id::new((
                 "deco_svg_tex", salt, *rev, pw, ph, tint_mode.as_str(),
                 tint[0], tint[1], tint[2], tint[3],
+                tint_gradient.as_ref().map(|g| g.cache_key()),
             ));
             let cached = crate::widgets::tex_cache::get(&ctx, cache_key);
             let tex = match cached {
                 Some(t) => Some(t),
                 None => {
-                    rasterize_svg_recolored(svg_src, pw, ph, tint_mode, rgba_to_color32(*tint))
+                    let img = match tint_gradient {
+                        // Each pixel tinted the gradient's colour there, as much as its alpha.
+                        Some(g) => {
+                            let box_size = egui::vec2(pw as f32, ph as f32);
+                            rasterize_svg_recolored_by(svg_src, pw, ph, tint_mode, |x, y| {
+                                let c = g.sample(egui::vec2(x as f32 + 0.5, y as f32 + 0.5), box_size)
+                                    .to_srgba_unmultiplied();
+                                [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32 / 255.0]
+                            })
+                        }
+                        None => rasterize_svg_recolored(svg_src, pw, ph, tint_mode, rgba_to_color32(*tint)),
+                    };
+                    img
                         .map(|img| {
                             let h = ctx.load_texture(
                                 format!("deco-svg-{}-{}", *rev, pw),
@@ -1638,3 +1215,48 @@ pub(crate) fn paint_decoration(painter: &egui::Painter, origin: egui::Pos2, deco
 
 // (Old `show_subpatch_decorations` has been folded into `show_subpatch_body`.
 //  Decorations + module pins share one Z-order, one selection, and one
+
+#[cfg(test)]
+mod object_snap_tests {
+    use super::*;
+
+    fn r(x: f32, y: f32, w: f32, h: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+    }
+
+    /// Shift: a dragged object's edge catches on another's nearby edge - the same side or
+    /// the facing one - across and down on their own, with the line it caught on.
+    #[test]
+    fn edges_catch_on_the_other_objects_edges() {
+        let others = [r(100.0, 100.0, 50.0, 50.0)];
+        // Left edge 3 points right of the other's left: pulled onto it, nothing down.
+        let (off, x, y) = snap_to_objects(r(103.0, 300.0, 20.0, 20.0), &others, ObjectSnap::Edges, 6.0);
+        assert_eq!((off, x, y), (egui::vec2(-3.0, 0.0), Some(100.0), None));
+        // Its right edge 4 short of the other's left: abutting.
+        let (off, x, _) = snap_to_objects(r(76.0, 300.0, 20.0, 20.0), &others, ObjectSnap::Edges, 6.0);
+        assert_eq!((off.x, x), (4.0, Some(100.0)));
+        // Out of reach: left alone.
+        let (off, x, y) = snap_to_objects(r(120.0, 300.0, 5.0, 5.0), &others, ObjectSnap::Edges, 6.0);
+        assert_eq!((off, x, y), (egui::Vec2::ZERO, None, None));
+    }
+
+    /// Ctrl: the centre catches on another's centre, and edges don't.
+    #[test]
+    fn centres_catch_on_the_other_objects_centres() {
+        let others = [r(100.0, 100.0, 50.0, 50.0)];
+        let (off, x, y) = snap_to_objects(r(117.0, 113.0, 20.0, 20.0), &others, ObjectSnap::Centres, 6.0);
+        assert_eq!((off, x, y), (egui::vec2(-2.0, 2.0), Some(125.0), Some(125.0)));
+        let (off, _, _) = snap_to_objects(r(103.0, 400.0, 20.0, 20.0), &others, ObjectSnap::Centres, 6.0);
+        // Resizing with Ctrl: the right edge catches on the other's left, the bottom on its
+        // centre; about the centre, the left moves as far the other way.
+        let other = [r(200.0, 100.0, 100.0, 100.0)];
+        let (pos, size, x, y) = snap_resize_to_objects([100.0, 100.0], [97.0, 52.0], &other, 6.0, false, None);
+        assert_eq!((pos, size, x, y), ([100.0, 100.0], [100.0, 50.0], Some(200.0), Some(150.0)));
+        let (pos, size, _, _) = snap_resize_to_objects([100.0, 100.0], [97.0, 20.0], &other, 6.0, true, None);
+        assert_eq!((pos, size), ([97.0, 100.0], [103.0, 20.0]));
+        // Keeping the shape, the nearer catch holds and the other side follows.
+        let (_, size, x, y) = snap_resize_to_objects([100.0, 100.0], [98.0, 48.0], &other, 6.0, false, Some(2.0));
+        assert_eq!((size, x, y), ([100.0, 50.0], Some(200.0), None));
+        assert_eq!(off.x, 0.0, "an edge on an edge is not a centre on a centre");
+    }
+}

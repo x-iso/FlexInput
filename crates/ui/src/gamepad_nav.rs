@@ -43,6 +43,28 @@ pub enum ChordTarget {
     ConfigOverlay,
     /// The phase tuner over the game (`phase_overlay`).
     PhaseOverlay,
+    /// The previous / next patch tab (default Home + LB / RB).
+    PrevTab,
+    NextTab,
+    /// The previous / next tab of the layout showing (default LB / RB): read by FlexInput's
+    /// own gamepad navigation, not the background watcher.
+    LayoutTabPrev,
+    LayoutTabNext,
+}
+
+impl ChordTarget {
+    /// Read by FlexInput's own gamepad navigation rather than the background watcher: any
+    /// one or more of the navigation buttons, on press - no press mode, no time gap.
+    pub fn in_app(self) -> bool {
+        matches!(self, ChordTarget::LayoutTabPrev | ChordTarget::LayoutTabNext)
+    }
+}
+
+/// Whether `combo` (navigation buttons) went down this frame: all held, one of them just
+/// pressed. False for an empty or unassigned one.
+pub fn combo_rising(nav: &NavInput, combo: Option<&[String]>) -> bool {
+    let Some(c) = combo.filter(|c| !c.is_empty()) else { return false };
+    c.iter().all(|p| nav.pressed.contains(p)) && c.iter().any(|p| nav.is_rising(p))
 }
 
 /// Per-shortcut edge/timing state carried between frames by `chord_fire`.
@@ -378,6 +400,18 @@ pub struct GamepadNav {
     pub stick_walk_latch: bool,
     /// Widget-level vs editing-a-widget.
     pub edit_level: EditLevel,
+    /// On a module pinned whole, which of its stops the walk is on: a part its body offers
+    /// (`module_part`, a graph or a row - nav treats the widget as that part while it's set),
+    /// and a field in it (`module_field`) where the walk stops on the row's fields one by one.
+    /// See `FlexInputApp::nav_widget_stops`.
+    pub module_part: Option<String>,
+    pub module_field: Option<usize>,
+    /// The item those belong to - the Easy body's `selected_item`, or the config overlay's
+    /// `config_index` - so a stop left over from one widget never stands for another.
+    pub module_part_item: Option<usize>,
+    /// When the pad last picked or moved anything: the pointer's movement only takes the
+    /// layout from it a moment after (`widgets::note_pointer_activity`).
+    pub last_pad_input: Option<Instant>,
     /// The nav pad that last showed fresh activity (set by `run_gamepad_nav`
     /// while any nav-enabled pad exists, cleared otherwise). Every nav pad
     /// drives the UI at once, merged; this one only supplies what can't merge:
@@ -444,9 +478,12 @@ pub struct GamepadNav {
     pub alt_tab_active: bool,
     /// Re-arm latch for right-stick → arrow-key taps inside the switcher.
     pub rs_arrow_armed: bool,
-    /// Previous-frame analog trigger pressed state (>0.5), for rising edges.
+    /// Previous-frame trigger pressed state (`NavInput::lt_down`), for rising edges.
     pub prev_lt: bool,
     pub prev_rt: bool,
+    /// Each nav pad's two triggers against their calibrated points, left then right
+    /// (`read_nav_input_calibrated`).
+    pub trig_cross: HashMap<String, [flexinput_core::automap::TriggerCrossing; 2]>,
     /// Left-panel (I/O panel) edit-in-progress: the AdjustParam target the
     /// cursor entered with South/RT. While `Some`, stick/dpad nudges the param,
     /// West toggles fine, North resets, East/LT exits. None = not editing the
@@ -749,6 +786,10 @@ impl Default for GamepadNav {
             config_lane: None,
             stick_walk_latch: false,
             edit_level: EditLevel::Widget,
+            module_part: None,
+            module_field: None,
+            module_part_item: None,
+            last_pad_input: None,
             active_dev: None,
             fine_increment: false,
             jsm_pane: JsmPane::default(),
@@ -771,6 +812,7 @@ impl Default for GamepadNav {
             rs_arrow_armed: true,
             prev_lt: false,
             prev_rt: false,
+            trig_cross: HashMap::new(),
             left_edit: None,
             left_selected: None,
             left_scrolled_to: None,
@@ -893,7 +935,7 @@ pub enum PickerUse {
 }
 
 /// One frame's worth of navigation input for a single device.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct NavInput {
     /// Bool pins currently asserted.
     pub pressed: HashSet<String>,
@@ -903,6 +945,10 @@ pub struct NavInput {
     pub rstick: egui::Vec2,
     pub lt: f32,
     pub rt: f32,
+    /// Whether each trigger is pressed, as a button: past its calibrated point
+    /// ([`read_nav_input_calibrated`]), or half way for a pad read raw.
+    pub lt_down: bool,
+    pub rt_down: bool,
     /// Local pitch (gyro_y) / yaw (gyro_z), raw deg/s-ish units.
     pub gyro_pitch: f32,
     pub gyro_yaw: f32,
@@ -990,9 +1036,68 @@ pub fn read_nav_input(
         rstick: sig_vec2(signals, dev_id, "right_stick"),
         lt,
         rt,
+        lt_down: lt > 0.5,
+        rt_down: rt > 0.5,
         gyro_pitch: sig_float(signals, dev_id, "gyro_y"),
         gyro_yaw: sig_float(signals, dev_id, "gyro_z"),
     }
+}
+
+/// The least share of a trigger's calibrated travel that presses it for navigation and the
+/// gamepad shortcuts, whatever its point: a point at rest is for a game to see the lightest
+/// touch, and would hold the trigger down for good on a pad resting a hair off zero.
+pub const NAV_TRIGGER_LEAST: f32 = 0.3;
+
+/// [`read_nav_input`] with the pad's calibration, as the engine applies it before a patch
+/// sees the pad, so it answers navigation as it answers everywhere else: its sticks centred,
+/// scaled round and deadzoned, each trigger within its range and pressed from its point (no
+/// nearer rest than [`NAV_TRIGGER_LEAST`]) - with its band and its debounce, stepped on
+/// `triggers`, `dt` seconds after the last read - and its gyro without its bias. A pad with
+/// digital triggers only presses them as they are, and so does one whose analog trigger
+/// stays at zero while its button presses.
+pub fn read_nav_input_calibrated(
+    signals: &HashMap<(String, String), Signal>,
+    dev_id: &str,
+    prev_pressed: &HashSet<String>,
+    cal: &flexinput_engine::eval::PadCalibration,
+    triggers: &mut [flexinput_core::automap::TriggerCrossing; 2],
+    dt: f32,
+) -> NavInput {
+    let mut nav = read_nav_input(signals, dev_id, prev_pressed);
+    let stick = |right: bool, v: egui::Vec2| {
+        let out = cal.stick(right, glam::Vec2::new(v.x, v.y));
+        egui::vec2(out.x, out.y)
+    };
+    nav.lstick = stick(false, nav.lstick);
+    nav.rstick = stick(true, nav.rstick);
+    for (side, (analog, digital)) in [("left_trigger", "btn_lt_dig"), ("right_trigger", "btn_rt_dig")].into_iter().enumerate() {
+        let right = side == 1;
+        let (travel, down) = match signals.get(&(dev_id.to_string(), analog.to_string())) {
+            Some(raw) => {
+                let travel = cal.trigger(right, raw.as_float());
+                let (edges, hold) = cal.trigger_edges(right, NAV_TRIGGER_LEAST);
+                triggers[side].step(&edges, travel, dt, hold);
+                if raw.as_float() <= 0.0 && sig_bool(signals, dev_id, digital) {
+                    (1.0, true)
+                } else {
+                    (travel, triggers[side].down())
+                }
+            }
+            None => {
+                let down = sig_bool(signals, dev_id, digital);
+                (if down { 1.0 } else { 0.0 }, down)
+            }
+        };
+        if right {
+            (nav.rt, nav.rt_down) = (travel, down);
+        } else {
+            (nav.lt, nav.lt_down) = (travel, down);
+        }
+    }
+    let g = cal.gyro(["gyro_x", "gyro_y", "gyro_z"].map(|pin| sig_float(signals, dev_id, pin)));
+    nav.gyro_pitch = g[1];
+    nav.gyro_yaw = g[2];
+    nav
 }
 
 /// Fold another nav-enabled pad's frame into `into`, so several pads drive the
@@ -1008,6 +1113,8 @@ pub fn merge_nav_input(into: &mut NavInput, other: &NavInput) {
     if other.rstick.length() > into.rstick.length() { into.rstick = other.rstick; }
     into.lt = into.lt.max(other.lt);
     into.rt = into.rt.max(other.rt);
+    into.lt_down |= other.lt_down;
+    into.rt_down |= other.rt_down;
 }
 
 /// Drop the buttons a gamepad shortcut currently owns on `dev_id` (published
@@ -1027,23 +1134,13 @@ pub fn has_activity(nav: &NavInput) -> bool {
     !nav.pressed.is_empty()
         || nav.lstick.length() > 0.3
         || nav.rstick.length() > 0.1
-        || nav.lt > 0.5
-        || nav.rt > 0.5
+        || nav.lt_down
+        || nav.rt_down
 }
 
 fn item_center(item: &LayoutItem) -> egui::Vec2 {
     let (p, s) = item.bbox();
     egui::vec2(p[0] + s[0] * 0.5, p[1] + s[1] * 0.5)
-}
-
-/// [`nearest_item_toward`] in one of the four directions.
-pub fn nearest_in_dir(
-    items: &[LayoutItem],
-    cur: Option<usize>,
-    dir: NavDir,
-    editable: impl Fn(usize) -> bool,
-) -> Option<usize> {
-    nearest_item_toward(items, cur, dir.into(), editable)
 }
 
 fn item_rect(item: &LayoutItem) -> egui::Rect {
@@ -1092,31 +1189,6 @@ pub fn nearest_item_toward(
 
     nearest_rect_toward(
         item_rect(&items[cur]),
-        items.iter().enumerate()
-            .filter(|&(i, _)| i != cur && navigable(i))
-            .map(|(i, item)| (i, item_rect(item))),
-        step,
-    )
-}
-
-/// [`nearest_item_toward`] as a walk: keeping to `lane` ([`NavLane`], scoped by
-/// `scope`, the sub-patch) and moving it on.
-pub fn walk_items(
-    items: &[LayoutItem],
-    cur: Option<usize>,
-    step: NavStep,
-    editable: impl Fn(usize) -> bool,
-    lane: &mut Option<NavLane>,
-    scope: u64,
-) -> Option<usize> {
-    let Some(cur) = cur.filter(|&i| i < items.len()) else {
-        return nearest_item_toward(items, None, step, editable);
-    };
-    let navigable = |i: usize| matches!(items.get(i), Some(LayoutItem::Module(_))) && editable(i);
-    step_in_lane(
-        lane,
-        scope,
-        (cur, item_rect(&items[cur])),
         items.iter().enumerate()
             .filter(|&(i, _)| i != cur && navigable(i))
             .map(|(i, item)| (i, item_rect(item))),
@@ -1618,6 +1690,94 @@ mod nav_switch_tests {
 }
 
 #[cfg(test)]
+mod calibrated_nav_tests {
+    use super::*;
+    use flexinput_engine::eval::PadCalibration;
+
+    fn signals(pins: &[(&str, Signal)]) -> HashMap<(String, String), Signal> {
+        pins.iter().map(|(p, s)| (("pad".to_string(), p.to_string()), *s)).collect()
+    }
+
+    fn cal(params: serde_json::Value) -> PadCalibration {
+        let map: HashMap<String, serde_json::Value> = serde_json::from_value(params).unwrap();
+        PadCalibration::from_params(&map)
+    }
+
+    fn read(sigs: &HashMap<(String, String), Signal>, cal: &PadCalibration, trig: &mut [flexinput_core::automap::TriggerCrossing; 2]) -> NavInput {
+        read_nav_input_calibrated(sigs, "pad", &HashSet::new(), cal, trig, 1.0 / 60.0)
+    }
+
+    /// Navigation takes a pad the way its patch does: the stick inside its deadzone is
+    /// still, and past it comes out rescaled from the deadzone's edge.
+    #[test]
+    fn nav_sticks_keep_the_pads_deadzone() {
+        let c = cal(serde_json::json!({ "deadzone": 0.25 }));
+        let mut trig = Default::default();
+        let inside = read(&signals(&[("left_stick", Signal::Vec2(glam::Vec2::new(0.2, 0.0)))]), &c, &mut trig);
+        assert_eq!(inside.lstick, egui::Vec2::ZERO, "inside the deadzone the stick is still");
+        let past = read(&signals(&[("right_stick", Signal::Vec2(glam::Vec2::new(0.0, 0.625)))]), &c, &mut trig);
+        assert!((past.rstick.y - 0.5).abs() < 1e-4, "rescaled from the deadzone's edge: {:?}", past.rstick);
+    }
+
+    /// A trigger presses where its calibrated point is, on the travel within its range - not
+    /// at a fixed half of the raw travel.
+    #[test]
+    fn nav_triggers_press_at_their_calibrated_point() {
+        let c = cal(serde_json::json!({ "ltrig_min": 0.1, "ltrig_max": 0.9, "ltrig_digital_threshold": 0.3 }));
+        let mut trig = Default::default();
+        // 0.3 of 0.1..0.9 is 0.34 raw.
+        let short = read(&signals(&[("left_trigger", Signal::Float(0.3))]), &c, &mut trig);
+        assert!(!short.lt_down, "short of the point: {}", short.lt);
+        let past = read(&signals(&[("left_trigger", Signal::Float(0.4))]), &c, &mut trig);
+        assert!(past.lt_down && (past.lt - 0.375).abs() < 1e-4, "past the point, read within the range: {}", past.lt);
+        // Uncalibrated, the stock point is nearer rest than a deliberate pull, which presses it.
+        let stock = PadCalibration::default();
+        let mut trig = Default::default();
+        assert!(!read(&signals(&[("right_trigger", Signal::Float(0.2))]), &stock, &mut trig).rt_down);
+        assert!(read(&signals(&[("right_trigger", Signal::Float(0.4))]), &stock, &mut trig).rt_down);
+        // A pad with only digital triggers presses them as they are, and so does one whose
+        // analog trigger stays at zero.
+        assert!(read(&signals(&[("btn_lt_dig", Signal::Bool(true))]), &stock, &mut trig).lt_down);
+        let mut trig = Default::default();
+        let dead_axis = signals(&[("left_trigger", Signal::Float(0.0)), ("btn_lt_dig", Signal::Bool(true))]);
+        assert!(read(&dead_axis, &stock, &mut trig).lt_down);
+    }
+
+    /// A point at rest - a game seeing the lightest touch - doesn't hold navigation's trigger
+    /// down on a pad that rests a hair off zero: it presses at a deliberate pull and lets go
+    /// back at rest, press after press.
+    #[test]
+    fn a_trigger_point_at_rest_still_lets_go_for_navigation() {
+        let c = cal(serde_json::json!({
+            "ltrig_min": 0.0, "ltrig_max": 0.13, "ltrig_digital_threshold": 0.0, "digital_triggers": true,
+            "trig_debounce_ms": 11.0, "trig_hysteresis": 0.01,
+        }));
+        let mut trig = Default::default();
+        let mut downs = Vec::new();
+        for v in [0.0004_f32, 0.0004, 0.13, 0.13, 0.13, 0.0004, 0.0004, 0.0004, 0.13, 0.13, 0.0004, 0.0004, 0.0004] {
+            downs.push(read(&signals(&[("left_trigger", Signal::Float(v))]), &c, &mut trig).lt_down);
+        }
+        let presses = downs.windows(2).filter(|w| !w[0] && w[1]).count();
+        assert_eq!(presses, 2, "two pulls, two presses: {downs:?}");
+        assert!(!downs[downs.len() - 1], "and up again at rest: {downs:?}");
+    }
+
+    /// The gyro cursor moves by the gyro less its calibrated bias, so a pad lying still
+    /// leaves it still.
+    #[test]
+    fn the_gyro_cursor_reads_the_gyro_without_its_bias() {
+        let c = cal(serde_json::json!({ "gyro_offset": [0.001, 0.004, -0.003] }));
+        let mut trig = Default::default();
+        let still = read(
+            &signals(&[("gyro_x", Signal::Float(0.001)), ("gyro_y", Signal::Float(0.004)), ("gyro_z", Signal::Float(-0.003))]),
+            &c,
+            &mut trig,
+        );
+        assert!(still.gyro_pitch.abs() < 1e-6 && still.gyro_yaw.abs() < 1e-6, "{} {}", still.gyro_pitch, still.gyro_yaw);
+    }
+}
+
+#[cfg(test)]
 mod left_nav_tests {
     use super::*;
 
@@ -1935,6 +2095,8 @@ mod spatial_walk_tests {
             rstick: egui::Vec2::ZERO,
             lt: 0.0,
             rt: 0.0,
+            lt_down: false,
+            rt_down: false,
             gyro_pitch: 0.0,
             gyro_yaw: 0.0,
         }
@@ -2007,5 +2169,59 @@ mod spatial_walk_tests {
         let mut stale = Some(NavLane { scope: 1, at: 12, x: 400.0, y: 213.0 });
         let mut pad = 4;
         assert_eq!(go(&mut stale, &mut pad, NavStep::DOWN), 5, "from the pad's middle: the cards");
+    }
+}
+
+#[cfg(test)]
+mod combo_rising_tests {
+    use super::*;
+
+    fn nav(pressed: &[&str], rising: &[&str]) -> NavInput {
+        NavInput {
+            pressed: pressed.iter().map(|s| s.to_string()).collect(),
+            rising: rising.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A combo goes down when all of it is held and one of it was just pressed - not while
+    /// it stays held, not with part of it, not unassigned.
+    #[test]
+    fn a_combo_rises_once_all_of_it_is_held() {
+        let lb = vec!["btn_lb".to_string()];
+        assert!(combo_rising(&nav(&["btn_lb"], &["btn_lb"]), Some(&lb)));
+        assert!(!combo_rising(&nav(&["btn_lb"], &[]), Some(&lb)), "held, not pressed");
+        let pair = vec!["btn_back".to_string(), "btn_rb".to_string()];
+        assert!(!combo_rising(&nav(&["btn_rb"], &["btn_rb"]), Some(&pair)), "half of it");
+        assert!(combo_rising(&nav(&["btn_back", "btn_rb"], &["btn_rb"]), Some(&pair)));
+        assert!(!combo_rising(&nav(&["btn_lb"], &["btn_lb"]), None));
+        assert!(!combo_rising(&nav(&["btn_lb"], &["btn_lb"]), Some(&[])));
+    }
+
+    /// Each shortcut target reads and writes its own setting: none shares another's.
+    #[test]
+    fn every_shortcut_target_has_its_own_setting() {
+        use ChordTarget as T;
+        let all = [T::SeeThrough, T::Panic, T::Overlay, T::Pin, T::ConfigOverlay, T::PhaseOverlay,
+            T::PrevTab, T::NextTab, T::LayoutTabPrev, T::LayoutTabNext];
+        let mut s = crate::settings::AppSettings::default();
+        for (i, &t) in all.iter().enumerate() {
+            *s.chord_mut(t) = Some(vec![format!("b{i}")]);
+            if let Some(m) = s.chord_mode_mut(t) {
+                *m = format!("m{i}");
+            }
+            if let Some(g) = s.chord_gap_ms_mut(t) {
+                *g = i as f32;
+            }
+        }
+        for (i, &t) in all.iter().enumerate() {
+            assert_eq!(s.chord(t), &Some(vec![format!("b{i}")]), "{t:?}");
+            assert_eq!(s.chord_mode_mut(t).map(|m| m.clone()), (!t.in_app()).then(|| format!("m{i}")), "{t:?}");
+            assert_eq!(s.chord_gap_ms_mut(t).map(|g| *g), (!t.in_app()).then_some(i as f32), "{t:?}");
+        }
+        // The defaults: the layout's tabs on LB / RB, the patch tabs on Home with them.
+        let d = crate::settings::AppSettings::default();
+        assert_eq!(d.chord(T::LayoutTabNext), &Some(vec!["btn_rb".to_string()]));
+        assert_eq!(d.chord(T::PrevTab), &Some(vec!["btn_guide".to_string(), "btn_lb".to_string()]));
     }
 }

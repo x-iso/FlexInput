@@ -170,6 +170,10 @@ fn home_chord(dpad: &str) -> Option<Vec<String>> {
     Some(vec!["btn_guide".to_string(), dpad.to_string()])
 }
 fn default_overlay_chord() -> Option<Vec<String>> { home_chord("dpad_up") }
+fn default_tab_prev_chord() -> Option<Vec<String>> { home_chord("btn_lb") }
+fn default_tab_next_chord() -> Option<Vec<String>> { home_chord("btn_rb") }
+fn default_layout_tab_prev_chord() -> Option<Vec<String>> { Some(vec!["btn_lb".to_string()]) }
+fn default_layout_tab_next_chord() -> Option<Vec<String>> { Some(vec!["btn_rb".to_string()]) }
 fn default_pin_chord() -> Option<Vec<String>> { home_chord("dpad_down") }
 fn default_config_overlay_chord() -> Option<Vec<String>> { home_chord("dpad_right") }
 
@@ -571,6 +575,21 @@ pub struct AppSettings {
     /// overlay's. None = unassigned (the default).
     #[serde(default)]
     pub phase_overlay_chord: Option<Vec<String>>,
+    /// Gamepad shortcuts for the previous / next PATCH tab, through the background watcher
+    /// like the window shortcuts (Home leads them, so it isn't replayed to a game). Default
+    /// Home + LB / Home + RB: plain LB / RB went to the layout's tabs.
+    #[serde(default = "default_tab_prev_chord")]
+    pub tab_prev_chord: Option<Vec<String>>,
+    #[serde(default = "default_tab_next_chord")]
+    pub tab_next_chord: Option<Vec<String>>,
+    /// The buttons for the previous / next tab of the layout showing (Easy mode's, or the
+    /// config overlay's while it has the pad), read by FlexInput's own gamepad navigation, on
+    /// press. Default LB / RB. Where the layout has no tabs they go to the patch tabs, as
+    /// LB / RB did before layouts had tabs.
+    #[serde(default = "default_layout_tab_prev_chord")]
+    pub layout_tab_prev_chord: Option<Vec<String>>,
+    #[serde(default = "default_layout_tab_next_chord")]
+    pub layout_tab_next_chord: Option<Vec<String>>,
     /// Press mode for each gamepad shortcut chord above (`"down"` = on press,
     /// `"long"` = hold for the gap, `"double"` = double-tap within the gap).
     /// Mirrors the remapper card press modes; see `gamepad_nav::chord_fire`.
@@ -586,6 +605,10 @@ pub struct AppSettings {
     pub config_overlay_chord_mode: String,
     #[serde(default = "default_chord_mode")]
     pub phase_overlay_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub tab_prev_chord_mode: String,
+    #[serde(default = "default_chord_mode")]
+    pub tab_next_chord_mode: String,
     /// Time gap (ms) each shortcut chord's press mode reads: the hold duration
     /// for `long`, the max inter-tap gap for `double`. Ignored by `down`.
     #[serde(default = "default_chord_gap_ms")]
@@ -600,6 +623,10 @@ pub struct AppSettings {
     pub config_overlay_chord_gap_ms: f32,
     #[serde(default = "default_chord_gap_ms")]
     pub phase_overlay_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub tab_prev_chord_gap_ms: f32,
+    #[serde(default = "default_chord_gap_ms")]
+    pub tab_next_chord_gap_ms: f32,
     /// Whether the info overlay was visible on exit — restored on launch
     /// (mirrors `see_through_active`; the live state lives in a ctx temp
     /// slot that `update()` syncs back here).
@@ -1066,18 +1093,26 @@ impl Default for AppSettings {
             pin_chord: default_pin_chord(),
             config_overlay_chord: default_config_overlay_chord(),
             phase_overlay_chord: None,
+            tab_prev_chord: default_tab_prev_chord(),
+            tab_next_chord: default_tab_next_chord(),
+            layout_tab_prev_chord: default_layout_tab_prev_chord(),
+            layout_tab_next_chord: default_layout_tab_next_chord(),
             seethrough_chord_mode: default_chord_mode(),
             panic_chord_mode: default_chord_mode(),
             overlay_chord_mode: default_chord_mode(),
             pin_chord_mode: default_chord_mode(),
             config_overlay_chord_mode: default_chord_mode(),
             phase_overlay_chord_mode: default_chord_mode(),
+            tab_prev_chord_mode: default_chord_mode(),
+            tab_next_chord_mode: default_chord_mode(),
             seethrough_chord_gap_ms: default_chord_gap_ms(),
             panic_chord_gap_ms: default_chord_gap_ms(),
             overlay_chord_gap_ms: default_chord_gap_ms(),
             pin_chord_gap_ms: default_chord_gap_ms(),
             config_overlay_chord_gap_ms: default_chord_gap_ms(),
             phase_overlay_chord_gap_ms: default_chord_gap_ms(),
+            tab_prev_chord_gap_ms: default_chord_gap_ms(),
+            tab_next_chord_gap_ms: default_chord_gap_ms(),
             overlay_visible: false,
             overlay_shortcut: default_overlay_shortcut(),
             edit_overlay_shortcut: default_edit_overlay_shortcut(),
@@ -1099,6 +1134,74 @@ impl Default for AppSettings {
             window_size: None,
             window_maximized: false,
         }
+    }
+}
+
+/// Each gamepad shortcut's combo, press mode and time gap, by target. The layout-tab buttons
+/// have no mode or gap of their own (always on press): theirs read the defaults.
+impl AppSettings {
+    pub(crate) fn chord(&self, t: crate::gamepad_nav::ChordTarget) -> &Option<Vec<String>> {
+        use crate::gamepad_nav::ChordTarget as T;
+        match t {
+            T::SeeThrough => &self.seethrough_chord,
+            T::Panic => &self.panic_chord,
+            T::Overlay => &self.overlay_chord,
+            T::Pin => &self.pin_chord,
+            T::ConfigOverlay => &self.config_overlay_chord,
+            T::PhaseOverlay => &self.phase_overlay_chord,
+            T::PrevTab => &self.tab_prev_chord,
+            T::NextTab => &self.tab_next_chord,
+            T::LayoutTabPrev => &self.layout_tab_prev_chord,
+            T::LayoutTabNext => &self.layout_tab_next_chord,
+        }
+    }
+
+    pub(crate) fn chord_mut(&mut self, t: crate::gamepad_nav::ChordTarget) -> &mut Option<Vec<String>> {
+        use crate::gamepad_nav::ChordTarget as T;
+        match t {
+            T::SeeThrough => &mut self.seethrough_chord,
+            T::Panic => &mut self.panic_chord,
+            T::Overlay => &mut self.overlay_chord,
+            T::Pin => &mut self.pin_chord,
+            T::ConfigOverlay => &mut self.config_overlay_chord,
+            T::PhaseOverlay => &mut self.phase_overlay_chord,
+            T::PrevTab => &mut self.tab_prev_chord,
+            T::NextTab => &mut self.tab_next_chord,
+            T::LayoutTabPrev => &mut self.layout_tab_prev_chord,
+            T::LayoutTabNext => &mut self.layout_tab_next_chord,
+        }
+    }
+
+    /// A shortcut's press mode; `None` for the layout-tab buttons, which have none.
+    pub(crate) fn chord_mode_mut(&mut self, t: crate::gamepad_nav::ChordTarget) -> Option<&mut String> {
+        use crate::gamepad_nav::ChordTarget as T;
+        Some(match t {
+            T::SeeThrough => &mut self.seethrough_chord_mode,
+            T::Panic => &mut self.panic_chord_mode,
+            T::Overlay => &mut self.overlay_chord_mode,
+            T::Pin => &mut self.pin_chord_mode,
+            T::ConfigOverlay => &mut self.config_overlay_chord_mode,
+            T::PhaseOverlay => &mut self.phase_overlay_chord_mode,
+            T::PrevTab => &mut self.tab_prev_chord_mode,
+            T::NextTab => &mut self.tab_next_chord_mode,
+            T::LayoutTabPrev | T::LayoutTabNext => return None,
+        })
+    }
+
+    /// A shortcut's time gap (ms); `None` for the layout-tab buttons, which have none.
+    pub(crate) fn chord_gap_ms_mut(&mut self, t: crate::gamepad_nav::ChordTarget) -> Option<&mut f32> {
+        use crate::gamepad_nav::ChordTarget as T;
+        Some(match t {
+            T::SeeThrough => &mut self.seethrough_chord_gap_ms,
+            T::Panic => &mut self.panic_chord_gap_ms,
+            T::Overlay => &mut self.overlay_chord_gap_ms,
+            T::Pin => &mut self.pin_chord_gap_ms,
+            T::ConfigOverlay => &mut self.config_overlay_chord_gap_ms,
+            T::PhaseOverlay => &mut self.phase_overlay_chord_gap_ms,
+            T::PrevTab => &mut self.tab_prev_chord_gap_ms,
+            T::NextTab => &mut self.tab_next_chord_gap_ms,
+            T::LayoutTabPrev | T::LayoutTabNext => return None,
+        })
     }
 }
 

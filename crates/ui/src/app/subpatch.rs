@@ -294,11 +294,11 @@ pub(crate) fn show_subpatch_editors(
         let already_open = app.sub_patch_editors.iter()
             .any(|e| e.tab_idx == active && e.node_id == node_id);
         if already_open {
-            // Asked for again: bring it up rather than leave it under us.
-            ctx.send_viewport_cmd_to(
-                egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0)),
-                egui::ViewportCommand::Focus,
-            );
+            // Asked for again: bring it up rather than leave it under us - from
+            // minimized too, which a focus alone leaves on the taskbar.
+            let id = egui::ViewportId::from_hash_of(("subpatch_editor", active, node_id.0));
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus);
         } else {
             let inner_snarl = app.tabs[active].canvas.snarl
                 .get_node(node_id)
@@ -766,6 +766,7 @@ pub(crate) fn show_subpatch_editors(
                 if let Some(node) = node_opt {
                     if let Some(sp) = node.subpatch.as_mut() {
                         sp.push_module_pin(ExposedModule {
+                            tab: sp.new_item_tab(),
                             inner_node_id: inner_id.0,
                             element_id,
                             pos: [PINNED_PAD, next_y + PINNED_PAD],
@@ -779,6 +780,7 @@ pub(crate) fn show_subpatch_editors(
                             keep_aspect: false,
                             anchor: Default::default(),
                             pin_style: Some(2),
+                            zoom: None,
                         });
                     }
                 }

@@ -782,9 +782,7 @@ pub(crate) fn mapping_curve_editor(
     if let Some(uid) = nav_uid {
         let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
             .unwrap_or(egui::emath::TSTransform::IDENTITY);
-        ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_curve_geom", uid)),
-            (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32)));
+        crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), uid, (pass, to_global * g, 0.0f32, 1.0f32, 0.0f32, 1.0f32));
         let nav_sel: Option<(u64, usize, bool)> = ui.ctx()
             .data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_sel", uid))));
         let nav_sel = nav_sel.filter(|(p, _, _)| crate::widgets::nav_pass_matches(ui.ctx(), *p));

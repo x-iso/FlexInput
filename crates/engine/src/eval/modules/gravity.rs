@@ -173,8 +173,19 @@ impl GravityFusion {
 /// instead of spinning on the spot.
 const ORIENT_COS_CAP: f32 = 0.259;
 
+/// How much of what the cap held back the camera gives back, as a share of how far the
+/// nose moves: each degree the nose moves below the cap brings the camera this many degrees
+/// nearer where it would be without the cap. Only while the pad moves, so a still pad's
+/// pointer stays still.
+const ORIENT_PAYBACK: f32 = 0.3;
+
+/// Owed more than this, degrees, the camera and the look without the cap have parted some
+/// other way than by the cap (they shouldn't): the look without the cap starts over on the
+/// camera's rather than pull it across.
+const ORIENT_PAYBACK_GIVE_UP: f32 = 60.0;
+
 /// How many `f32`s [`OrientCamera::store`] writes.
-pub(crate) const ORIENT_CAMERA_LEN: usize = 7;
+pub(crate) const ORIENT_CAMERA_LEN: usize = 10;
 
 /// `Orient` (3DOF to 2D) and `GYRO_SPACE = ORIENT` (the JSM module): a camera with
 /// a heading and a pitch, kept looking where the pad's nose points, its up the
@@ -204,6 +215,12 @@ pub(crate) const ORIENT_CAMERA_LEN: usize = 7;
 /// measured in is held to gravity (`GravityFusion::orientation`), but bringing it
 /// back after the gyro drifted turns the frame, not the camera, so a still pad's
 /// pointer stays still.
+///
+/// What the heading's cap near a pole holds back is given back below it: the camera
+/// carries along the look it would have without the cap (`trail`, turned by the nose's
+/// own moves and nothing else), and once it's under the cap again it closes on that look
+/// by a share of each move the nose makes. Up past 75°, turned and back down, it comes
+/// down where the nose is rather than short of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct OrientCamera {
     /// Heading in `frame`, degrees, right positive.
@@ -214,6 +231,9 @@ pub(crate) struct OrientCamera {
     /// The frame the heading and pitch are in, to the world - both (forward,
     /// right, down). The identity until the camera first goes over a pole.
     frame: Quat,
+    /// Where the camera would look without the heading's cap, in the world: carried by the
+    /// nose's moves. Zero until the camera starts.
+    trail: Vec3,
 }
 
 /// The look of a camera at heading `psi` and pitch `theta` (degrees), in its frame.
@@ -231,6 +251,7 @@ impl OrientCamera {
             theta: s[1],
             valid: s[2] > 0.5,
             frame: if f.length_squared() > 0.5 { f.normalize() } else { Quat::IDENTITY },
+            trail: Vec3::new(s[7], s[8], s[9]),
         }
     }
 
@@ -243,7 +264,15 @@ impl OrientCamera {
             self.frame.y,
             self.frame.z,
             self.frame.w,
+            self.trail.x,
+            self.trail.y,
+            self.trail.z,
         ]);
+    }
+
+    /// Where the camera looks, in the world.
+    fn world_look(&self) -> Vec3 {
+        self.frame * look(self.psi, self.theta)
     }
 
     /// Where the camera looks in the world, as a heading and a pitch in degrees -
@@ -271,6 +300,7 @@ impl OrientCamera {
         self.theta = (-n.z).clamp(-1.0, 1.0).asin().to_degrees();
         self.frame = Quat::IDENTITY;
         self.valid = true;
+        self.trail = self.world_look();
     }
 
     /// A share `t` of the way from where the camera looks onto where the nose of `q`
@@ -287,6 +317,7 @@ impl OrientCamera {
         self.theta = (-l.z).clamp(-1.0, 1.0).asin().to_degrees();
         self.frame = Quat::IDENTITY;
         self.valid = true;
+        self.trail = self.world_look();
     }
 
     /// One tick: the pad at `q_prev` (as it was before this tick's reading) turned
@@ -304,8 +335,12 @@ impl OrientCamera {
         // Up with the pad before its move is measured against the camera's axes.
         self.keep_up(hold.map_or(q_prev, |h| q_prev * h.inverse()) * Vec3::NEG_Z);
         let q_now = q_prev * Quat::from_axis_angle(gyro_dps / gyro_dps.length(), speed * dt);
+        let (n_prev, n_now) = (nose(q_prev, hold).normalize(), nose(q_now, hold).normalize());
+        // The look without the cap, turned as the nose turned.
+        let trail = if self.trail.length_squared() > 0.5 { self.trail } else { self.world_look() };
+        let trail = (arc(n_prev, n_now) * trail).normalize();
         // The nose's move, in the camera's frame.
-        let moved = self.frame.inverse() * (nose(q_now, hold) - nose(q_prev, hold));
+        let moved = self.frame.inverse() * (n_now - n_prev);
         let (st, ct) = self.theta.to_radians().sin_cos();
         let (sp, cp) = self.psi.to_radians().sin_cos();
         // The camera's level right, and its up: which way more pitch moves the look.
@@ -318,7 +353,40 @@ impl OrientCamera {
         if self.theta.abs() > 90.0 {
             self.turn_over();
         }
-        (d_psi, d_theta, false)
+        let (pay_psi, pay_theta) = self.pay_back(trail, moved.length().to_degrees());
+        (d_psi + pay_psi, d_theta + pay_theta, false)
+    }
+
+    /// Below the cap, a share of the nose's move (`moved`, degrees) of the way onto the look
+    /// without the cap (`trail`, in the world), which it then keeps. Returns how far the
+    /// heading and the pitch moved.
+    fn pay_back(&mut self, trail: Vec3, moved: f32) -> (f32, f32) {
+        self.trail = trail;
+        let ct = self.theta.to_radians().cos();
+        if ct <= ORIENT_COS_CAP {
+            return (0.0, 0.0);
+        }
+        let l = self.frame.inverse() * trail;
+        let theta_t = (-l.z).clamp(-1.0, 1.0).asin().to_degrees();
+        if theta_t.to_radians().cos() <= ORIENT_COS_CAP {
+            return (0.0, 0.0);
+        }
+        let owed_psi = (l.y.atan2(l.x).to_degrees() - self.psi + 180.0).rem_euclid(360.0) - 180.0;
+        let owed_theta = theta_t - self.theta;
+        // How far apart the two looks are, degrees on the sphere.
+        let apart = (owed_psi * ct).hypot(owed_theta);
+        if apart < 1e-4 {
+            return (0.0, 0.0);
+        }
+        if apart > ORIENT_PAYBACK_GIVE_UP {
+            self.trail = self.world_look();
+            return (0.0, 0.0);
+        }
+        let share = (ORIENT_PAYBACK * moved / apart).min(1.0);
+        let (d_psi, d_theta) = (owed_psi * share, owed_theta * share);
+        self.psi = ((self.psi + d_psi) + 180.0).rem_euclid(360.0) - 180.0;
+        self.theta += d_theta;
+        (d_psi, d_theta)
     }
 
     /// The camera's up, kept on the pad's (`pad_up`, in the world): more than ~107°
@@ -349,6 +417,18 @@ impl OrientCamera {
         let (sp, cp) = self.psi.to_radians().sin_cos();
         self.theta = (-l.z).atan2(l.x * cp + l.y * sp).to_degrees();
     }
+}
+
+/// The shortest turn from unit `from` to unit `to`, however small: `Quat::from_rotation_arc`
+/// calls a turn of under a few hundredths of a degree none, which is a tick's move of a nose
+/// near a pole at 1 kHz.
+fn arc(from: Vec3, to: Vec3) -> Quat {
+    let c = from.cross(to);
+    let w = 1.0 + from.dot(to);
+    if w < 1e-6 {
+        return Quat::from_rotation_arc(from, to);
+    }
+    Quat::from_xyzw(c.x, c.y, c.z, w).normalize()
 }
 
 /// The nose of `q` measured from the neutral `hold`, in the world.
@@ -460,6 +540,29 @@ mod tests {
         let real = q * Vec3::X;
         let real = Vec3::new(real.x, -real.y, -real.z);
         assert!(nose.angle_between(real).to_degrees() < 1.0, "{nose:?} vs {real:?}");
+    }
+
+    // Below the heading's cap nothing is held back, so nothing is given back: through a
+    // wobble that never goes near 75° up, the look without the cap stays on the camera's,
+    // and the camera moves as it did without it.
+    #[test]
+    fn below_the_cap_the_camera_owes_nothing() {
+        let mut f = GravityFusion::default();
+        let mut q = Quat::IDENTITY;
+        settle(&mut f, q, 0.5);
+        let mut cam = OrientCamera::default();
+        for k in 0..4000 {
+            let t = k as f32 * DT;
+            let w = Vec3::new(60.0 * (t * 2.3).sin(), 50.0 * (t * 1.7).cos(), 70.0 * (t * 3.1).sin());
+            q = (q * Quat::from_scaled_axis(w * DT.to_radians())).normalize();
+            let (g, a) = reading(q, w);
+            let before = f.orientation();
+            f.update(g, Some(a), DT);
+            cam.step(before, g, DT, None);
+            assert!(cam.theta.abs() < 70.0, "the wobble stays under the cap: {}", cam.theta);
+        }
+        let apart = cam.trail.angle_between(cam.world_look()).to_degrees();
+        assert!(apart < 0.05, "the look without the cap parted from the camera's by {apart}°");
     }
 
     #[test]

@@ -17,7 +17,7 @@ impl FlexInputApp {
         let step_dir = step.and_then(|s| s.cardinal());
 
         // RT's press edge: it inserts a gap.
-        let rt_down = nav.rt > 0.5;
+        let rt_down = nav.rt_down;
         let rt_rising = rt_down && !self.gamepad_nav.kbm_picker_prev_rt;
         self.gamepad_nav.kbm_picker_prev_rt = rt_down;
         // The chord list has the focus: the D-pad and the face buttons edit
@@ -177,7 +177,7 @@ impl FlexInputApp {
                 let mut c = chord;
                 let dir = if d == NavDir::Up { 1 } else { -1 };
                 // On a flick, Up / Down is the turn; with LT held, its time.
-                if nav.lt > 0.5 && matches!(elems[f], crate::kbm_picker::ChordElem::Item(i) if c.flick_at(i).is_some()) {
+                if nav.lt_down && matches!(elems[f], crate::kbm_picker::ChordElem::Item(i) if c.flick_at(i).is_some()) {
                     c.nudge_flick_time(elems[f], dir, fine);
                 } else {
                     c.nudge(elems[f], dir, fine);

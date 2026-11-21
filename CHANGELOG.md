@@ -103,14 +103,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   from the orientation JoyShockMapper's motion library keeps, held to gravity, but gravity
   only holds the frame the turns are measured in: bringing it back after the gyro drifted
   never moves the pointer. Near straight up a nose moved sideways is a big change of
-  heading; past 75° the camera takes it a little at a time instead of spinning on the spot.
-  The camera matches the pad as far as the game lets it: at a 1:1 sensitivity with no
+  heading; past 75° the camera takes it a little at a time instead of spinning on the spot,
+  and gives back what it held back once it's below 75° again, a share of each move the nose
+  makes (never while the pad is still): up past 75°, turned and back down, it comes down
+  where the nose is rather than short of it. The camera matches the pad as far as the game lets it: at a 1:1 sensitivity with no
   acceleration curve, no ratchet and nothing else turning it - a game that stops its pitch at
   straight up parts from the pad over the top, until a Reset puts the camera back on the
   nose. The JSM module has it too, as FlexInput's own `GYRO_SPACE = ORIENT`. Auto re-center
   puts Orient's pointer back on the pad: once the pad has lain still for three seconds, the
   camera eases onto where its nose points and the heading back to forward, as a Reset would,
-  sending no movement - whatever the pose's source.
+  sending no movement - whatever the pose's source. In Orient the preview's pointer is where
+  the pad's nose is from the reference - the heading a Reset made zero, the pitch from level -
+  and Edge turn goes by the same, so the edge comes where the pointer shows it. Orient's level
+  is gravity's: a pad whose accelerometer was never calibrated (the gyro calibration, lying
+  flat, zeroes its tilt) shows its pad tilted by what it misreads, and the pointer with it.
 - **3DOF to 2D has a 3D preview of what it's doing.** The pad - its own icon, the one its
   device card shows; or that icon's outline; or its 3D model, half see-through at an opacity
   you set, picked in the preview's corner - sits in a sphere marked in degrees, seen from
@@ -270,8 +276,94 @@ All notable changes to FlexInput are documented here. This project adheres to
   `grid`, `labels` and `snap`, each with `module` (follow the module on the canvas), `on` and
   `off`. `module` is the default, so every copy saved until now looks exactly as it did. A
   pinned Response Curve graph can set its grid and labels the same way.
+- **Gradient fills in layouts.** A rectangle's or ellipse's fill, and an SVG's tint, can be a
+  linear or a radial gradient instead of one colour - in Easy layouts, sub-patch layouts and
+  overlays. Selected, the object shows its gradient's line: drag its two ends (a radial one's
+  centre and edge), the diamond where the middle of the colours falls, and the colours along
+  it; double-click the line for another colour there, right-click one to take it off. The
+  inspector lists the colours with where each sits, adds one in the widest gap, and sets the
+  bias. The handles are on top of everything while their object is selected, so another
+  object over it doesn't take them, and Shift or Ctrl catches a dragged one on edges or
+  centres as it does a moved object. A colour that's see-through fades the gradient out
+  rather than darkening it, and a radial gradient stays round in a box that isn't square.
+- **Moving a layout object catches on the others:** with Shift held its edges snap to theirs,
+  with Ctrl its centre to theirs, within a few points, with a guide along the line it caught
+  on. Alt resizes about the centre, Shift with it keeping the shape, and Ctrl catches a
+  resize's moving edges on the others' edges or centres, whichever is nearer. A modifier held
+  while a layout is edited says what it does there, in a panel at the window's bottom left,
+  as the canvas does for its own.
+- **Layout tabs.** An Easy layout, a sub-patch layout and an overlay can have tabs, one
+  showing at a time. Each object is on one tab, or on all of them (the Inspector's `tab`).
+  With two or more, they're a row across the layout's top and the layout sits beneath it -
+  in Easy mode under the header, staying put as the layout scrolls; on an overlay across the
+  top of the screen. A click on a tab shows it, and the pad's LB / RB step along them.
+  Editing, a double click renames a tab, the tab showing has a × that takes it off - what
+  was on it goes to the tab before - and a + at the row's end adds one. The layout editor's
+  `tab` picker shows another tab or adds one; the first added makes two, with what was there
+  on the first.
+- **A whole module as a widget.** Picking what to pin, every module on the canvas has a
+  glowing ring round its fold chevron, and under the pointer the whole module glows: it pins
+  the module whole, as a widget of its own size, laid out as
+  the module is at that size - a curve's graph shrinks to leave its rows room - starting at
+  the size the module has on the canvas. Remapper, Map Action, Combiner and the Network
+  modules keep the card views they had. With the pad, on the Easy body and the config overlay
+  alike, there's nothing to go into: the walk goes straight on through the widget, each field
+  of its rows a stop of its own and its graph another, ringed as a widget pinned on its own
+  is. South edits the field - or flips a switch there and then - and goes into the graph's
+  dots; an editor that keeps the pad to itself once entered (JSM's) is entered as before. A
+  section's heading is a stop too, and South folds or unfolds it, so the settings of a folded
+  section (3DOF to 2D's Orientation output and Invert Axes start folded) are in reach; a row
+  whose settings are all greyed out is passed by. The Inspector's `zoom` lays the module out as if the widget were
+  bigger and draws it smaller to fit (or the other way), from 40% to 200%: zoomed out, its
+  buttons and values come out smaller and a graph takes the room they leave.
 
 ### Changed
+
+- **Layout editing in Easy mode is a mode of the window, not a strip under the bar.** 🎨 and
+  🔧 sit at the right end of the header row. Editing, the preset bar and its Save and Load
+  give way to the layout editor's tools in the same row, and the Devices panel becomes the
+  Inspector: what the selected object is, where it sits and how big it is, and its options,
+  in sections under headings in the modules' own style - value pills, colour pills, joined
+  choices - every row ending on the same edge. The options were a strip of egui's small
+  controls under the preset bar that pushed the whole layout down while editing. Save and
+  Load are drawings, where they were 💾 and 📂, and 🔧 brings up the sub-patch editor if it
+  is open already, minimized or not. However narrow the window or large the UI scale, the
+  preset bar narrows - and its label goes - before anything in the row reaches the buttons
+  beside it; it never went under 220 points, so at a large UI scale it ran into them.
+- **The layout editor's tools are the canvas's,** in Easy mode, overlays and sub-patch
+  layouts: the magnet for snap, the grid as a value pill, and drawings for the text,
+  rectangle, ellipse, line and picture to add, where there were emoji and words. An
+  overlay's and a sub-patch node's inspector is one slim strip in the same style, each
+  control as wide as its words, its sections in a line that wraps only where its room runs
+  out, where it was egui's small controls.
+- **A layout being edited looks as it will.** Its objects are drawn whole, and the ones under
+  the pointer ease see-through so whatever they cover shows; pinned modules were greyed out the
+  whole time. An object's outline shows only while the pointer is over it - the selection's
+  always - where every object had a blue frame. The same in sub-patch layouts and overlays.
+  The snap grid shows only while an object is moved or resized, or the pointer is on the
+  grid's pill, and so do an overlay's anchor zones; they were there the whole time. Where an
+  overlay's inspector would run across most of the screen - a 3D viewer's has a dozen
+  colours - its sections become tabs; and a chevron at its start folds it away to the
+  object's name, so the object can be moved without it in the way. An overlay's anchors -
+  an element's anchor point, and the line to the element it's anchored to - show for the
+  selection only, where every element's were always there; the anchor switch on the
+  toolbar shows them all.
+- **The pad's LB / RB step the layout's tabs, and Home + LB / RB the patch tabs.** In a layout
+  with no tabs LB / RB still step the patch tabs, as before. All four are set in Settings -
+  the patch tabs' as gamepad shortcuts with the others, the layout's as buttons of their own
+  - and in the gamepad's settings panel.
+- **The mouse has the layout back from the pad as soon as it's used.** With gamepad
+  navigation on, the pad's selection kept its glow and the Easy body kept scrolling back to
+  it, so every turn of the wheel was undone. Clicking, scrolling or touching - or moving the
+  mouse, once the pad has been left alone a moment - now fades the pad's highlights, hides
+  its cursor and stops the following, until the pad picks or moves something again. On the
+  config overlay a click or a scroll does it (over a game the cursor moves by itself), and
+  what the mouse is over becomes the pin that passes its input through.
+- **A curve edited on the config overlay with the right stick keeps its cursor.** Where the
+  left stick passes through to the game to be felt, the right stick edits instead - and it
+  left no cursor to add, delete or grab a dot with. Picking a dot, the right stick now leads
+  the cursor over the graph and the D-pad steps from dot to dot; a grabbed dot moves with
+  the right stick, and the cursor comes back on it once it's let go.
 
 - **Module bodies follow one style,** written down in `docs/MODULE_UI_GUIDELINES.md`.
   Settings are value pills - drag across, or double-click (or Ctrl-click) to type - joined
@@ -294,7 +386,9 @@ All notable changes to FlexInput are documented here. This project adheres to
 - **Buttons in module bodies wear the house style:** MIDI Out's Unmute and the MIDI picker's
   Add, the 3D viewer's colour Reset / Save… / Load…, Network Receive's Copy, and a raw
   pad's Learn, Clear unused and motion setup (Skip, Cancel, Use it, Redo, Try again) are
-  action-row buttons in the controls' font, where they were egui's small grey ones.
+  action-row buttons in the controls' font, where they were egui's small grey ones. The
+  Remapper's preset Save and Load are drawings on square buttons, like every module's Save
+  and Load, where they were 💾 and 📂.
 - **A module's name never decides how wide it is, and never runs under the buttons beside
   it.** It's painted in the header's room: whole if it fits before the controls at the right
   edge, cut with dots if only part of it does, and left out if the room is smaller than a word
@@ -671,6 +765,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **A stick's or the D-pad's AutoMap response curve answers the pad.** Its graph is drawn by
+  the two-axis curve body, which neither said where it was nor showed the pad's selection: a
+  dot picked with the pad wasn't ringed, and the triggers added and took off no dots - on the
+  Easy body and on the config overlay alike - while a gyro's curve, drawn by the other body,
+  did all of that. The two-axis curve now works as the other does, Alt's bias handles shown
+  while the pad holds bias mode too.
+- **The pad adds and takes off a curve's dots where its cursor is on the config overlay.** With
+  the same curve on the Easy body too, the triggers found the dots against the Easy body's
+  graph behind the overlay, so a dot went where the cursor would have been over that one.
 - **Zoomed-in text and icons are sharp.** Easy mode draws its layout bigger to fill the panel
   and the canvas zooms by scaling what's drawn, and both stretched text and icons rasterized
   for their size in points: twice the size was twice as blurry, worst on a 1080p screen at
@@ -733,6 +836,19 @@ All notable changes to FlexInput are documented here. This project adheres to
   FlexInput now replugs a controller in software the first time it hides it (a disable and
   re-enable, re-enabled by the helper's watchdog if anything goes wrong in between), which
   closes every handle; the hide then lets only FlexInput back in.
+- **Gamepad navigation takes each pad's calibration.** It read the pad raw, so the
+  Calibration window's settings stopped at the patch: a trigger pressed at half its travel
+  whatever its range and digital point, a stick's centre and deadzone were ignored, and the
+  gyro cursor crept with the gyro's bias. Navigation, its cursor and the phase tuner now take
+  each pad as its patch does - from its node on the tab in front, else the calibration the tab
+  remembers for it or its type's default: sticks centred, scaled round and deadzoned; each
+  trigger read within its range and pressing at its yellow pin - but no nearer rest than a
+  third of the way in, as a pin at rest lets go only at exactly zero and a pad resting a hair
+  off it would hold the trigger down - with its hysteresis and debounce (on or off, "Digital
+  triggers" only decides the patch's button), and a trigger whose axis stays at zero while
+  its button presses read as the button; the gyro without its bias, through its orientation
+  and noise floor. A gamepad shortcut with a trigger in it presses at the same point, where
+  it took the pad's own flag, which can fire at the first touch.
 - **Navigating the config overlay with a pad sent the navigation to the game as well.** The
   focused pin's inputs pass through to the game so a tweak can be felt, and a pin that reads
   the left stick, or one that passes the whole pad, let the d-pad and stick doing the
@@ -741,6 +857,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   kept from the game while it does, passthrough or not. A calibration sweep still lets the
   stick and the pad's turn through; only its Finish and Cancel are held back.
 - **A pinned JSM editor scrolls with the wheel or a trackpad.** Only its scroll bar moved it.
+- **Pinned mapping cards stay inside the layout while it's edited.** A Remapper or a list of
+  mapping cards pinned to an Easy layout scrolled partly out of view drew over the header
+  above it while the layout was being edited, cut only to its own frame.
 - **A folded module drew its own body across its name.** A collapsed node's body still runs,
   shifted up under the header's clip, so a folded Dropdown put an option over "Dropdown", a
   folded Oscillator its phase number over "Oscillator", a folded knob a slice of its dial

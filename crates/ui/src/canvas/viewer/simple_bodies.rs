@@ -3482,6 +3482,20 @@ pub(crate) fn rasterize_svg_recolored(
     mode: &str,
     tint: egui::Color32,
 ) -> Option<egui::ColorImage> {
+    let blend = (tint.a() as f32 / 255.0).clamp(0.0, 1.0);
+    let t = [tint.r() as f32, tint.g() as f32, tint.b() as f32, blend];
+    rasterize_svg_recolored_by(svg_text, w, h, mode, |_, _| t)
+}
+
+/// [`rasterize_svg_recolored`] with the tint given per pixel, `tint_at(x, y)` as its red,
+/// green and blue (0-255) and how much of it to blend in (0-1): a gradient across the picture.
+pub(crate) fn rasterize_svg_recolored_by(
+    svg_text: &str,
+    w: u32,
+    h: u32,
+    mode: &str,
+    tint_at: impl Fn(usize, usize) -> [f32; 4],
+) -> Option<egui::ColorImage> {
     let opt = usvg::Options::default();
     let tree = usvg::Tree::from_str(svg_text, &opt).ok()?;
 
@@ -3503,17 +3517,16 @@ pub(crate) fn rasterize_svg_recolored(
 
     // Recolor in place. tiny_skia stores premultiplied RGBA; we work in
     // straight-alpha space then re-premultiply on write.
-    let blend = (tint.a() as f32 / 255.0).clamp(0.0, 1.0);
-    let tr = tint.r() as f32;
-    let tg = tint.g() as f32;
-    let tb = tint.b() as f32;
+    let width = w as usize;
     let pixels = pixmap.pixels_mut();
-    if blend > 0.0 {
+    {
         match mode {
             "additive" => {
-                for px in pixels.iter_mut() {
+                for (i, px) in pixels.iter_mut().enumerate() {
                     let a = px.alpha() as f32;
                     if a == 0.0 { continue; }
+                    let [tr, tg, tb, blend] = tint_at(i % width, i / width);
+                    if blend <= 0.0 { continue; }
                     // Un-premultiply.
                     let r = (px.red()   as f32) / a * 255.0;
                     let g = (px.green() as f32) / a * 255.0;
@@ -3533,9 +3546,11 @@ pub(crate) fn rasterize_svg_recolored(
             }
             _ => {
                 // Override: lerp original RGB toward tint RGB by `blend`.
-                for px in pixels.iter_mut() {
+                for (i, px) in pixels.iter_mut().enumerate() {
                     let a = px.alpha() as f32;
                     if a == 0.0 { continue; }
+                    let [tr, tg, tb, blend] = tint_at(i % width, i / width);
+                    if blend <= 0.0 { continue; }
                     let r = (px.red()   as f32) / a * 255.0;
                     let g = (px.green() as f32) / a * 255.0;
                     let b = (px.blue()  as f32) / a * 255.0;

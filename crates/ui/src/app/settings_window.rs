@@ -64,19 +64,11 @@ impl FlexInputApp {
     pub(crate) fn gamepad_shortcut_row(&mut self, ui: &mut egui::Ui, label: &str,
         target: crate::gamepad_nav::ChordTarget) -> bool
     {
-        use crate::gamepad_nav::ChordTarget;
         let mut changed = false;
         let learning = self.gamepad_nav.chord_learn == Some(target);
         // Snapshot the assigned combo as an owned value so no borrow of
         // self.settings is held across the closure (which mutates self).
-        let combo_now: Vec<String> = match target {
-            ChordTarget::SeeThrough    => self.settings.seethrough_chord.clone(),
-            ChordTarget::Panic         => self.settings.panic_chord.clone(),
-            ChordTarget::Overlay       => self.settings.overlay_chord.clone(),
-            ChordTarget::Pin           => self.settings.pin_chord.clone(),
-            ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.clone(),
-            ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord.clone(),
-        }.unwrap_or_default();
+        let combo_now: Vec<String> = self.settings.chord(target).clone().unwrap_or_default();
         let has_assigned = !combo_now.is_empty();
         // A single-button shortcut (a standalone Guide/Capture/Mic) may NOT use
         // "on press": the same button is meant to also be combinable in other
@@ -101,29 +93,19 @@ impl FlexInputApp {
             if has_assigned
                 && ui.small_button("✕").on_hover_text("Clear shortcut").clicked()
             {
-                match target {
-                    ChordTarget::SeeThrough    => self.settings.seethrough_chord = None,
-                    ChordTarget::Panic         => self.settings.panic_chord = None,
-                    ChordTarget::Overlay       => self.settings.overlay_chord = None,
-                    ChordTarget::Pin           => self.settings.pin_chord = None,
-                    ChordTarget::ConfigOverlay => self.settings.config_overlay_chord = None,
-                    ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord = None,
-                }
+                *self.settings.chord_mut(target) = None;
                 if learning { self.gamepad_nav.chord_learn = None; }
                 changed = true;
             }
 
             // ── Press mode + time gap (mirrors the remapper card controls) ──
+            // The layout-tab buttons have neither: always on press.
+            if target.in_app() {
+                return;
+            }
             use crate::gamepad_nav::{SHORTCUT_PRESS_MODES, shortcut_press_mode_label,
                 shortcut_press_mode_glyph};
-            let mut mode_now = match target {
-                ChordTarget::SeeThrough    => self.settings.seethrough_chord_mode.clone(),
-                ChordTarget::Panic         => self.settings.panic_chord_mode.clone(),
-                ChordTarget::Overlay       => self.settings.overlay_chord_mode.clone(),
-                ChordTarget::Pin           => self.settings.pin_chord_mode.clone(),
-                ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_mode.clone(),
-                ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_mode.clone(),
-            };
+            let Some(mut mode_now) = self.settings.chord_mode_mut(target).map(|m| m.clone()) else { return };
             // Single-button shortcuts can't be "on press" — migrate a stored
             // "down" to "long" so the value shown (and persisted below) is valid.
             if is_single && mode_now == "down" {
@@ -145,37 +127,16 @@ impl FlexInputApp {
                         }
                     }
                 });
-            let apply_mode = |s: &mut settings::AppSettings, m: String| match target {
-                ChordTarget::SeeThrough    => s.seethrough_chord_mode = m,
-                ChordTarget::Panic         => s.panic_chord_mode = m,
-                ChordTarget::Overlay       => s.overlay_chord_mode = m,
-                ChordTarget::Pin           => s.pin_chord_mode = m,
-                ChordTarget::ConfigOverlay => s.config_overlay_chord_mode = m,
-                ChordTarget::PhaseOverlay  => s.phase_overlay_chord_mode = m,
-            };
-            let prev_mode = match target {
-                ChordTarget::SeeThrough    => &self.settings.seethrough_chord_mode,
-                ChordTarget::Panic         => &self.settings.panic_chord_mode,
-                ChordTarget::Overlay       => &self.settings.overlay_chord_mode,
-                ChordTarget::Pin           => &self.settings.pin_chord_mode,
-                ChordTarget::ConfigOverlay => &self.settings.config_overlay_chord_mode,
-                ChordTarget::PhaseOverlay  => &self.settings.phase_overlay_chord_mode,
-            };
-            if *prev_mode != mode_now {
-                apply_mode(&mut self.settings, mode_now.clone());
-                changed = true;
+            if let Some(m) = self.settings.chord_mode_mut(target) {
+                if *m != mode_now {
+                    *m = mode_now.clone();
+                    changed = true;
+                }
             }
 
             // Time gap applies to long / double (mirrors remapper `window_ms`).
             let gap_applies = mode_now != "down";
-            let mut gap_ms = match target {
-                ChordTarget::SeeThrough    => self.settings.seethrough_chord_gap_ms,
-                ChordTarget::Panic         => self.settings.panic_chord_gap_ms,
-                ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms,
-                ChordTarget::Pin           => self.settings.pin_chord_gap_ms,
-                ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms,
-                ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_gap_ms,
-            };
+            let Some(mut gap_ms) = self.settings.chord_gap_ms_mut(target).map(|g| *g) else { return };
             ui.add_enabled_ui(gap_applies, |ui| {
                 let resp = ui.add(
                     egui::DragValue::new(&mut gap_ms)
@@ -183,13 +144,8 @@ impl FlexInputApp {
                         .custom_formatter(|n, _| format!("{n:.0} ms")),
                 ).on_hover_text("Long-press hold time / double-tap max gap.");
                 if resp.changed() {
-                    match target {
-                        ChordTarget::SeeThrough    => self.settings.seethrough_chord_gap_ms = gap_ms,
-                        ChordTarget::Panic         => self.settings.panic_chord_gap_ms = gap_ms,
-                        ChordTarget::Overlay       => self.settings.overlay_chord_gap_ms = gap_ms,
-                        ChordTarget::Pin           => self.settings.pin_chord_gap_ms = gap_ms,
-                        ChordTarget::ConfigOverlay => self.settings.config_overlay_chord_gap_ms = gap_ms,
-                        ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord_gap_ms = gap_ms,
+                    if let Some(g) = self.settings.chord_gap_ms_mut(target) {
+                        *g = gap_ms;
                     }
                     changed = true;
                 }
@@ -1181,6 +1137,22 @@ impl FlexInputApp {
             *dirty = true;
         }
         if self.gamepad_shortcut_row(ui, "Pin (always-on-top)", crate::gamepad_nav::ChordTarget::Pin) {
+            *dirty = true;
+        }
+        if self.gamepad_shortcut_row(ui, "Previous patch tab", crate::gamepad_nav::ChordTarget::PrevTab) {
+            *dirty = true;
+        }
+        if self.gamepad_shortcut_row(ui, "Next patch tab", crate::gamepad_nav::ChordTarget::NextTab) {
+            *dirty = true;
+        }
+        settings_subheading(ui, "Layout tabs");
+        ui.label(egui::RichText::new(
+            "Read by FlexInput's own gamepad navigation, on press. In a layout without tabs they \
+             switch the patch tabs.").small().weak());
+        if self.gamepad_shortcut_row(ui, "Previous layout tab", crate::gamepad_nav::ChordTarget::LayoutTabPrev) {
+            *dirty = true;
+        }
+        if self.gamepad_shortcut_row(ui, "Next layout tab", crate::gamepad_nav::ChordTarget::LayoutTabNext) {
             *dirty = true;
         }
         settings_subheading(ui, "Behavior");

@@ -1117,18 +1117,32 @@ pub(crate) fn compute_gyro_3dof(
     let mut final_x = final_x;
     let mut final_y = final_y;
     let edge = edge_cfg(params);
-    match (pose, &edge) {
-        (Some(q), Some(cfg)) if family == "pointer" => {
+    let deflection = match (orient_now, pose) {
+        // Orient: where the pad's nose is against the reference - right of the heading a
+        // Reset made zero, up from level - as the preview's pad and pointer show it. It
+        // went by the Orientation output, which measures from the pad as it was at the
+        // Reset: where a Reset wasn't level, or the accelerometer read level wrong, the
+        // edge came at a pitch the preview didn't show it at.
+        (Some((heading, elevation, _)), _) => Some(glam::Vec2::new(
+            wrap180(heading - state.aux_f32[ORIENT_AUX + ORIENT_CAMERA_LEN]) * inv("inv_yaw"),
+            elevation * inv("inv_pitch"),
+        )),
+        (None, Some(q)) => {
             let a = pose_angles(q);
             // The computed pose already integrates with the inv_* toggles (and
             // the 3D rot × scale); a device's is physical, so it takes them here.
-            let d = if device_q.is_some() {
+            Some(if device_q.is_some() {
                 let x = if axis == "pitch_roll" { a.z * inv("inv_roll") } else { a.x };
                 glam::Vec2::new(x * inv("inv_yaw"), a.y * inv("inv_pitch"))
             } else {
                 let x = if axis == "pitch_roll" { a.z * inv("inv_yaw") } else { a.x };
                 glam::Vec2::new(x, a.y) / orient_disp_scale.abs().max(1e-3)
-            };
+            })
+        }
+        (None, None) => None,
+    };
+    match (deflection, &edge) {
+        (Some(d), Some(cfg)) if family == "pointer" => {
             let e = edge_turn(&mut state.aux_f32[21..30], d, dt, cfg);
             // Out in the X/Y outputs' units: ±1 == ±GYRO_REF_DPS, with the
             // device's gyro multiplier on top, as the gyro itself carries it.
@@ -2170,6 +2184,53 @@ mod aim_tests {
         let at = pad.aim();
         pad.hold_still(3.0);
         assert!(near(pad.aim(), at, 0.01), "a still pad's pointer crept: {at:?} -> {:?}", pad.aim());
+    }
+
+    // Up past the heading's cap (75°), turned a quarter about the world's up and back down:
+    // as the pad comes down the camera gives back what the cap held back, and ends where
+    // the nose is - it came down 6° short from 80° up and 12° from 85°. Only while the pad
+    // moves: held still after, the pointer stays put.
+    #[test]
+    fn orient_gives_back_what_the_cap_held_near_the_top() {
+        for up in [80.0_f32, 85.0] {
+            let mut pad = Pad::new(&[("axis", json!("orient"))]);
+            pad.turn(NOSE_UP, up, 200.0);
+            pad.turn_world(90.0, 200.0);
+            pad.turn(NOSE_UP, -up, 200.0);
+            let nose = pad.nose();
+            assert!(near(pad.aim(), nose, 1.5), "{up}° up: the aim {:?}, the nose {nose:?}", pad.aim());
+            let at = pad.aim();
+            pad.hold_still(2.0);
+            assert!(near(pad.aim(), at, 0.01), "a still pad's pointer moved: {at:?} -> {:?}", pad.aim());
+        }
+    }
+
+    // Orient's Edge turn goes by the nose as the preview shows it - up from level, right of
+    // the heading a Reset made zero - not by the Orientation output, which measures from the
+    // pad as it was at the Reset. Reset pointing 20° down, the nose 20° up is inside a 30°
+    // zone (the output had it 40° past the Reset, and turned), 40° up past it.
+    #[test]
+    fn orient_edge_turn_goes_by_the_nose_as_shown() {
+        let mut pad = Pad::new(&[
+            ("axis", json!("orient")),
+            ("edge_mode", json!("ramp")),
+            ("edge_zone_deg", json!(30.0)),
+            ("edge_blend_deg", json!(0.0)),
+            ("edge_ramp_deg", json!(10.0)),
+        ]);
+        let y = |pad: &Pad| match pad.out[2] {
+            Some(Signal::Float(v)) => v,
+            ref other => panic!("y: {other:?}"),
+        };
+        pad.turn(NOSE_UP, -20.0, 200.0);
+        pad.tick(Vec3::ZERO, true);
+        pad.hold_still(0.3);
+        pad.turn(NOSE_UP, 40.0, 200.0);
+        pad.hold_still(0.3);
+        assert!(y(&pad).abs() < 1e-4, "20° up is inside the zone: {}", y(&pad));
+        pad.turn(NOSE_UP, 20.0, 200.0);
+        pad.hold_still(0.3);
+        assert!(y(&pad) > 1e-3, "40° up is past it: {}", y(&pad));
     }
 
     // Held upright like a wheel and turned, Pitch+Yaw steering knows where

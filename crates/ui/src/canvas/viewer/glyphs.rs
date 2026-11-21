@@ -18,6 +18,12 @@ const SAVE: &str = include_str!("../../../../../app/assets/save.svg");
 const LOAD: &str = include_str!("../../../../../app/assets/load.svg");
 const RESET: &str = include_str!("../../../../../app/assets/reset.svg");
 const ABS: &str = include_str!("../../../../../app/assets/modules/ABS.svg");
+const ADD_TEXT: &str = include_str!("../../../../../app/assets/layout/add_text.svg");
+const ADD_RECT: &str = include_str!("../../../../../app/assets/layout/add_rect.svg");
+const ADD_ELLIPSE: &str = include_str!("../../../../../app/assets/layout/add_ellipse.svg");
+const ADD_LINE: &str = include_str!("../../../../../app/assets/layout/add_line.svg");
+const ADD_PICTURE: &str = include_str!("../../../../../app/assets/layout/add_picture.svg");
+const ANCHORS: &str = include_str!("../../../../../app/assets/layout/anchors.svg");
 
 /// A switch mark. Named for what the shape stands for, not for what it looks like.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -39,6 +45,14 @@ pub(crate) enum Glyph {
     Reset,
     /// Magnitude: a curve's Abs switch wears the Abs module's own mark.
     Abs,
+    /// What the layout editor adds: a text, a rectangle, an ellipse, a line, a picture.
+    AddText,
+    AddRect,
+    AddEllipse,
+    AddLine,
+    AddPicture,
+    /// What each element of an overlay holds on to.
+    Anchors,
 }
 
 impl Glyph {
@@ -53,6 +67,12 @@ impl Glyph {
             Glyph::Load => LOAD,
             Glyph::Reset => RESET,
             Glyph::Abs => ABS,
+            Glyph::AddText => ADD_TEXT,
+            Glyph::AddRect => ADD_RECT,
+            Glyph::AddEllipse => ADD_ELLIPSE,
+            Glyph::AddLine => ADD_LINE,
+            Glyph::AddPicture => ADD_PICTURE,
+            Glyph::Anchors => ANCHORS,
         }
     }
 
@@ -67,6 +87,8 @@ impl Glyph {
             Glyph::Magnet => 48.0,
             Glyph::Hold | Glyph::Bounce | Glyph::Loop | Glyph::Stopwatch => 34.0,
             Glyph::Save | Glyph::Load | Glyph::Reset | Glyph::Abs => 34.0,
+            Glyph::AddText | Glyph::AddRect | Glyph::AddEllipse | Glyph::AddLine | Glyph::AddPicture => 34.0,
+            Glyph::Anchors => 34.0,
         }
     }
 }
@@ -183,7 +205,7 @@ fn rasterize(glyph: Glyph, px: u32) -> Option<egui::ColorImage> {
 mod tests {
     use super::*;
 
-    const ALL: [Glyph; 9] = [
+    const ALL: [Glyph; 15] = [
         Glyph::Abs,
         Glyph::Magnet,
         Glyph::Hold,
@@ -193,6 +215,12 @@ mod tests {
         Glyph::Save,
         Glyph::Load,
         Glyph::Reset,
+        Glyph::AddText,
+        Glyph::AddRect,
+        Glyph::AddEllipse,
+        Glyph::AddLine,
+        Glyph::AddPicture,
+        Glyph::Anchors,
     ];
 
     // A drawing edited to be bigger than its window would be cut off at the button's edge,

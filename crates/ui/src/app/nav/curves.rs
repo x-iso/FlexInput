@@ -449,9 +449,34 @@ impl FlexInputApp {
     pub(crate) fn nav_curve_geom(&self, ctx: &egui::Context, inner: egui_snarl::NodeId)
         -> Option<(egui::Rect, f32, f32, f32, f32)>
     {
-        let g: (u64, egui::Rect, f32, f32, f32, f32) =
-            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_curve_geom", inner.0))))?;
+        // The graph the pad works on: the config overlay's pin while the overlay has the pad
+        // on this curve - the same curve drawn on the Easy body behind it is another graph,
+        // where the cursor's dots landed - else the main window's.
+        let on_overlay = crate::config_overlay::config_overlay_visible(ctx)
+            && self.gamepad_nav.config_nav_sel.is_some();
+        let overlay = crate::canvas::viewer::nav_curve_geom_id(inner.0, crate::canvas::viewer::config_overlay_viewport());
+        let main = crate::canvas::viewer::nav_curve_geom_id(inner.0, egui::ViewportId::ROOT);
+        let g: (u64, egui::Rect, f32, f32, f32, f32) = ctx.data(|d| {
+            let overlay = on_overlay.then(|| d.get_temp(overlay)).flatten();
+            overlay.or_else(|| d.get_temp(main))
+        })?;
         Some((g.1, g.2, g.3, g.4, g.5))
+    }
+
+    /// Where dot `idx` of the curve is on the screen, from the geometry its body published
+    /// last frame.
+    pub(crate) fn nav_curve_dot_screen(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, idx: usize) -> Option<egui::Pos2>
+    {
+        let (rect, x_lo, x_hi, y_lo, y_hi) = self.nav_curve_geom(ctx, inner)?;
+        let (_, pts) = self.nav_curve_points(outer_id)?;
+        let p = pts.get(idx)?;
+        let sx = (x_hi - x_lo).abs().max(f32::EPSILON) * (x_hi - x_lo).signum();
+        let sy = (y_hi - y_lo).abs().max(f32::EPSILON) * (y_hi - y_lo).signum();
+        Some(egui::pos2(
+            rect.left() + (p[0] - x_lo) / sx * rect.width(),
+            rect.bottom() - (p[1] - y_lo) / sy * rect.height(),
+        ))
     }
 
     /// Publish the highlighted dot + editing flag so the curve body rings it.

@@ -102,6 +102,14 @@ impl FlexInputApp {
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::ConfigOverlay }, suffix: "" },
             GpSettingRow { label: "Shortcut: Pin".into(),
                 kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::Pin }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Previous patch tab".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::PrevTab }, suffix: "" },
+            GpSettingRow { label: "Shortcut: Next patch tab".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::NextTab }, suffix: "" },
+            GpSettingRow { label: "Buttons: Previous layout tab".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::LayoutTabPrev }, suffix: "" },
+            GpSettingRow { label: "Buttons: Next layout tab".into(),
+                kind: ChordLearn { target: crate::gamepad_nav::ChordTarget::LayoutTabNext }, suffix: "" },
         ];
         // Display sync follows Output rate; its own rows only while it's on.
         let mut at = 2;
@@ -321,15 +329,7 @@ impl FlexInputApp {
             // North → clear the assigned binding on a ChordLearn row.
             if nav.is_rising("btn_north") {
                 if let GpSettingKind::ChordLearn { target } = &row.kind {
-                    use crate::gamepad_nav::ChordTarget;
-                    match target {
-                        ChordTarget::SeeThrough    => self.settings.seethrough_chord = None,
-                        ChordTarget::Panic         => self.settings.panic_chord = None,
-                        ChordTarget::Overlay       => self.settings.overlay_chord = None,
-                        ChordTarget::Pin           => self.settings.pin_chord = None,
-                        ChordTarget::ConfigOverlay => self.settings.config_overlay_chord = None,
-                        ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord = None,
-                    }
+                    *self.settings.chord_mut(*target) = None;
                     self.settings_dirty = true;
                 }
             }
@@ -454,7 +454,6 @@ impl FlexInputApp {
                                 .unwrap_or_else(|| format!("?{:.0}", v))
                         }
                         GpSettingKind::ChordLearn { target } => {
-                            use crate::gamepad_nav::ChordTarget;
                             if self.gamepad_nav.chord_learn == Some(*target) {
                                 // Learning: live listening state. Show the combo
                                 // captured so far as icons too.
@@ -465,14 +464,7 @@ impl FlexInputApp {
                                     String::new()
                                 }
                             } else {
-                                let assigned = match target {
-                                    ChordTarget::SeeThrough => self.settings.seethrough_chord.as_ref(),
-                                    ChordTarget::Panic => self.settings.panic_chord.as_ref(),
-                                    ChordTarget::Overlay => self.settings.overlay_chord.as_ref(),
-                                    ChordTarget::Pin => self.settings.pin_chord.as_ref(),
-                                    ChordTarget::ConfigOverlay => self.settings.config_overlay_chord.as_ref(),
-                                    ChordTarget::PhaseOverlay  => self.settings.phase_overlay_chord.as_ref(),
-                                };
+                                let assigned = self.settings.chord(*target).as_ref();
                                 match assigned {
                                     Some(c) if !c.is_empty() => { combo_icons = Some(c.clone()); String::new() }
                                     _ => "(none)".to_string(),

@@ -46,6 +46,7 @@ impl FlexInputApp {
             let accent = crate::widgets::NavHighlightStyle::of(ctx).accent;
             let mut painter = ctx.layer_painter(crate::widgets::nav_glow_layer(ctx,
                 egui::Order::Foreground, egui::Id::new("gp_nav_left_glow"), host));
+            painter.multiply_opacity(crate::widgets::nav_highlight_alpha(ctx));
             // Partly scrolled out: crop at the list's edge rather than draw the
             // missing part over the header or the output cards.
             if !t.clip.contains_rect(t.rect) {

@@ -66,13 +66,27 @@ pub(crate) fn draw_requested_field_hud(
     if let Some((_, fr)) = field {
         FlexInputApp::paint_field_glow_ring(ctx, fr, accent, host, view);
     }
+    paint_field_label_pill(ctx, egui::Id::new(("gp_nav_field_hud", outer.0)), item, &req.label, accent, host, view);
+}
+
+/// The pill naming the focused field (its label and value) just above `item` - the widget,
+/// or the part of a whole-module widget it's in - as far as `view` allows. `host` is the
+/// layer the widget renders in: a window over it covers the pill too.
+pub(crate) fn paint_field_label_pill(
+    ctx: &egui::Context,
+    id: egui::Id,
+    item: egui::Rect,
+    label: &str,
+    accent: egui::Color32,
+    host: egui::LayerId,
+    view: egui::Rect,
+) {
     if !item.intersect(view).is_positive() {
         return;
     }
-    let painter = crate::widgets::nav_highlight_painter(
-        ctx, egui::Id::new(("gp_nav_field_hud", outer.0)), host, view);
+    let painter = crate::widgets::nav_highlight_painter(ctx, id, host, view);
     let font = crate::settings::ui_font(12.0);
-    let galley = painter.layout_no_wrap(req.label.clone(), font.clone(), egui::Color32::WHITE);
+    let galley = painter.layout_no_wrap(label.to_string(), font.clone(), egui::Color32::WHITE);
     let pad = egui::vec2(6.0, 3.0);
     let size = galley.size() + pad * 2.0;
     // Just above the widget, as far as the view allows.
@@ -81,7 +95,21 @@ pub(crate) fn draw_requested_field_hud(
         egui::pos2(item.center().x, bottom - size.y * 0.5), size);
     painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(20, 20, 24, 230));
     painter.rect_stroke(bg, 4.0, egui::Stroke::new(1.0_f32, accent), egui::StrokeKind::Outside);
-    painter.text(bg.center(), egui::Align2::CENTER_CENTER, req.label, font, egui::Color32::WHITE);
+    painter.text(bg.center(), egui::Align2::CENTER_CENTER, label, font, egui::Color32::WHITE);
+}
+
+/// Ctx-data slot of the focused field's label while the config overlay has the pad:
+/// `(nav pass, label)`, for the overlay's viewport to draw (`draw_config_field_glow`).
+pub(crate) fn config_field_hud_id() -> egui::Id {
+    egui::Id::new("gp_nav_config_field_hud")
+}
+
+/// Hand the config overlay's viewport the focused field's label, stamped with this pass.
+pub(crate) fn publish_config_field_label(ctx: &egui::Context, label: String) {
+    // Read before `data_mut` takes the context: asking for it inside deadlocked the app the
+    // moment a field was edited on the overlay.
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(config_field_hud_id(), (pass, label)));
 }
 
 impl FlexInputApp {
@@ -499,12 +527,6 @@ impl FlexInputApp {
     pub(crate) fn nav_publish_field_hud(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId,
         inner: egui_snarl::NodeId, fields: &[NavFieldDef], idx: usize, fine: bool)
     {
-        // While the config overlay is up it draws its OWN field glow + HUD in its
-        // viewport (`draw_config_field_glow`); drawing here too would double the
-        // ring as a ghost on the main window when it sits in front of the overlay.
-        if crate::config_overlay::config_overlay_visible(ctx) {
-            return;
-        }
         let def = &fields[idx];
         // Read the focused field's current value as a string for the HUD.
         let val_str = match &def.field {
@@ -541,6 +563,13 @@ impl FlexInputApp {
         } else {
             format!("{} = {}{}", def.label, val_str, if fine { "  (fine)" } else { "" })
         };
+        // While the config overlay is up it draws its OWN field glow + label in its
+        // viewport (`draw_config_field_glow`); drawing here too would double the
+        // ring as a ghost on the main window when it sits in front of the overlay.
+        if crate::config_overlay::config_overlay_visible(ctx) {
+            publish_config_field_label(ctx, label);
+            return;
+        }
         // The field's rects are keyed by (inner, element): a single inner node
         // exposes several element rows, each rendered separately.
         let element = self.nav_selected_element(outer_id)
@@ -594,25 +623,6 @@ impl FlexInputApp {
         sp.get_node(inner)?.params.get(key)?.as_bool()
     }
 
-    /// Hit-test the RS/gyro cursor against the sub-patch item screen rects
-    /// published by `render_subpatch_body` last frame. Returns the index of the
-    /// topmost item under the cursor (last in paint order wins), or None.
-    pub(crate) fn nav_cursor_hit_item(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> Option<usize> {
-        let cursor = self.gamepad_nav.cursor_pos;
-        let rects: Option<(u64, Vec<(usize, egui::Rect)>)> =
-            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0))));
-        let (_pass, rects) = rects?;
-        // Only consider items that are actually interactable — skip text titles,
-        // graphs, svgs and other decorative elements the cursor passes over.
-        let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        rects
-            .iter()
-            .rev()
-            .find(|(i, r)| r.contains(cursor) && Self::sp_item_is_editable(sp, *i))
-            .map(|(i, _)| *i)
-    }
-
     /// True if sub-patch item `idx` is a gamepad-editable widget (knob/constant/
     /// dropdown/switch/curve/remapper), not a decorative element. Only the
     /// `"curve"` element of a response curve is selectable (its scale/range/grid
@@ -623,10 +633,168 @@ impl FlexInputApp {
     ) -> bool {
         use crate::canvas::node::LayoutItem;
         let Some(LayoutItem::Module(m)) = sp.items.get(idx) else { return false; };
+        // On another tab of the layout than the one showing: not there to reach.
+        if !sp.items[idx].on_tab(sp.active_tab, sp.layout_tabs.len()) {
+            return false;
+        }
         let inner = egui_snarl::NodeId(m.inner_node_id);
         let Some(mid) = sp.snarl.get_node(inner)
             .map(|n| crate::canvas::viewer::curve_ui_module_id(n).to_string()) else { return false; };
-        Self::elem_is_nav_target(&mid, &m.element_id)
+        Self::pin_is_nav_target(&mid, &m.element_id)
+    }
+
+    /// Whether a pin of `elem` of a `mid` module is one the pad stops on: a widget it has a
+    /// handler for, or a module pinned whole with parts to work in. The Easy body and the
+    /// config overlay walk the same pins.
+    pub(crate) fn pin_is_nav_target(mid: &str, elem: &str) -> bool {
+        Self::elem_is_nav_target(mid, elem) || (elem == "whole_module" && Self::module_widget_navigable(mid))
+    }
+
+    /// Whether a module pinned whole has parts the pad can work in: everything but what only
+    /// shows - the scopes and readouts, a note, a picture.
+    pub(crate) fn module_widget_navigable(mid: &str) -> bool {
+        !mid.starts_with("display.") && !matches!(mid, "module.label" | "module.svg")
+    }
+
+    /// The stops of a module pinned whole (`mid`, pinned as `elem`, its node `inner`) as its
+    /// widget drew it in `viewport` last pass, on the screen: each field of each row the pad
+    /// works in, one by one, and each other part whole - a graph, a nested editor (the JSM
+    /// editor keeps the pad to itself once entered), a row whose fields aren't known. `None`
+    /// unless the pin is a module pinned whole the pad walks into: one with a walk of its own
+    /// (the mapping modules' card views) is a single stop, entered as before.
+    pub(crate) fn nav_widget_stops(
+        ctx: &egui::Context,
+        mid: &str,
+        elem: &str,
+        inner: usize,
+        viewport: egui::ViewportId,
+    ) -> Option<Vec<WidgetStop>> {
+        if elem != "whole_module" || Self::elem_is_nav_target(mid, elem) || !Self::module_widget_navigable(mid) {
+            return None;
+        }
+        // Stamped with the nav pass, so a widget on the config overlay - a viewport of its own,
+        // counting its own passes - answers too.
+        let (pass, parts): (u64, Vec<crate::canvas::viewer::ModulePart>) =
+            ctx.data(|d| d.get_temp(crate::canvas::viewer::module_parts_id(inner, viewport)))?;
+        if pass + 2 < crate::widgets::nav_pass(ctx) {
+            return None;
+        }
+        let mut stops = Vec::new();
+        for part in parts {
+            if !Self::elem_is_nav_target(mid, &part.element) {
+                continue;
+            }
+            let field_row = Self::elem_has_fields(mid, &part.element) && !(mid == "module.jsm" && part.element == "editor");
+            let fields: Vec<(usize, egui::Rect)> = part.fields.iter().copied().enumerate()
+                .filter(|(_, r)| field_row && r.is_finite() && r.is_positive())
+                .collect();
+            // A row whose every field is greyed out (published, none drawn live) is passed by.
+            if field_row && fields.is_empty() && !part.fields.is_empty() {
+                continue;
+            }
+            if fields.is_empty() {
+                stops.push((part.element, None, part.rect));
+            } else {
+                stops.extend(fields.into_iter().map(|(k, r)| (part.element.clone(), Some(k), r)));
+            }
+        }
+        (!stops.is_empty()).then_some(stops)
+    }
+
+    /// The stops of the Easy body's walk, on the screen: each widget the pad stops on - and for
+    /// a module pinned whole, its own stops instead (`nav_widget_stops`) - as `(item, part,
+    /// field, rect)`.
+    pub(crate) fn nav_easy_stops(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> Vec<EasyStop> {
+        let rects: Option<(u64, Vec<(usize, egui::Rect)>)> =
+            ctx.data(|d| d.get_temp(egui::Id::new(("gp_nav_item_rects", outer_id.0))));
+        let Some((_, rects)) = rects else { return Vec::new() };
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let Some(sp) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref()) else { return Vec::new() };
+        let mut out = Vec::new();
+        for (i, r) in rects {
+            if !Self::sp_item_is_editable(sp, i) {
+                continue;
+            }
+            let inner = match sp.items.get(i) {
+                Some(crate::canvas::node::LayoutItem::Module(m)) => m.inner_node_id,
+                _ => continue,
+            };
+            let stops = sp_item_element(sp, i)
+                .and_then(|(mid, elem)| Self::nav_widget_stops(ctx, &mid, &elem, inner, egui::ViewportId::ROOT));
+            match stops {
+                Some(stops) => out.extend(stops.into_iter().map(|(p, f, r)| (i, Some(p), f, r))),
+                None => out.push((i, None, None, r)),
+            }
+        }
+        out
+    }
+
+    /// Which of `stops` the Easy body's walk is on: its selection, and on a module pinned
+    /// whole its stop there - or the first of that item's, where its stop is gone.
+    pub(crate) fn nav_easy_stop_at(&self, outer_id: egui_snarl::NodeId, stops: &[EasyStop]) -> Option<usize> {
+        let canvas = &self.tabs[self.active_tab].canvas;
+        let sel = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?.selected_item?;
+        let (part, field) = if self.gamepad_nav.module_part_item == Some(sel) {
+            (self.gamepad_nav.module_part.clone(), self.gamepad_nav.module_field)
+        } else {
+            (None, None)
+        };
+        stops.iter().position(|s| s.0 == sel && s.1 == part && s.2 == field)
+            .or_else(|| stops.iter().position(|s| s.0 == sel))
+    }
+
+    /// Put the Easy body's walk on `stop`: its item selected, and on a module pinned whole its
+    /// part and field.
+    pub(crate) fn nav_select_easy_stop(&mut self, outer_id: egui_snarl::NodeId, stop: &EasyStop) {
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        if let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
+            sp.selected_item = Some(stop.0);
+            sp.selected_items = vec![stop.0];
+        }
+        self.gamepad_nav.module_part = stop.1.clone();
+        self.gamepad_nav.module_field = stop.2;
+        self.gamepad_nav.module_part_item = stop.1.as_ref().map(|_| stop.0);
+    }
+
+    /// The stop of the Easy body's walk under the RS / gyro cursor: the smallest one it's in.
+    pub(crate) fn nav_cursor_hit_stop(&self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> Option<EasyStop> {
+        let cursor = self.gamepad_nav.cursor_pos;
+        self.nav_easy_stops(ctx, outer_id)
+            .into_iter()
+            .filter(|s| s.3.contains(cursor))
+            .min_by(|a, b| a.3.area().total_cmp(&b.3.area()))
+    }
+
+    /// On a section heading of a module pinned whole (the walk stopped on it): fold or unfold
+    /// the section, as a click on it does. `false` when the walk isn't on one.
+    pub(crate) fn nav_flip_section_fold(&mut self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) -> bool {
+        let Some((_, part)) = self.nav_selected_element(outer_id) else { return false };
+        let Some(key) = part.strip_prefix(crate::canvas::viewer::WIDGET_FOLD_PREFIX) else { return false };
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
+        let open: Option<bool> = ctx.data(|d| d.get_temp(crate::canvas::viewer::section_open_id(inner.0, key)));
+        let Some(open) = open else { return false };
+        let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+        // The section's param says whether it's folded: an open one folds.
+        self.set_subpatch_param_bool(outer_id, inner, &format!("fold_{key}"), open);
+        let canvas = &mut self.tabs[self.active_tab].canvas;
+        canvas.commit_undo_if_changed(base);
+        canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+        ctx.request_repaint();
+        true
+    }
+
+    /// Flip the Toggle field `k` of the selected element - the walk stopped on it in a module
+    /// pinned whole, where South flips it straight away rather than entering the row. `false`
+    /// when that field isn't a Toggle.
+    pub(crate) fn nav_flip_toggle_field(&mut self, outer_id: egui_snarl::NodeId, k: usize) -> bool {
+        let fields = self.nav_element_fields(outer_id);
+        let Some(NavFieldDef { field: NavField::Toggle { key }, .. }) = fields.get(k) else { return false };
+        let Some(inner) = self.nav_selected_inner_node(outer_id) else { return false };
+        let base = self.tabs[self.active_tab].canvas.snapshot_for_undo();
+        let cur = self.get_subpatch_param_bool(outer_id, inner, key).unwrap_or(false);
+        self.set_subpatch_param_bool(outer_id, inner, key, !cur);
+        self.tabs[self.active_tab].canvas.commit_undo_if_changed(base);
+        true
     }
 
     /// Pure (module, element) test for "the cursor can target this and the nav
@@ -635,6 +803,8 @@ impl FlexInputApp {
     /// context. Mirrors the arms of `nav_selected_kind`.
     pub(crate) fn elem_is_nav_target(mid: &str, elem: &str) -> bool {
         match (mid, elem) {
+            // A section heading in a module pinned whole: South folds or unfolds it.
+            (_, e) if e.starts_with(crate::canvas::viewer::WIDGET_FOLD_PREFIX) => true,
             // Single-actuation widgets.
             ("module.knob", _) | ("module.constant", _)
             | ("module.dropdown", _) | ("module.switch", _) => true,
@@ -700,6 +870,8 @@ impl FlexInputApp {
             | ("processing.gyro_3dof", "steering_opts")
             | ("processing.gyro_3dof", "roll_mix") | ("processing.gyro_3dof", "hold_offset")
             | ("processing.gyro_3dof", "edge_turn") | ("processing.gyro_3dof", "orient_source")
+            | ("processing.gyro_3dof", "orient_scale") | ("processing.gyro_3dof", "orient_drift")
+            | ("processing.gyro_3dof", "orient_recenter")
             | ("processing.gyro_3dof", "gyro_invert") | ("processing.gyro_3dof", "accel_invert")
             | ("logic.counter", "mode") | ("logic.counter", "range_mode")
             | ("logic.counter", "step") | ("logic.counter", "min_max")
@@ -841,12 +1013,21 @@ impl FlexInputApp {
 
     /// (module_id, element_id) of the selected sub-patch item.
     pub(crate) fn nav_selected_element(&self, outer_id: egui_snarl::NodeId) -> Option<(String, String)> {
-        if let Some((_, mid, elem)) = self.nav_config_override(outer_id) {
-            return Some((mid, elem));
+        let (mid, elem, item) = match self.nav_config_override(outer_id) {
+            Some((_, mid, elem)) => (mid, elem, self.gamepad_nav.config_index),
+            None => {
+                let canvas = &self.tabs[self.active_tab].canvas;
+                let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
+                let (mid, elem) = sp_item_element(sp, sp.selected_item?)?;
+                (mid, elem, sp.selected_item)
+            }
+        };
+        // On a stop of a module pinned whole (on the Easy body or the config overlay): the
+        // widget is that part.
+        match (&self.gamepad_nav.module_part, elem.as_str()) {
+            (Some(part), "whole_module") if self.gamepad_nav.module_part_item == item => Some((mid, part.clone())),
+            _ => Some((mid, elem)),
         }
-        let canvas = &self.tabs[self.active_tab].canvas;
-        let sp = canvas.snarl.get_node(outer_id)?.subpatch.as_ref()?;
-        sp_item_element(sp, sp.selected_item?)
     }
 
     /// Numeric-edit descriptor for the selected element, if it edits a single
@@ -2353,6 +2534,14 @@ pub(crate) fn field_hint(module_id: &str, key: &str) -> Option<&'static str> {
 /// AutoMap curve navigates as the plain curve it runs, as the config overlay's selection does
 /// (`nav_config_override`): under its own id its rows had no fields, so on a layout the pad
 /// reached its graph and none of its rows.
+/// One stop of a module pinned whole: the part its body offers (a graph, a row), the field in
+/// it where the walk stops on a row's fields one by one, and where it is on the screen.
+pub(crate) type WidgetStop = (String, Option<usize>, egui::Rect);
+
+/// One stop of the Easy body's walk: the item, and on a module pinned whole the part and field
+/// (`WidgetStop`), and where it is on the screen.
+pub(crate) type EasyStop = (usize, Option<String>, Option<usize>, egui::Rect);
+
 pub(crate) fn sp_item_element(sp: &crate::canvas::node::UiSubPatch, idx: usize) -> Option<(String, String)> {
     let crate::canvas::node::LayoutItem::Module(m) = sp.items.get(idx)? else { return None };
     let node = sp.snarl.get_node(egui_snarl::NodeId(m.inner_node_id))?;
@@ -2633,6 +2822,15 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
             // its first option).
             ("processing.gyro_3dof", "orient_source") =>
                 vec![f!("3D source", Enum{key:"orient_source",opts:&["auto","computed","device"]})],
+            // The Orientation output's other settings: parts of a module pinned whole only.
+            ("processing.gyro_3dof", "orient_scale") =>
+                vec![f!("Rotation ×", v("orient_scale",0.05,5.0,1.0,Fixed(0.05)))],
+            ("processing.gyro_3dof", "orient_drift") =>
+                vec![f!("Drift fix", v("orient_drift",0.0,1.0,0.0,Fixed(0.05)))],
+            ("processing.gyro_3dof", "orient_recenter") => vec![
+                f!("Auto re-center", Toggle{key:"orient_auto_recenter"}),
+                f!("Still below", v("orient_recenter_thresh",0.0005,0.2,0.005,Decade)),
+            ],
             ("processing.gyro_3dof", "gyro_invert") => vec![
                 f!("yaw", Toggle{key:"inv_yaw"}),
                 f!("pitch", Toggle{key:"inv_pitch"}),

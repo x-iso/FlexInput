@@ -280,6 +280,20 @@ pub(crate) struct NavCurveSnap {
     pub line: bool,
 }
 
+/// Ctx-data slot of a curve graph's geometry for gamepad nav, `(pass, rect on the screen,
+/// x_lo, x_hi, y_lo, y_hi)`, as drawn in `viewport`: the same curve can be on the Easy body
+/// and pinned on the config overlay at once, and the pad works on the one in front of it.
+pub(crate) fn nav_curve_geom_id(node_id: usize, viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::new(("gp_nav_curve_geom", node_id, viewport))
+}
+
+/// Publish a curve graph's geometry for gamepad nav ([`nav_curve_geom_id`]), for the viewport
+/// `ctx` is drawing.
+pub(crate) fn publish_nav_curve_geom(ctx: &egui::Context, node_id: usize, geom: (u64, egui::Rect, f32, f32, f32, f32)) {
+    let id = nav_curve_geom_id(node_id, ctx.viewport_id());
+    ctx.data_mut(|d| d.insert_temp(id, geom));
+}
+
 pub(crate) fn nav_curve_snap_id(node_id: usize) -> egui::Id {
     egui::Id::new(("gp_nav_curve_snap", node_id))
 }
@@ -938,9 +952,7 @@ pub(crate) fn paint_response_curve_graph(
         let to_global = ui.ctx().layer_transform_to_global(ui.layer_id())
             .unwrap_or(egui::emath::TSTransform::IDENTITY);
         let screen_rect = to_global * rect;
-        ui.ctx().data_mut(|d| d.insert_temp(
-            egui::Id::new(("gp_nav_curve_geom", node_id.0)),
-            (pass, screen_rect, x_lo, x_hi, y_lo, y_hi)));
+        crate::canvas::viewer::publish_nav_curve_geom(ui.ctx(), node_id.0, (pass, screen_rect, x_lo, x_hi, y_lo, y_hi));
     }
 
     // Add/remove keep each segment's bias on its own segment (plain Vec

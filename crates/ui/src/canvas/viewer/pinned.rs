@@ -26,6 +26,7 @@ pub(crate) fn render_pinned_element(
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
     pin_style: u8,
+    zoom: f32,
 ) {
     // Stable identity for this pin's natural-size cache: (viewport, outer node,
     // inner node, element) — see `pin_ws_nat_key` for why the viewport.
@@ -42,7 +43,7 @@ pub(crate) fn render_pinned_element(
         inner_id, module_id, element_id, ui, inner_snarl, container_size,
         live_signals, panic_shortcut, automap_parent, outer_snapshot,
         outer_id, is_layout_mode, graph_override, iv_style_override,
-        menu_style_override, pin_style,
+        menu_style_override, pin_style, zoom,
     );
 
     // `applied` is only present when the renderer routed through
@@ -67,6 +68,258 @@ pub(crate) fn render_pinned_element(
     }
 }
 
+/// A whole module pinned as a widget of its own size: its body laid out at the widget's
+/// size, as a canvas lays it out at its frame's - it reflows as the widget is resized
+/// rather than stretching - and cut at the widget's edges. Zoomed (`zoom`, see
+/// [`crate::canvas::node::ExposedModule::zoom`]), it's laid out at the widget's size over the
+/// zoom, on a layer of its own drawn - and clicked - that much smaller or larger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_module_widget(
+    inner_id: NodeId,
+    ui: &mut egui::Ui,
+    inner_snarl: &mut Snarl<NodeData>,
+    container_size: egui::Vec2,
+    live_signals: &std::collections::HashMap<(String, String), Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    automap_parent: Option<&AutomapGlowParent<'_>>,
+    zoom: f32,
+    is_layout_mode: bool,
+) {
+    let Some(node) = inner_snarl.get_node(inner_id) else { return };
+    let module_id = node.module_id.clone();
+    let (n_in, n_out) = (node.inputs.len(), node.outputs.len());
+    let inputs: Vec<egui_snarl::InPin> = (0..n_in).map(|i| inner_snarl.in_pin(InPinId { node: inner_id, input: i })).collect();
+    let outputs: Vec<egui_snarl::OutPin> =
+        (0..n_out).map(|o| inner_snarl.out_pin(egui_snarl::OutPinId { node: inner_id, output: o })).collect();
+    let rect = egui::Rect::from_min_size(ui.max_rect().min, container_size);
+    let range = crate::canvas::node::WIDGET_ZOOM;
+    let zoom = if zoom.is_finite() { zoom.clamp(*range.start(), *range.end()) } else { 1.0 };
+    // The body's own space - the widget's, or zoomed, a layer of its own laid out at the
+    // widget's size over the zoom and mapped onto the widget, its input too. While the layout
+    // is edited the body takes no input, and a layer of its own over the host's would take
+    // the pointer from the layout's handles (egui looks no further than the topmost layer
+    // covering it), so then it's drawn on the host's layer, only its shapes scaled (`visual`).
+    let zoomed = (zoom - 1.0).abs() > 1e-3;
+    let mut visual: Option<egui::emath::TSTransform> = None;
+    let (mut body, body_rect) = if zoomed && is_layout_mode {
+        let t = egui::emath::TSTransform::new(rect.min.to_vec2() * (1.0 - zoom), zoom);
+        let body_rect = egui::Rect::from_min_size(rect.min, container_size / zoom);
+        let mut body = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(body_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min))
+                .id_salt(("fxi_module_widget", inner_id.0)),
+        );
+        let inv = t.inverse();
+        let shown = ui.clip_rect().intersect(rect);
+        body.set_clip_rect(egui::Rect::from_min_max(inv * shown.min, inv * shown.max));
+        visual = Some(t);
+        (body, body_rect)
+    } else if zoomed {
+        let layer = egui::LayerId::new(
+            ui.layer_id().order,
+            egui::Id::new(("fxi_module_widget_layer", pin_host_scope(ui), inner_id.0)),
+        );
+        let parent_to_global = ui.ctx().layer_transform_to_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY);
+        let local = egui::emath::TSTransform::new(rect.min.to_vec2(), zoom);
+        // Before the body draws, so what it publishes on the screen is where it is now.
+        ui.ctx().set_transform_layer(layer, parent_to_global * local);
+        ui.ctx().set_sublayer(ui.layer_id(), layer);
+        let body_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, container_size / zoom);
+        let mut body = ui.new_child(
+            egui::UiBuilder::new()
+                .layer_id(layer)
+                .max_rect(body_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min))
+                .id_salt(("fxi_module_widget", inner_id.0)),
+        );
+        let inv = local.inverse();
+        let host_clip = ui.clip_rect();
+        body.set_clip_rect(body_rect.intersect(egui::Rect::from_min_max(inv * host_clip.min, inv * host_clip.max)));
+        (body, body_rect)
+    } else {
+        let mut body = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min))
+                .id_salt(("fxi_module_widget", inner_id.0)),
+        );
+        body.set_clip_rect(body.clip_rect().intersect(rect));
+        (body, rect)
+    };
+    let body_size = body_rect.size();
+    let cx = super::BodyCtx {
+        // Its own view: what a body keys by its view doesn't follow the canvas's copy.
+        view_salt: egui::Id::new(("fxi_module_widget", inner_id.0)).value(),
+        live_signals,
+        panic_shortcut,
+        automap_parent,
+    };
+    // The parts its body offers, for the pad to walk inside it.
+    let collect_key = egui::Id::new(super::MODULE_PARTS_COLLECT_KEY);
+    let outer_collect: Option<usize> = ui.ctx().data_mut(|d| {
+        d.insert_temp(super::module_parts_collect_id(), Vec::<(String, egui::Rect)>::new());
+        d.remove_temp::<Vec<egui::Rect>>(super::module_part_fields_pending_id());
+        let was = d.get_temp(collect_key);
+        d.insert_temp(collect_key, inner_id.0);
+        was
+    });
+    // Laid out as a canvas lays the module out in a frame this size: the size a body is
+    // handed is its surface's (a curve's graph, a note's page), and what it draws round that
+    // - rows, a title - comes on top. So it's handed the widget less what it drew round its
+    // surface last pass, which settles in a pass or two.
+    let fit_id = ui.id().with("fxi_module_widget_round");
+    let round: egui::Vec2 = ui.ctx().data(|d| d.get_temp(fit_id)).unwrap_or(egui::Vec2::ZERO);
+    let given = (body_size - round).max(egui::vec2(40.0, 30.0)).min(body_size.max(egui::vec2(40.0, 30.0)));
+    // What a body that places itself against its module's frame reads for it (a glyph, the
+    // kit bodies' pills - which drew nothing without it): the widget, as the frame of the
+    // widget's own view.
+    ui.ctx().data_mut(|d| {
+        let map = d.get_temp_mut_or_default::<super::NodeRectMap>(super::node_rects_id(cx.view_salt));
+        let frame = body_rect.expand(super::module_icons::NODE_FRAME_MARGIN);
+        map.insert(inner_id.0, [frame.min.x, frame.min.y, frame.width(), frame.height()]);
+    });
+    // The controls the body draws (egui keeps every widget of the pass), for the fields of a
+    // part whose row doesn't say where they are.
+    let layer = body.layer_id();
+    let controls_before = ui.ctx().viewport(|v| v.this_pass.widgets.get_layer(layer).count());
+    // While the layout is edited, a part of the body that has a layer of its own (a card
+    // window) draws on the host's instead: see `widget_layout_id`.
+    let outer_layout: Option<usize> = ui.ctx().data_mut(|d| {
+        let was = d.get_temp(widget_layout_id());
+        if is_layout_mode {
+            d.insert_temp(widget_layout_id(), inner_id.0);
+        } else {
+            d.remove_temp::<usize>(widget_layout_id());
+        }
+        was
+    });
+    match visual {
+        Some(t) => {
+            body.with_visual_transform(t, |body| {
+                super::show_module_body(
+                    &cx, &module_id, inner_id, &inputs, &outputs, body, inner_snarl,
+                    given.x, given.y, given.x,
+                );
+            });
+        }
+        None => {
+            super::show_module_body(
+                &cx, &module_id, inner_id, &inputs, &outputs, &mut body, inner_snarl,
+                given.x, given.y, given.x,
+            );
+        }
+    }
+    ui.ctx().data_mut(|d| match outer_layout {
+        Some(was) => d.insert_temp(widget_layout_id(), was),
+        None => {
+            d.remove_temp::<usize>(widget_layout_id());
+        }
+    });
+    let controls: Vec<egui::Rect> = ui.ctx().viewport(|v| {
+        v.this_pass.widgets.get_layer(layer).skip(controls_before)
+            .filter(|w| w.enabled && (w.sense.senses_click() || w.sense.senses_drag()))
+            .map(|w| w.rect)
+            .collect()
+    });
+    let took = body.min_rect().size();
+    let now_round = (took - given).max(egui::Vec2::ZERO);
+    if (now_round - round).abs().max_elem() > 0.5 {
+        ui.ctx().data_mut(|d| d.insert_temp(fit_id, now_round));
+        ui.ctx().request_repaint();
+    }
+    let to_global = ui.ctx().layer_transform_to_global(layer).unwrap_or(egui::emath::TSTransform::IDENTITY)
+        * visual.unwrap_or(egui::emath::TSTransform::IDENTITY);
+    let parts: Vec<(String, egui::Rect)> = ui.ctx().data_mut(|d| {
+        match outer_collect {
+            Some(o) => d.insert_temp(collect_key, o),
+            None => {
+                d.remove_temp::<usize>(collect_key);
+            }
+        }
+        d.remove_temp::<Vec<(String, egui::Rect)>>(super::module_parts_collect_id()).unwrap_or_default()
+    });
+    publish_part_fields(ui.ctx(), inner_id, &module_id, inner_snarl.get_node(inner_id), &parts, &controls, to_global);
+    // Each part with its fields as this pass drew them, on the screen, stamped with the nav
+    // pass: the pad walks them from the main window whichever viewport the widget is on (the
+    // config overlay counts its own passes). The pad's stop is ringed by the host, as any
+    // widget it's on is.
+    let pass = ui.ctx().cumulative_pass_nr();
+    let nav_pass = crate::widgets::nav_pass(ui.ctx());
+    let viewport = ui.ctx().viewport_id();
+    let published: Vec<super::ModulePart> = parts.iter().map(|(element, r)| {
+        let id = egui::Id::new(("gp_nav_field_rects", inner_id.0, element.clone()));
+        let fields = ui.ctx().data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(id))
+            .filter(|(p, _)| *p == pass)
+            .map(|(_, f)| f)
+            .unwrap_or_default();
+        super::ModulePart { element: element.clone(), rect: to_global * *r, fields }
+    }).collect();
+    ui.ctx().data_mut(|d| d.insert_temp(super::module_parts_id(inner_id.0, viewport), (nav_pass, published)));
+    ui.allocate_rect(rect, egui::Sense::hover());
+}
+
+/// The fields of each part of a whole-module widget whose row didn't publish where they are:
+/// the controls drawn inside the part (`controls`, on the widget's layer), in reading order -
+/// rows top to bottom, each left to right - and only when there are as many as the pad walks
+/// there (`element_fields`), so a row drawn some other way goes without a field ring rather
+/// than gets the wrong one. On the screen (`to_global`), for the field ring and its label.
+fn publish_part_fields(
+    ctx: &egui::Context,
+    inner_id: NodeId,
+    module_id: &str,
+    node: Option<&NodeData>,
+    parts: &[(String, egui::Rect)],
+    controls: &[egui::Rect],
+    to_global: egui::emath::TSTransform,
+) {
+    let pass = ctx.cumulative_pass_nr();
+    for (part, r) in parts {
+        let id = egui::Id::new(("gp_nav_field_rects", inner_id.0, part.clone()));
+        let published = ctx.data(|d| d.get_temp::<(u64, Vec<egui::Rect>)>(id)).is_some_and(|(p, _)| p == pass);
+        if published {
+            continue;
+        }
+        let want = crate::app::element_fields(module_id, part, node).len();
+        if want == 0 {
+            continue;
+        }
+        // A control no bigger than the part, its middle in it (a part with one field is often
+        // all control); one drawn over another counts once. Anything else in the part - a
+        // background that takes drags - makes one too many, and nothing is published.
+        let mut inside: Vec<egui::Rect> = Vec::new();
+        for c in controls {
+            if r.contains(c.center()) && c.area() <= r.area() * 1.05 && !inside.iter().any(|i| i.center().distance(c.center()) < 1.0) {
+                inside.push(*c);
+            }
+        }
+        if let Some(fields) = reading_order(inside).filter(|f| f.len() == want) {
+            let fields: Vec<egui::Rect> = fields.into_iter().map(|f| to_global * f).collect();
+            ctx.data_mut(|d| d.insert_temp(id, (pass, fields)));
+        }
+    }
+}
+
+/// `rects` in reading order: in rows - ones whose middles are within half the shorter's
+/// height of each other - top to bottom, each left to right. `None` for none.
+fn reading_order(mut rects: Vec<egui::Rect>) -> Option<Vec<egui::Rect>> {
+    if rects.is_empty() {
+        return None;
+    }
+    rects.sort_by(|a, b| a.center().y.total_cmp(&b.center().y));
+    let mut rows: Vec<Vec<egui::Rect>> = Vec::new();
+    for r in rects {
+        match rows.last_mut() {
+            Some(row) if row.iter().any(|o| (o.center().y - r.center().y).abs() <= 0.5 * o.height().min(r.height())) => row.push(r),
+            _ => rows.push(vec![r]),
+        }
+    }
+    Some(rows.into_iter().flat_map(|mut row| {
+        row.sort_by(|a, b| a.center().x.total_cmp(&b.center().x));
+        row
+    }).collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_pinned_element_impl(
     inner_id: egui_snarl::NodeId,
@@ -85,6 +338,7 @@ pub(crate) fn render_pinned_element_impl(
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
     pin_style: u8,
+    zoom: f32,
 ) {
     let cap_w = container_size.x.max(20.0);
     // Whole-module pinned renderers manage their own width/clip; don't cap
@@ -168,6 +422,11 @@ pub(crate) fn render_pinned_element_impl(
                 false, inner_id, ui, inner_snarl, container_size,
                 live_signals, panic_shortcut, bridged_parent, is_layout_mode,
             );
+            return;
+        }
+        // Any other module pinned whole (or by the old "default", which meant the same).
+        (_, "whole_module" | "default") => {
+            render_module_widget(inner_id, ui, inner_snarl, container_size, live_signals, panic_shortcut, bridged_parent, zoom, is_layout_mode);
             return;
         }
         // Input Viewer board: whole-container render, letterboxed to the
@@ -958,6 +1217,13 @@ pub(crate) fn pin_host_scope(ui: &egui::Ui) -> egui::Id {
     egui::Id::new((ui.ctx().viewport_id(), ui.layer_id(), ui.id()))
 }
 
+/// The host's clip (`clip`, in the host layer's coords) in the coords of a body drawn under
+/// `xform` with `Ui::with_visual_transform`, which maps clip rects along with the shapes.
+fn body_clip_of_host(clip: egui::Rect, xform: egui::emath::TSTransform) -> egui::Rect {
+    let inv = xform.inverse();
+    egui::Rect::from_min_max(inv * clip.min, inv * clip.max)
+}
+
 pub(crate) fn remap_pin_state_id(ui: &egui::Ui, inner_id: NodeId, tag: &'static str) -> egui::Id {
     egui::Id::new(("fxi_remap_pin_state", pin_host_scope(ui), inner_id.0, tag))
 }
@@ -1375,6 +1641,9 @@ where
                 - egui::vec2(0.0, scroll_offset_body * scale),
             scale,
         );
+        // What the host shows of the pin, in body coords: the band is cut to it too, or a
+        // pin partly scrolled out of an Easy layout drew over the header above it.
+        let host_clip = body_clip_of_host(ui.clip_rect(), xform);
         let inner = ui.with_visual_transform(xform, |ui| {
             let body_max_rect = egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1389,7 +1658,7 @@ where
                 egui::pos2(0.0, scroll_offset_body),
                 egui::vec2(design_w, container_h / scale),
             );
-            body_ui.set_clip_rect(visible_band);
+            body_ui.set_clip_rect(visible_band.intersect(host_clip));
             body_ui.add_enabled_ui(false, |body_ui| {
                 body_fn(
                     inner_id,
@@ -1661,6 +1930,16 @@ const ONE_CARD_H: f32 = 76.0;
 /// and 3DOF's two Lean lists shared one scroll, the first pushing the second out of view.
 /// Returns the window's rect (the pinnable `cards` element's).
 #[allow(clippy::too_many_arguments)]
+/// While a whole-module widget's body draws for a layout being edited, its node. A part of
+/// the body with a layer of its own (`card_window`'s cards) is drawn on the host's layer then,
+/// as a pinned mapping body is while its layout is edited: scaled with the shapes, so with the
+/// widget's zoom, and taking no input. On a layer of its own it missed the zoom - only the
+/// host's shapes are scaled while the layout is edited - so its cards came out full size and
+/// out past the widget, and over the host's layer it took the pointer from the layout's handles.
+fn widget_layout_id() -> egui::Id {
+    egui::Id::new("fxi_module_widget_layout")
+}
+
 pub(crate) fn card_window<BodyFn, MapLenFn, DraftLenFn>(
     ui: &mut egui::Ui,
     snarl: &mut Snarl<NodeData>,
@@ -1711,9 +1990,10 @@ where
         (None, None) => natural.unwrap_or(200.0),
     };
     let top_left = ui.cursor().min;
+    let laid_out = ui.ctx().data(|d| d.get_temp::<usize>(widget_layout_id())) == Some(node_id.0);
     render_remap_whole_module_impl(
         tag, REMAP_DESIGN_W, node_id, ui, snarl, egui::vec2(width, h),
-        live_signals, panic_shortcut, automap_parent, false, "",
+        live_signals, panic_shortcut, automap_parent, laid_out, "",
         body_fn, map_len_fn, draft_len_fn,
     );
     let rect = egui::Rect::from_min_size(top_left, egui::vec2(width, h));
@@ -2126,6 +2406,7 @@ pub(crate) fn render_label_text_pinned_scroll(
             container_rect.min.to_vec2() - egui::vec2(0.0, scroll_offset_body * scale),
             scale,
         );
+        let host_clip = body_clip_of_host(ui.clip_rect(), xform);
         let inner = ui.with_visual_transform(xform, |ui| {
             let body_max_rect = egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -2136,7 +2417,7 @@ pub(crate) fn render_label_text_pinned_scroll(
                 egui::pos2(0.0, scroll_offset_body),
                 egui::vec2(design_w, container_h / scale),
             );
-            body_ui.set_clip_rect(visible_band);
+            body_ui.set_clip_rect(visible_band.intersect(host_clip));
             body_ui.add_enabled_ui(false, |b| render_body(b, design_w))
                 .inner
         });
@@ -3239,4 +3520,20 @@ mod scroll_ownership_tests {
         let mut r = Rig::new(1);
         assert!(!wheel_has(&mut r, ON_LIST), "nothing to scroll: the page's");
     }
+}
+
+/// The stop of whole-module widget `inner` the pad is on - its field, or its part whole - on
+/// the screen, while it's on one, as drawn in the viewport `ctx` is drawing.
+pub(crate) fn module_part_focus_rect(ctx: &egui::Context, inner: usize) -> Option<egui::Rect> {
+    let (at, part, field, _): (u64, String, Option<usize>, bool) = ctx.data(|d| d.get_temp(super::module_part_focus_id(inner)))?;
+    if !crate::widgets::nav_pass_matches(ctx, at) {
+        return None;
+    }
+    let viewport = ctx.viewport_id();
+    let (_, parts): (u64, Vec<super::ModulePart>) = ctx.data(|d| d.get_temp(super::module_parts_id(inner, viewport)))?;
+    let part = parts.into_iter().find(|p| p.element == part)?;
+    field
+        .and_then(|k| part.fields.get(k).copied())
+        .filter(|r| r.is_finite() && r.is_positive())
+        .or(Some(part.rect))
 }
