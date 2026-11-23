@@ -24,19 +24,21 @@ pub const SAMPLE_RATE_HZ: f32 = 48_000.0;
 pub const LRA_L_CH: usize = 2;
 pub const LRA_R_CH: usize = 3;
 
-/// Frequency band the parametric pins map onto. The DualSense LRAs resonate around
-/// ~160–200 Hz; the useful band is ~80–500 Hz. We report the detected carrier
-/// normalized into `[0,1]` over this band so it lines up with the `ds_*_freq` pin
-/// convention (0 = 80 Hz, 1 = 500 Hz; see `dualsense_haptic.rs`).
+/// A DualSense's frequency pins, `ds_*_freq` and its `hd*_freq`: 0 = 80 Hz,
+/// 1 = 500 Hz, straight across (`automap::PitchScale::DualSense`, and
+/// `dualsense_haptic.rs`). Its LRAs resonate around 160–200 Hz.
 pub const FREQ_MIN_HZ: f32 = 80.0;
 pub const FREQ_MAX_HZ: f32 = 500.0;
 
-/// LRA resonance, normalized into the band above. Used as the default carrier when
-/// the signal is a transient/impulse with no resolvable pitch (a menu click). A
-/// DualSense impulse physically plays at the actuator's resonance (~180 Hz), so
-/// that's the natural frequency to fall back to rather than 0 (80 Hz) or a spurious
-/// max. (180-80)/(500-80) ≈ 0.238.
-const RESONANCE_NORM: f32 = 0.238;
+/// The carrier reported when the signal is a transient with no pitch to find (a
+/// menu click): an impulse plays at an actuator's resonance (a DualSense's is
+/// near 180 Hz), the natural pitch to fall back to rather than either end.
+const RESONANCE_HZ: f32 = 180.0;
+
+/// The pitches the detector looks for, and reports on the wide scale
+/// (`automap::PitchScale::Wide`), so a pad that plays higher than a DualSense (a
+/// Switch Pro to 1253 Hz, a Steam Controller to 2000) gets the pitch the game sent.
+const DETECT_HZ: (f32, f32) = crate::automap::WIDE_HZ;
 
 /// One channel's running pitch/envelope detector. Holds a small sample history so
 /// autocorrelation has enough span to resolve the lowest frequency in-band even
@@ -44,13 +46,19 @@ const RESONANCE_NORM: f32 = 0.238;
 /// samples, so we keep a window at least that long).
 #[derive(Debug, Clone)]
 pub struct ChannelDetector {
-    /// Ring of recent normalized samples (`-1.0..1.0`). Used for *pitch* detection
-    /// only — amplitude comes from the peak-envelope follower below.
+    /// Ring of recent samples at half the input rate (each the mean of two), for
+    /// *pitch* detection only — amplitude comes from the peak-envelope follower
+    /// below. 24 kHz still resolves the top of [`DETECT_HZ`] with room to spare,
+    /// and halves the search's cost.
     history: Vec<f32>,
     /// Write cursor into `history`.
     pos: usize,
     /// How many valid samples have been written (saturates at capacity).
     filled: usize,
+    /// The input sample waiting for its pair.
+    half: Option<f32>,
+    /// Half-rate samples since the pitch was last searched for.
+    since_search: usize,
     /// Last detected normalized frequency (held when amplitude is below the
     /// noise floor so a silent gap doesn't snap frequency to 0 and click).
     last_freq_norm: f32,
@@ -76,10 +84,16 @@ pub struct ChannelDetector {
     ms_release: f32,
 }
 
-/// Window length: enough to cover ~1.5 periods of the lowest in-band tone at
-/// 48 kHz (600 samples / period @ 80 Hz). 1024 keeps autocorrelation cheap and
-/// resolves the whole band.
+/// The pitch search's rate: half the input's.
+const SEARCH_RATE_HZ: f32 = SAMPLE_RATE_HZ / 2.0;
+
+/// Window length at [`SEARCH_RATE_HZ`]: about 1.7 periods of the lowest pitch
+/// looked for (600 samples a period at 40 Hz), ~43 ms.
 const WINDOW: usize = 1024;
+
+/// The pitch is searched for again only once this many new half-rate samples
+/// have come in (10 ms): however often it is read, the search costs the same.
+const SEARCH_EVERY: usize = 240;
 
 /// Below this envelope the channel is treated as silent: amplitude reports 0 and
 /// pitch is frozen (not recomputed from noise). ~ -54 dBFS.
@@ -130,9 +144,11 @@ impl Default for ChannelDetector {
             history: vec![0.0; WINDOW],
             pos: 0,
             filled: 0,
+            half: None,
+            since_search: SEARCH_EVERY,
             // Default to the LRA resonance so an impulse with no resolvable carrier
-            // plays at a natural haptic frequency instead of 80 Hz / a spurious max.
-            last_freq_norm: RESONANCE_NORM,
+            // plays at a natural haptic frequency instead of either end.
+            last_freq_norm: crate::automap::PitchScale::Wide.value(RESONANCE_HZ),
             env: 0.0,
             ms: 0.0,
             ms_attack: MS_ATTACK,
@@ -150,10 +166,15 @@ impl ChannelDetector {
     /// peak-envelope follower.
     #[inline]
     pub fn push(&mut self, s: f32) {
-        self.history[self.pos] = s;
-        self.pos = (self.pos + 1) % WINDOW;
-        if self.filled < WINDOW {
-            self.filled += 1;
+        if let Some(first) = self.half.take() {
+            self.history[self.pos] = (first + s) * 0.5;
+            self.pos = (self.pos + 1) % WINDOW;
+            if self.filled < WINDOW {
+                self.filled += 1;
+            }
+            self.since_search += 1;
+        } else {
+            self.half = Some(s);
         }
         // Fast-attack / slow-release peak envelope on the rectified sample.
         let mag = s.abs();
@@ -203,22 +224,24 @@ impl ChannelDetector {
         ((rms - NOISE_FLOOR) / (LOUDNESS_REF_RMS - NOISE_FLOOR)).clamp(0.0, 1.0)
     }
 
-    /// Current carrier frequency normalized into `[0,1]` over `[FREQ_MIN,FREQ_MAX]`.
-    /// Returns the held value when the channel is below the silence floor.
+    /// Current carrier frequency on the wide scale (`automap::PitchScale::Wide`).
+    /// Returns the held value when the channel is below the silence floor, and
+    /// between searches.
     pub fn frequency_norm(&mut self) -> f32 {
-        if self.amplitude() < SILENCE_RMS || self.filled < WINDOW {
+        if self.amplitude() < SILENCE_RMS || self.filled < WINDOW || self.since_search < SEARCH_EVERY {
             return self.last_freq_norm;
         }
+        self.since_search = 0;
         if let Some(hz) = self.detect_pitch_hz() {
-            let norm = ((hz - FREQ_MIN_HZ) / (FREQ_MAX_HZ - FREQ_MIN_HZ)).clamp(0.0, 1.0);
-            self.last_freq_norm = norm;
+            self.last_freq_norm = crate::automap::PitchScale::Wide.value(hz);
         }
         self.last_freq_norm
     }
 
-    /// Autocorrelation pitch detector over the linear window. Searches lag range
-    /// corresponding to `[FREQ_MIN,FREQ_MAX]` and returns the frequency at the
-    /// strongest correlation peak, or `None` if no clear period is found.
+    /// Autocorrelation pitch detector over the window: the period is the first
+    /// strong peak past the zero lag's own lobe, so a tone isn't read an octave
+    /// or more low (every multiple of its period correlates as well as the period
+    /// does). `None` if no clear period is found.
     fn detect_pitch_hz(&self) -> Option<f32> {
         // Linearize the ring into a temporary contiguous buffer (oldest → newest).
         let mut buf = [0.0f32; WINDOW];
@@ -230,51 +253,53 @@ impl ChannelDetector {
         for v in buf.iter_mut() {
             *v -= mean;
         }
-
-        let min_lag = (SAMPLE_RATE_HZ / FREQ_MAX_HZ).floor() as usize; // highest freq → shortest lag
-        let max_lag = (SAMPLE_RATE_HZ / FREQ_MIN_HZ).ceil() as usize; // lowest freq → longest lag
-        let max_lag = max_lag.min(WINDOW - 1);
-        if min_lag >= max_lag {
+        // Energy of buf[..i], so each lag's overlap energies are two lookups.
+        let mut energy = [0.0f32; WINDOW + 1];
+        for i in 0..WINDOW {
+            energy[i + 1] = energy[i] + buf[i] * buf[i];
+        }
+        if energy[WINDOW] <= f32::EPSILON {
             return None;
         }
 
-        let total_energy: f32 = buf.iter().map(|v| v * v).sum();
-        if total_energy <= f32::EPSILON {
-            return None;
-        }
+        let min_lag = (SEARCH_RATE_HZ / DETECT_HZ.1).floor().max(2.0) as usize; // highest freq → shortest lag
+        let max_lag = ((SEARCH_RATE_HZ / DETECT_HZ.0).ceil() as usize).min(WINDOW - 2); // lowest → longest
 
-        let mut best_lag = 0usize;
-        let mut best_corr = 0.0f32;
-        for lag in min_lag..=max_lag {
-            let mut corr = 0.0f32;
-            let mut e0 = 0.0f32; // energy of buf[0 .. WINDOW-lag]
-            let mut e1 = 0.0f32; // energy of buf[lag .. WINDOW]
-            for i in 0..(WINDOW - lag) {
-                corr += buf[i] * buf[i + lag];
-                e0 += buf[i] * buf[i];
-                e1 += buf[i + lag] * buf[i + lag];
-            }
-            // Normalized cross-correlation (Pearson-style) over the OVERLAP region,
-            // not the full window. Dividing by the full-window energy systematically
-            // favors short lags — for a sharp transient (a menu click, which has no
-            // real carrier) the autocorrelation falls monotonically from lag 0, so
-            // the shortest in-band lag always "won" and we reported the max frequency
-            // (~626 Hz). Per-overlap normalization removes that bias so an impulse no
-            // longer masquerades as a high tone.
+        // Normalized cross-correlation (Pearson-style) over the OVERLAP region,
+        // not the full window. Dividing by the full-window energy systematically
+        // favors short lags — for a sharp transient (a menu click, which has no
+        // real carrier) the autocorrelation falls monotonically from lag 0, so
+        // the shortest lag always "won" and we reported the top frequency.
+        // Per-overlap normalization removes that bias so an impulse no longer
+        // masquerades as a high tone. From lag 1, to find where the lobe round
+        // lag 0 ends; one past the longest, for the peak's shape.
+        let mut corr = [0.0f32; WINDOW];
+        for lag in 1..=max_lag + 1 {
+            let n = WINDOW - lag;
+            let dot: f32 = buf[..n].iter().zip(&buf[lag..]).map(|(a, b)| a * b).sum();
+            let e0 = energy[n];
+            let e1 = energy[WINDOW] - energy[lag];
             let denom = (e0 * e1).sqrt();
-            let norm_corr = if denom > f32::EPSILON { corr / denom } else { 0.0 };
-            if norm_corr > best_corr {
-                best_corr = norm_corr;
-                best_lag = lag;
-            }
+            corr[lag] = if denom > f32::EPSILON { dot / denom } else { 0.0 };
         }
-
+        // The lobe round lag 0 runs until the correlation first goes negative.
+        let lobe_end = (1..=max_lag).find(|&l| corr[l] < 0.0)?;
+        let from = lobe_end.max(min_lag);
+        let best = (from..=max_lag).map(|l| corr[l]).fold(0.0f32, f32::max);
         // Require a reasonably periodic signal — reject noise / impulses that have no
         // real carrier (otherwise we'd report a jittery or maxed-out frequency).
-        if best_lag == 0 || best_corr < 0.5 {
+        if best < 0.5 {
             return None;
         }
-        Some(SAMPLE_RATE_HZ / best_lag as f32)
+        // The first peak nearly as strong as the strongest is the period.
+        let lag = (from..=max_lag).find(|&l| {
+            corr[l] >= 0.9 * best && corr[l] >= corr[l - 1] && corr[l] >= corr[l + 1]
+        })?;
+        // Between samples: a parabola through the peak and its neighbours.
+        let (a, b, c) = (corr[lag - 1], corr[lag], corr[lag + 1]);
+        let bend = a - 2.0 * b + c;
+        let shift = if bend.abs() > f32::EPSILON { (0.5 * (a - c) / bend).clamp(-0.5, 0.5) } else { 0.0 };
+        Some(SEARCH_RATE_HZ / (lag as f32 + shift))
     }
 }
 
@@ -318,8 +343,9 @@ impl HapticConverter {
         }
     }
 
-    /// Latest parametric haptics: per-side amplitude (`0..1`) and normalized
-    /// frequency (`0..1` over 80–500 Hz). Cheap; recomputes from the live windows.
+    /// Latest parametric haptics: per-side amplitude (`0..1`) and frequency on the
+    /// wide scale (`automap::PitchScale::Wide`, 40–2000 Hz). Cheap; recomputes
+    /// from the live windows, the pitch at most every [`SEARCH_EVERY`].
     pub fn params(&mut self) -> HapticParams {
         HapticParams {
             l_amp: self.left.amplitude(),
@@ -342,6 +368,7 @@ fn read_s16(bytes: &[u8], off: usize) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automap::PitchScale;
     use std::f32::consts::TAU;
 
     /// Build N frames of interleaved 4-ch S16 with the LRA channels carrying a
@@ -401,10 +428,22 @@ mod tests {
         // 160 Hz left, 320 Hz right.
         c.push_pcm(&synth(160.0, 0.8, 320.0, 0.8, WINDOW * 3));
         let p = c.params();
-        let l_hz = FREQ_MIN_HZ + p.l_freq * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        let r_hz = FREQ_MIN_HZ + p.r_freq * (FREQ_MAX_HZ - FREQ_MIN_HZ);
-        assert!((l_hz - 160.0).abs() < 12.0, "L carrier ≈160Hz, got {l_hz}");
-        assert!((r_hz - 320.0).abs() < 18.0, "R carrier ≈320Hz, got {r_hz}");
+        let l_hz = PitchScale::Wide.hz(p.l_freq);
+        let r_hz = PitchScale::Wide.hz(p.r_freq);
+        assert!((l_hz - 160.0).abs() < 4.0, "L carrier ≈160Hz, got {l_hz}");
+        assert!((r_hz - 320.0).abs() < 8.0, "R carrier ≈320Hz, got {r_hz}");
+    }
+
+    // The whole wide scale, each pitch read as itself rather than an octave down,
+    // which a multiple of its period would correlate as well as.
+    #[test]
+    fn detects_pitches_across_the_wide_scale() {
+        for hz in [45.0f32, 90.0, 180.0, 440.0, 700.0, 1000.0, 1500.0, 1900.0] {
+            let mut c = HapticConverter::new();
+            c.push_pcm(&synth(hz, 0.6, hz, 0.6, WINDOW * 4));
+            let got = PitchScale::Wide.hz(c.params().l_freq);
+            assert!((got / hz - 1.0).abs() < 0.03, "{hz} Hz read as {got} Hz");
+        }
     }
 
     #[test]

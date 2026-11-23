@@ -5,23 +5,16 @@
 //! these units instead, once the wiring says where the value ends up
 //! (`curve_support::refresh_motion_units`).
 
+use flexinput_core::automap::PitchScale;
+
 /// The bottom of the dB scale a reading is put in: quieter is silence.
 pub(crate) const DB_FLOOR: f32 = -60.0;
-
-/// How a pad turns a frequency pin's 0-1 into a pitch.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum FreqMap {
-    /// Straight across `lo`..`hi` Hz: a DualSense's or a Steam Controller's actuators.
-    Linear(f32, f32),
-    /// A Switch Pro's (and first Joy-Cons') HD-rumble table: an octave every 32 of its 126
-    /// steps, 82 to 1253 Hz (`automap::switch_hd_freq`).
-    Switch,
-}
 
 /// What a pin's value reads as.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PinUnit {
-    Hz(FreqMap),
+    /// A pitch, on the scale its pad reads the pin on.
+    Hz(PitchScale),
     /// An amplitude, as dB of full strength.
     Decibels,
     /// A share, as a percentage.
@@ -51,11 +44,12 @@ impl PinUnit {
     /// how it maps a frequency ("0=82Hz … 1=1253Hz" is the Switch table); `switch` says the
     /// pad behind a Feedback Control is a Switch pad, for when there is no hint.
     pub(crate) fn of_feedback_pin(pin: &str, hint: Option<&str>, switch: bool) -> Option<Self> {
-        let freq_map = || match hint {
-            Some(h) if h.contains("1253") => FreqMap::Switch,
-            Some(h) if h.contains("500Hz") => FreqMap::Linear(80.0, 500.0),
-            _ if switch => FreqMap::Switch,
-            _ => FreqMap::Linear(flexinput_core::haptic_pcm::FREQ_MIN_HZ, flexinput_core::haptic_pcm::FREQ_MAX_HZ),
+        let hd_scale = || match hint {
+            Some(h) if h.contains("1253") => PitchScale::Switch,
+            Some(h) if h.contains("2000Hz") => PitchScale::Wide,
+            Some(h) if h.contains("500Hz") => PitchScale::DualSense,
+            _ if switch => PitchScale::Switch,
+            _ => PitchScale::DualSense,
         };
         Some(match pin {
             "rumble_strong" | "rumble_weak" | "hd_rumble_l" | "hd_rumble_r" => PinUnit::Percent,
@@ -63,10 +57,11 @@ impl PinUnit {
             "player_led" => PinUnit::PlayerLed,
             "mic_led" => PinUnit::MicLed,
             p if p.ends_with("_amp") => PinUnit::Decibels,
-            p if p.starts_with("ds_") || p.starts_with("tp_") => {
-                if p.ends_with("_freq") { PinUnit::Hz(FreqMap::Linear(80.0, 500.0)) } else { return None }
+            p if p.starts_with("hd") && p.ends_with("_freq") => PinUnit::Hz(hd_scale()),
+            p if p.starts_with("ds_") || p.starts_with("tp_") || p.starts_with("grip") => {
+                // Each its own pad's, whatever pad is behind.
+                PinUnit::Hz(PitchScale::of_pin(p, [])?)
             }
-            p if p.starts_with("hd") && p.ends_with("_freq") => PinUnit::Hz(freq_map()),
             p if p.starts_with("trigger_") => {
                 if p.ends_with("_mode") {
                     PinUnit::TriggerMode
@@ -84,20 +79,11 @@ impl PinUnit {
         })
     }
 
-    /// The pitch at frequency value `v` (0-1).
-    fn hz(map: FreqMap, v: f32) -> f32 {
-        let v = v.clamp(0.0, 1.0);
-        match map {
-            FreqMap::Linear(lo, hi) => lo + (hi - lo) * v,
-            FreqMap::Switch => flexinput_core::automap::SWITCH_HD_HZ.0 * 2f32.powf(v * 126.0 / 32.0),
-        }
-    }
-
     /// Value `v` (the pin's 0-1) as it reads.
     pub(crate) fn text(self, v: f32) -> String {
         let v = v.clamp(0.0, 1.0);
         match self {
-            PinUnit::Hz(map) => format!("{:.0} Hz", Self::hz(map, v)),
+            PinUnit::Hz(scale) => format!("{:.0} Hz", scale.hz(v)),
             PinUnit::Decibels if v < 1e-4 => "-∞ dB".into(),
             PinUnit::Decibels => format!("{:.1} dB", 20.0 * v.log10()),
             PinUnit::Percent => format!("{:.0}%", v * 100.0),
@@ -114,7 +100,7 @@ impl PinUnit {
     pub(crate) fn reading(self, v: f32) -> f32 {
         let v = v.clamp(0.0, 1.0);
         match self {
-            PinUnit::Hz(map) => Self::hz(map, v),
+            PinUnit::Hz(scale) => scale.hz(v),
             PinUnit::Decibels => (20.0 * v.max(1e-6).log10()).max(DB_FLOOR),
             PinUnit::Percent => v * 100.0,
             PinUnit::Byte => v * 255.0,
@@ -129,8 +115,7 @@ impl PinUnit {
     /// the dB scale is silence.
     pub(crate) fn from_reading(self, x: f32) -> f32 {
         let v = match self {
-            PinUnit::Hz(FreqMap::Linear(lo, hi)) => (x - lo) / (hi - lo).max(1e-6),
-            PinUnit::Hz(FreqMap::Switch) => (x.max(1e-3) / flexinput_core::automap::SWITCH_HD_HZ.0).log2() * 32.0 / 126.0,
+            PinUnit::Hz(scale) => scale.value(x),
             PinUnit::Decibels if x <= DB_FLOOR => 0.0,
             PinUnit::Decibels => 10f32.powf(x / 20.0),
             PinUnit::Percent => x / 100.0,
@@ -157,7 +142,7 @@ impl PinUnit {
     /// The widest it ever reads, for sizing what shows it.
     pub(crate) fn widest(self) -> String {
         match self {
-            PinUnit::Hz(_) => "1253 Hz".into(),
+            PinUnit::Hz(_) => "2000 Hz".into(),
             PinUnit::Decibels => "-80.0 dB".into(),
             PinUnit::Percent => "100%".into(),
             PinUnit::Byte => "255".into(),
@@ -183,8 +168,13 @@ mod tests {
         assert_eq!(sw.text(0.0), "82 Hz");
         assert_eq!(sw.text(0.5), "320 Hz");
         assert_eq!(sw.text(1.0), "1253 Hz");
-        let steam = PinUnit::of_feedback_pin("hd_l_freq", Some("Left Grip: Frequency (0=80Hz 1=500Hz)"), true).unwrap();
-        assert_eq!(steam.text(1.0), "500 Hz", "the pad's own name wins over the guess");
+        let named = PinUnit::of_feedback_pin("hd_l_freq", Some("HD Haptic L: Frequency (0=80Hz 1=500Hz)"), true).unwrap();
+        assert_eq!(named.text(1.0), "500 Hz", "the pad's own name wins over the guess");
+        for pin in ["grip_l_freq", "grip2_r_freq", "tp_l_freq"] {
+            let steam = PinUnit::of_feedback_pin(pin, None, true).unwrap();
+            assert_eq!((steam.text(0.0), steam.text(0.5), steam.text(1.0)),
+                ("40 Hz".into(), "283 Hz".into(), "2000 Hz".into()), "{pin}");
+        }
         let amp = PinUnit::of_feedback_pin("hd2_r_amp", None, false).unwrap();
         assert_eq!(amp.text(1.0), "0.0 dB");
         assert_eq!(amp.text(0.5), "-6.0 dB");
@@ -200,8 +190,9 @@ mod tests {
     #[test]
     fn a_reading_goes_back_to_its_value() {
         let units = [
-            PinUnit::Hz(FreqMap::Linear(80.0, 500.0)),
-            PinUnit::Hz(FreqMap::Switch),
+            PinUnit::Hz(PitchScale::DualSense),
+            PinUnit::Hz(PitchScale::Switch),
+            PinUnit::Hz(PitchScale::Wide),
             PinUnit::Decibels,
             PinUnit::Percent,
             PinUnit::Byte,

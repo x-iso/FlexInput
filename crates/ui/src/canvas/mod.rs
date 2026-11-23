@@ -496,6 +496,9 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
                 }
             }
         }
+        if node.value.module_id == "module.audio_stream_haptics" {
+            migrate_asth_eq_span(&mut node.value.params);
+        }
         migrate_midi_automap_port(&mut node.value);
         clear_stuck_nav_arms(&mut node.value);
         migrate_mapping_cards(&mut node.value);
@@ -507,6 +510,31 @@ pub fn migrate_loaded_snarl(snarl: &mut Snarl<NodeData>) {
             migrate_loaded_snarl(&mut sp.snarl);
         }
     }
+}
+
+/// Audio Stream Haptics' spectrum spanned 40–1253 Hz and spans the wide scale now
+/// (40–2000, `automap::WIDE_HZ`), so a band's place along it moved. An EQ saved
+/// on the old span (`asth_eq_points`) is moved to `asth_eq_wide` with each point
+/// where its pitch now is, and its last gain carried on to the new top. Once:
+/// the old key goes.
+fn migrate_asth_eq_span(params: &mut std::collections::HashMap<String, Value>) {
+    const OLD_TOP_HZ: f32 = 1253.0;
+    let Some(old) = params.remove("asth_eq_points") else { return };
+    if params.contains_key("asth_eq_wide") {
+        return;
+    }
+    let (lo, hi) = flexinput_core::automap::WIDE_HZ;
+    let k = ((OLD_TOP_HZ / lo).ln() / (hi / lo).ln()) as f64;
+    let mut pts: Vec<[f64; 2]> = old.as_array().into_iter().flatten()
+        .filter_map(|p| Some([p.get(0)?.as_f64()?, p.get(1)?.as_f64()?]))
+        .map(|[x, y]| [x * k, y])
+        .collect();
+    if let Some(&[x, y]) = pts.last() {
+        if x < 1.0 {
+            pts.push([1.0, y]);
+        }
+    }
+    params.insert("asth_eq_wide".into(), Value::Array(pts.iter().map(|p| serde_json::json!(p)).collect()));
 }
 
 /// Make each inlet's / outlet's `pin_index` equal its POSITION among its peers.
@@ -1006,7 +1034,93 @@ mod migration_tests {
         for (pin, want) in node.inputs[1..].iter().zip(FEEDBACK_INLET_PINS) {
             assert_eq!(pin.name, want.display_name);
         }
-        assert_eq!(node.inputs.last().unwrap().name, "Grip R: Click");
+        assert_eq!(node.inputs.last().unwrap().name, "Grip R: Freq (carrier 2)");
+    }
+
+    /// A Steam Controller node saved when its grips took a DualSense's `hd*` pins:
+    /// each input becomes its own grip pin in its slot, wire and all; a pad that
+    /// still has those pins keeps them.
+    #[test]
+    fn a_steam_controllers_saved_grip_inputs_take_their_own_names_in_place() {
+        let pin = |id: &str| flexinput_devices::DevicePin {
+            id: id.to_string(), display_name: format!("{id} name"), signal_type: SignalType::Float,
+        };
+        let device = |id: &str, inputs: &[&str]| flexinput_devices::PhysicalDevice {
+            id: id.to_string(),
+            display_name: "Pad".to_string(),
+            kind: flexinput_devices::ControllerKind::Generic,
+            outputs: vec![],
+            inputs: inputs.iter().map(|i| pin(i)).collect(),
+            instance_path: None,
+            vid: None,
+            pid: None,
+        };
+        let saved = |dev: &str| {
+            let ids = ["rumble_strong", "hd_l_amp", "hd_l_freq", "hd2_r_freq"];
+            let mut params = HashMap::new();
+            params.insert("device_id".to_string(), Value::from(dev));
+            params.insert("input_pin_ids".to_string(), serde_json::json!(ids));
+            NodeData {
+                module_id: "device.source".to_string(),
+                display_name: "Pad".to_string(),
+                category: "Device".to_string(),
+                inputs: ids.iter().map(|i| PinDescriptor::new(*i, SignalType::Float)).collect(),
+                outputs: vec![],
+                params,
+                subpatch: None,
+                extra: Default::default(),
+            }
+        };
+        let mut snarl: Snarl<NodeData> = Snarl::new();
+        let steam = snarl.insert_node(egui::Pos2::ZERO, saved("sdl:generic:steam"));
+        let ds = snarl.insert_node(egui::pos2(10.0, 0.0), saved("sdl:dualsense:a"));
+        let knob = snarl.insert_node(egui::pos2(20.0, 0.0), NodeData {
+            module_id: "module.knob".into(),
+            display_name: "Knob".into(),
+            category: "Test".into(),
+            inputs: vec![],
+            outputs: vec![PinDescriptor::new("out", SignalType::Float)],
+            params: HashMap::new(),
+            subpatch: None,
+            extra: Default::default(),
+        });
+        snarl.connect(OutPinId { node: knob, output: 0 }, InPinId { node: steam, input: 2 });
+
+        let pad = device("sdl:generic:steam", &["rumble_strong", "grip_l_amp", "grip_l_freq", "grip2_r_freq"]);
+        assert!(sync_device_node_pins(&mut snarl, &pad));
+        let n = snarl.get_node(steam).unwrap();
+        assert_eq!(n.params["input_pin_ids"], serde_json::json!(["rumble_strong", "grip_l_amp", "grip_l_freq", "grip2_r_freq"]));
+        assert_eq!(n.inputs[2].name, "grip_l_freq name");
+        assert_eq!(n.inputs.len(), 4, "renamed, not added");
+        assert!(snarl.wires().any(|(o, i)| o.node == knob && i == InPinId { node: steam, input: 2 }), "the wire stays");
+        assert!(!sync_device_node_pins(&mut snarl, &pad), "once");
+
+        let dualsense = device("sdl:dualsense:a", &["rumble_strong", "hd_l_amp", "hd_l_freq", "hd2_r_freq"]);
+        assert!(!sync_device_node_pins(&mut snarl, &dualsense));
+        assert_eq!(snarl.get_node(ds).unwrap().params["input_pin_ids"][1], "hd_l_amp");
+    }
+
+    /// An Audio Stream Haptics EQ saved on the 40–1253 Hz span: each point moves to
+    /// where its pitch is on the wide scale, the last gain runs on to the new top,
+    /// and it happens once.
+    #[test]
+    fn an_asth_eq_moves_onto_the_wide_span_once() {
+        let mut params = HashMap::new();
+        params.insert("asth_eq_points".to_string(), serde_json::json!([[0.0, 0.2], [0.5, 0.9], [1.0, 0.4]]));
+        migrate_asth_eq_span(&mut params);
+        assert!(!params.contains_key("asth_eq_points"));
+        let pts: Vec<[f32; 2]> = params["asth_eq_wide"].as_array().unwrap().iter()
+            .map(|p| [p[0].as_f64().unwrap() as f32, p[1].as_f64().unwrap() as f32]).collect();
+        let old_hz = |x: f32| 40.0 * (1253.0f32 / 40.0).powf(x);
+        let wide = flexinput_core::automap::PitchScale::Wide;
+        assert_eq!(pts.len(), 4);
+        for (i, x) in [0.0f32, 0.5, 1.0].into_iter().enumerate() {
+            assert!((wide.hz(pts[i][0]) - old_hz(x)).abs() < 1.0, "point {i} keeps its pitch");
+        }
+        assert_eq!(pts[3], [1.0, 0.4], "the last gain carried to the top");
+        let once = params.clone();
+        migrate_asth_eq_span(&mut params);
+        assert_eq!(params, once);
     }
 
     /// A saved node gains the inputs its pad has since, after the ones it has, and
@@ -3498,6 +3612,17 @@ fn extend_feedback_control_inlets(node: &mut NodeData) {
     }
 }
 
+/// A device's inputs renamed since a node could have been saved, old → new, for
+/// [`sync_device_node_pins`]: a Steam Controller's grips took a DualSense's `hd*`
+/// pins before they had their own. Only a pad that declares the new one and not
+/// the old is renamed.
+const RENAMED_DEVICE_INPUTS: &[(&str, &str)] = &[
+    ("hd_l_amp", "grip_l_amp"), ("hd_l_freq", "grip_l_freq"),
+    ("hd_r_amp", "grip_r_amp"), ("hd_r_freq", "grip_r_freq"),
+    ("hd2_l_amp", "grip2_l_amp"), ("hd2_l_freq", "grip2_l_freq"),
+    ("hd2_r_amp", "grip2_r_amp"), ("hd2_r_freq", "grip2_r_freq"),
+];
+
 /// A device.source's pins are frozen when the node is created, so a saved node
 /// doesn't have the pins its pad gained since (feedback inputs, a Steam
 /// Controller's trackpad press, its touch fields as sticks), or what its pad's
@@ -3557,6 +3682,17 @@ pub fn sync_device_node_pins(
         let Some(Value::Array(ids)) = node.params.get_mut("input_pin_ids") else { continue };
         // Pins and ids run in parallel; a node where they don't isn't this shape.
         if ids.len() != node.inputs.len() { continue; }
+        // An input renamed since keeps its slot, and so its wires.
+        let declares = |id: &str| device.inputs.iter().find(|p| p.id == id);
+        for (old, new) in RENAMED_DEVICE_INPUTS {
+            let Some(pin) = declares(new) else { continue };
+            if declares(old).is_some() || ids.iter().any(|id| id.as_str() == Some(new)) { continue; }
+            if let Some(i) = ids.iter().position(|id| id.as_str() == Some(old)) {
+                ids[i] = Value::String(new.to_string());
+                node.inputs[i].name = pin.display_name.clone();
+                changed = true;
+            }
+        }
         for pin in &device.inputs {
             if !ids.iter().any(|id| id.as_str() == Some(pin.id.as_str())) {
                 ids.push(Value::String(pin.id.clone()));

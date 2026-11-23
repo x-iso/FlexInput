@@ -3,6 +3,53 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.18.1] - 2026-11-24
+
+### Added
+
+- **Audio Stream Haptics on a Steam Controller's trackpads.** A Trackpads row (off, low
+  band, high band) makes the trackpads two more channels: each plays the chosen band, under
+  or over the crossover, as a tone of its own at that band's pitch and its side's loudness,
+  on top of what the grips play. A pad without trackpads ignores it.
+
+### Changed
+
+- **A Steam Controller's haptics reach 2000 Hz.** Its grips and trackpads were held to a
+  DualSense's 80–500 Hz; they play 40–2000 Hz now, evenly by octave (the middle is 283 Hz).
+  The grips' stream plays up to 1600 Hz, past which its samples make no tone; the
+  trackpads' tones go to the top. The grips have pins of their own (Grip L/R: Amplitude and
+  Frequency, and a second carrier) in place of the HD Rumble pins they shared with a
+  DualSense and a Switch Pro; a saved patch's pins are renamed where they are, wires and
+  all. A knob wired straight into a grip's or trackpad's frequency reads on the new scale,
+  so away from the middle it plays a different pitch than it did. Trigger and trackpad
+  click pitches in the Calibration window go from 40 to 2000 Hz on it (were 60–600).
+- **A game's HD haptics and Audio Stream Haptics play the pitch they carry on every pad.**
+  A pitch went over as a 0–1 that each pad read on its own scale, so a Switch Pro played a
+  DualSense's 500 Hz at 1253 Hz, and a Steam Controller topped out at 500. Now each pad
+  plays the pitch itself, as high as it goes: a Switch Pro to 1253 Hz, a Steam Controller
+  to 2000, a DualSense held at its 500. A virtual DualSense with USB audio finds a game's
+  haptic pitch from 40 to 2000 Hz (was 80–500), and no longer reads a tone an octave low.
+- **Audio Stream Haptics' spectrum spans 40–2000 Hz** (was 40–1253 Hz), and its crossover
+  goes to 1200 Hz (was 800). A saved EQ curve is moved so that each point keeps its pitch.
+- **Network I/O carries the grips' pins**, after the others: a peer on 0.18.0 warns that
+  its layout differs and leaves them out.
+
+### Fixed
+
+- **Audio Stream Haptics' rows line up at any text size.** Its labels and value boxes had
+  fixed widths, so at a larger text size the labels ran into the sliders and a value like
+  "270 Hz" ran out of its box over the slider. The label column is now as wide as the
+  widest label (Capture from's switches in it too), every slider row has a value box of the
+  same width on the same right edge, Balance and Rumble mix included, and every rail starts
+  and ends with the others.
+- **A Steam Controller's grips play a tone without a rattle under it.** Each grip's samples
+  went out in a report of its own, and the pad played every tone over a buzzing rattle of
+  its own; both grips now go out together in one report, as other tools send them, and the
+  same tone comes out clean. The stream also keeps a steady pace (it swung its rate by an
+  eighth to keep the pad's buffer filled; now it trims itself by at most 0.6%), glides to a
+  new strength or pitch over ~3 ms instead of stepping to it every ~15 ms, and eases into
+  full scale where two carriers add up past it instead of clipping.
+
 ## [0.18.0] - 2026-11-18
 
 ### Added

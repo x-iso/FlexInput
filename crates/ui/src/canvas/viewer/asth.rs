@@ -26,6 +26,9 @@ pub(crate) struct AsthParams {
     split: bool,
     /// No modulation between the bands: the carriers play clean.
     pure: bool,
+    /// A Steam Controller's trackpads as two more channels: "off", "low" or "high",
+    /// the band they play.
+    pads: String,
 }
 
 impl AsthParams {
@@ -54,63 +57,76 @@ impl AsthParams {
     }
 }
 
-/// One calibration row in the ASTH node: a fixed-width label cell followed by a
-/// control that fills the remaining row width (so sliders scale with the module
-/// width and stay left-aligned regardless of label length). `add` receives the
-/// width to fill and returns the control's `Response`; OR its `.changed()` into
-/// `changed`.
-pub(crate) fn asth_slider_row(
-    ui: &mut egui::Ui,
-    label: &str,
+/// The label of every calibration row, for the shared label column.
+const ASTH_LABELS: [&str; 10] = [
+    "Capture from", "Volume", "Release", "Crossover", "Amplitude", "Balance", "Swap", "Bands", "Trackpads",
+    "Rumble mix",
+];
+/// The widest each value box shows, for the shared box width.
+const ASTH_WIDEST_VALUES: [&str; 4] = ["2.00", "500 ms", "1200 Hz", "-1.00"];
+/// Space between the label column and what follows it, in the labels' text size,
+/// so it grows with them.
+const ASTH_LABEL_GAP_EM: f32 = 0.7;
+/// The narrowest a slider rail gets.
+const ASTH_MIN_RAIL: f32 = 40.0;
+
+/// The label column's and the value boxes' widths in the current text style: as
+/// wide as the widest label and value, so at any text size a label ends before
+/// its slider starts and a value stays inside its box. They had fixed widths, and
+/// at a larger text size the labels ran into the sliders.
+#[derive(Clone, Copy)]
+pub(crate) struct AsthCells {
     label_w: f32,
-    body_w: f32,
-    scale: f32,
-    changed: &mut bool,
-    add: impl FnOnce(&mut egui::Ui, f32) -> egui::Response,
-) -> egui::Rect {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        slider_label(ui, label, label_w);
-        // Rail extends to the SHARED right edge so every row's control lines up.
-        let w = (asth_row_right_edge(body_w, scale) - label_w).max(40.0 * scale);
-        ui.spacing_mut().slider_width = w;
-        *changed |= add(ui, w).changed();
-    }).response.rect
+    box_w: f32,
 }
 
-/// The uniform width of the editable value box on the Volume/Release/Crossover rows.
-pub(crate) const ASTH_VAL_BOX_W: f32 = 50.0;
-/// Width of the Amplitude row's response-curve box (matches `header_controls::curve_box`).
-pub(crate) const ASTH_CURVE_BOX_W: f32 = 34.0;
+impl AsthCells {
+    pub(crate) fn measure(ui: &egui::Ui) -> Self {
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let value = ui.style().drag_value_text_style.resolve(ui.style());
+        let widest = |texts: &[&str], font: &egui::FontId| texts.iter()
+            .map(|t| text_w(ui, t, font))
+            .fold(0.0f32, f32::max);
+        Self {
+            label_w: (widest(&ASTH_LABELS, &small) + ASTH_LABEL_GAP_EM * small.size).ceil(),
+            box_w: (widest(&ASTH_WIDEST_VALUES, &value) + 2.0 * ui.spacing().button_padding.x + 2.0).ceil(),
+        }
+    }
+}
+
+fn text_w(ui: &egui::Ui, text: &str, font: &egui::FontId) -> f32 {
+    ui.painter().layout_no_wrap(text.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x
+}
+
+/// How wide a row of word switches is in the current style.
+fn switches_w(ui: &egui::Ui, words: &[&str]) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding.x;
+    words.iter().map(|w| text_w(ui, w, &font) + 2.0 * pad).sum::<f32>()
+        + ASTH_BOX_GAP * words.len().saturating_sub(1) as f32
+}
+
 /// Right slack inside `body_w` — the SHARED right edge of every row sits here.
 pub(crate) const ASTH_RIGHT_INSET: f32 = 6.0;
-/// Gap between the Amplitude range slider and the curve box.
+/// Gap between a rail and the box after it, and between word switches.
 pub(crate) const ASTH_BOX_GAP: f32 = 4.0;
 
 /// The single shared RIGHT EDGE that every row's right-most element aligns to: the
-/// value boxes (Volume/Release/Crossover), the curve box (Amplitude), and the plain
-/// sliders (Balance/Rumble mix) all end here. `scale` keeps the inset proportional on
-/// an enlarged pinned row. (The Amplitude *range slider* stops short of this to leave
-/// room for the curve box, which then reaches the edge — see asth_amp_slider_right.)
+/// value boxes and the Amplitude row's curve box all end here. `scale` keeps the
+/// inset proportional on an enlarged pinned row.
 pub(crate) fn asth_row_right_edge(body_w: f32, scale: f32) -> f32 {
     body_w - ASTH_RIGHT_INSET * scale
 }
 
-/// Right edge of the Amplitude row's RANGE SLIDER: stops `curve_w + gap` short of the
-/// shared edge so the curve box occupies that trailing slot and reaches the edge.
-pub(crate) fn asth_amp_slider_right(body_w: f32, scale: f32) -> f32 {
-    asth_row_right_edge(body_w, scale) - (ASTH_CURVE_BOX_W + ASTH_BOX_GAP) * scale
-}
-
-/// A calibration row: left label, a flexible slider rail, and a fixed-width EDITABLE
-/// value box whose right edge aligns to `asth_value_right_edge(body_w)`. Pixel-precise
-/// (item spacing zeroed, explicit `add_space`) so all rows line up exactly. `edit`
-/// renders the DragValue (the editable readout) into the fixed box and reports change.
-/// `scale` scales the fixed cells so they grow with the text on a pinned, enlarged row.
+/// A slider row: left label, a flexible slider rail, and a box the same width on
+/// every row whose right edge is the shared one. Every slider row is this shape —
+/// the rails start and end together, and so do the boxes. Pixel-precise (item
+/// spacing zeroed, explicit `add_space`). `draw` renders the rail and then what
+/// goes in the box (a value, or the Amplitude row's curve box).
 pub(crate) fn asth_value_row(
     ui: &mut egui::Ui,
     label: &str,
-    label_w: f32,
+    cells: AsthCells,
     body_w: f32,
     scale: f32,
     changed: &mut bool,
@@ -119,7 +135,7 @@ pub(crate) fn asth_value_row(
     // `&mut` to the row's value without the borrow checker seeing two simultaneously.
     draw: impl FnOnce(&mut egui::Ui, f32, f32) -> bool,
 ) -> egui::Rect {
-    let val_box_w = ASTH_VAL_BOX_W * scale;
+    let (label_w, val_box_w) = (cells.label_w, cells.box_w);
     let gap = ASTH_BOX_GAP * scale;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -127,14 +143,14 @@ pub(crate) fn asth_value_row(
         // Value box right edge = the shared row right edge; rail fills the space
         // between the label and the box.
         let right_edge = asth_row_right_edge(body_w, scale);
-        let rail_w = (right_edge - val_box_w - gap - label_w).max(40.0 * scale);
+        let rail_w = (right_edge - val_box_w - gap - label_w).max(ASTH_MIN_RAIL * scale);
         ui.spacing_mut().slider_width = rail_w;
         *changed |= draw(ui, rail_w, val_box_w);
     }).response.rect
 }
 
-/// Inside an `asth_value_row` draw closure: render the slider then the fixed-width
-/// right-aligned editable value box for a single `value`, both editing it. Returns
+/// Inside an `asth_value_row` draw closure: render the slider then the editable
+/// value box for a single `value`, filling the box, both editing it. Returns
 /// whether `value` changed. `gap` is the (scaled) space before the box.
 pub(crate) fn asth_slider_and_box(
     ui: &mut egui::Ui,
@@ -147,11 +163,7 @@ pub(crate) fn asth_slider_and_box(
     let mut changed = slider(ui, value).changed();
     ui.add_space(gap);
     let row_h = ui.spacing().interact_size.y.max(14.0);
-    ui.allocate_ui_with_layout(
-        egui::vec2(box_w, row_h),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| { changed |= ui.add(drag(value)).changed(); },
-    );
+    changed |= ui.add_sized(egui::vec2(box_w, row_h), drag(value)).changed();
     changed
 }
 
@@ -159,7 +171,7 @@ pub(crate) fn asth_slider_and_box(
 /// to a stable `element_id` (so it can be pinned to a sub-patch body individually)
 /// and is rendered by the SAME code inline (in the node body) and when pinned.
 #[derive(Clone, Copy, PartialEq)]
-pub(crate) enum AsthRow { Mode, Volume, Release, Crossover, Amplitude, Balance, Swap, Bands, RumbleMix }
+pub(crate) enum AsthRow { Mode, Volume, Release, Crossover, Amplitude, Balance, Swap, Bands, Pads, RumbleMix }
 
 impl AsthRow {
     /// Stable element id used for pinning + the pinned-element dispatch.
@@ -173,15 +185,16 @@ impl AsthRow {
             AsthRow::Balance   => "asth_balance",
             AsthRow::Swap      => "asth_swap_row",
             AsthRow::Bands     => "asth_bands_row",
+            AsthRow::Pads      => "asth_pads_row",
             AsthRow::RumbleMix => "asth_rumble_mix",
         }
     }
     /// Calibration rows drawn by the shared `asth_draw_row` slider renderer. The
     /// capture-mode block (`Mode`) is drawn separately by `asth_draw_mode_block` and
     /// is therefore NOT in this list — but it is still a recognized pinnable element.
-    const ALL: [AsthRow; 8] = [
+    const ALL: [AsthRow; 9] = [
         AsthRow::Volume, AsthRow::Release, AsthRow::Crossover, AsthRow::Amplitude,
-        AsthRow::Balance, AsthRow::Swap, AsthRow::Bands, AsthRow::RumbleMix,
+        AsthRow::Balance, AsthRow::Swap, AsthRow::Bands, AsthRow::Pads, AsthRow::RumbleMix,
     ];
     /// Recognize any pinnable ASTH element id (the calibration rows plus the mode block).
     pub(crate) fn from_element_id(id: &str) -> Option<AsthRow> {
@@ -189,6 +202,24 @@ impl AsthRow {
         AsthRow::ALL.into_iter().find(|r| r.element_id() == id)
     }
 }
+
+/// Where the audio comes from: the `asth_mode` value, its word, and what it is.
+const ASTH_CAPTURE_CHOICES: [(&str, &str, &str); 3] = [
+    ("process", "app", "One app's audio, picked below."),
+    ("focused", "focused", "Whatever app has the focus."),
+    ("system", "system", "The whole system mix."),
+];
+
+/// The Trackpads row's choices: the `asth_pads` value, its word, and what it does.
+const ASTH_PAD_CHOICES: [(&str, &str, &str); 3] = [
+    ("off", "off", "The trackpads play nothing of the audio."),
+    ("low", "low band", "A Steam Controller's trackpads play the low band (under the crossover) as \
+        a tone of their own, each its side's, on top of what the grips play. A pad without \
+        trackpads ignores it."),
+    ("high", "high band", "A Steam Controller's trackpads play the high band (over the crossover) as \
+        a tone of their own, each its side's, on top of what the grips play. A pad without \
+        trackpads ignores it."),
+];
 
 /// Draw ONE calibration row into the current `ui`, mutating `a`. Returns
 /// `(changed, row_rect)`. `body_w` is the row's content width (slider scales with it).
@@ -210,7 +241,8 @@ pub(crate) fn asth_draw_row(
     body_w: f32,
     scale: f32,
 ) -> (bool, egui::Rect) {
-    let label_w = 64.0 * scale;
+    let cells = AsthCells::measure(ui);
+    let label_w = cells.label_w;
     let mut changed = false;
     let rect = match row {
         // The mode block is drawn by `asth_draw_mode_block`, not as a slider row;
@@ -222,7 +254,7 @@ pub(crate) fn asth_draw_row(
         }
         AsthRow::Volume => {
             let mut v = a.volume;
-            let rect = asth_value_row(ui, "Volume", label_w, body_w, scale, &mut changed,
+            let rect = asth_value_row(ui, "Volume", cells, body_w, scale, &mut changed,
                 |ui, _rail, box_w| asth_slider_and_box(ui, &mut v, box_w, ASTH_BOX_GAP * scale,
                     |ui, val| ui.add(egui::Slider::new(val, 0.0..=2.0).show_value(false))
                         .on_hover_text("Input gain applied before detection — lower it to tame a hot/clipping source."),
@@ -233,7 +265,7 @@ pub(crate) fn asth_draw_row(
         }
         AsthRow::Release => {
             let mut ms = a.release;
-            let rect = asth_value_row(ui, "Release", label_w, body_w, scale, &mut changed,
+            let rect = asth_value_row(ui, "Release", cells, body_w, scale, &mut changed,
                 |ui, _rail, box_w| asth_slider_and_box(ui, &mut ms, box_w, ASTH_BOX_GAP * scale,
                     |ui, val| ui.add(egui::Slider::new(val, 1.0..=500.0).smart_aim(false).show_value(false))
                         .on_hover_text("How quickly rumble fades after the audio stops."),
@@ -244,44 +276,53 @@ pub(crate) fn asth_draw_row(
         }
         AsthRow::Crossover => {
             let mut hz = a.crossover;
-            let rect = asth_value_row(ui, "Crossover", label_w, body_w, scale, &mut changed,
+            let rect = asth_value_row(ui, "Crossover", cells, body_w, scale, &mut changed,
                 |ui, _rail, box_w| asth_slider_and_box(ui, &mut hz, box_w, ASTH_BOX_GAP * scale,
-                    |ui, val| ui.add(egui::Slider::new(val, 60.0..=800.0).logarithmic(true).show_value(false))
+                    |ui, val| ui.add(egui::Slider::new(val, 60.0..=1200.0).logarithmic(true).show_value(false))
                         .on_hover_text("Split between the low (LF) and high (HF) carriers; the LRA plays both at once."),
-                    |val| egui::DragValue::new(val).speed(1.0).range(60.0..=800.0).max_decimals(0).suffix(" Hz")),
+                    |val| egui::DragValue::new(val).speed(1.0).range(60.0..=1200.0).max_decimals(0).suffix(" Hz")),
             );
             if (hz - a.crossover).abs() > f32::EPSILON { a.crossover = hz; changed = true; }
             rect
         }
-        AsthRow::Amplitude => ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            slider_label(ui, "Amplitude", label_w);
-            // Range slider stops short of the shared edge to leave room for the curve
-            // box, which fills the trailing slot and reaches the shared edge — so the
-            // curve box's right edge lines up with the value boxes above.
-            let sw = (asth_amp_slider_right(body_w, scale) - label_w).clamp(40.0 * scale, 800.0 * scale);
-            let mut lo = a.amp_min; let mut hi = a.amp_max;
-            let r = crate::canvas::header_controls::range_slider(ui, &mut lo, &mut hi, 0.0, 1.0, sw)
-                .on_hover_text("Floor (lift weak audio off the dead zone) … ceiling (cap). Curve box reshapes the response.");
-            if r.changed() || (lo - a.amp_min).abs() > f32::EPSILON || (hi - a.amp_max).abs() > f32::EPSILON {
+        AsthRow::Amplitude => {
+            let (mut lo, mut hi, mut exp) = (a.amp_min, a.amp_max, a.curve);
+            let rect = asth_value_row(ui, "Amplitude", cells, body_w, scale, &mut changed, |ui, rail_w, box_w| {
+                let r = crate::canvas::header_controls::range_slider(ui, &mut lo, &mut hi, 0.0, 1.0, rail_w)
+                    .on_hover_text("Floor (lift weak audio off the dead zone) … ceiling (cap). Curve box reshapes the response.");
+                ui.add_space(ASTH_BOX_GAP * scale);
+                // The curve box in the value boxes' slot, its right edge on theirs.
+                let row_h = ui.spacing().interact_size.y.max(14.0);
+                ui.allocate_ui_with_layout(egui::vec2(box_w, row_h), egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| crate::canvas::header_controls::curve_box(ui, &mut exp, 1.0));
+                r.changed()
+            });
+            if (lo - a.amp_min).abs() > f32::EPSILON || (hi - a.amp_max).abs() > f32::EPSILON {
                 a.amp_min = lo; a.amp_max = hi; changed = true;
             }
-            ui.add_space(ASTH_BOX_GAP * scale);
-            let mut exp = a.curve;
-            crate::canvas::header_controls::curve_box(ui, &mut exp, 1.0);
             if (exp - a.curve).abs() > f32::EPSILON { a.curve = exp; changed = true; }
-        }).response.rect,
+            rect
+        }
         AsthRow::Balance => {
             // Balance sets the modulation's depth, so there's nothing for it to do
             // with Pure tones on.
             let pure = a.pure;
-            asth_slider_row(ui, "Balance", label_w, body_w, scale, &mut changed, |ui, _w| {
-                ui.add_enabled(!pure, egui::Slider::new(&mut a.freq_bias, -1.0..=1.0).show_value(false))
-                    .on_hover_text("◄ smooth low rumble · high-frequency texture ►. \
-                                    The modulator band is rendered as a rapid amplitude \
-                                    flutter on the felt carrier (the Switch LRA can't play a separate tone).")
-                    .on_disabled_hover_text("Pure tones is on: the bands don't modulate each other.")
-            })
+            let mut bias = a.freq_bias;
+            let rect = asth_value_row(ui, "Balance", cells, body_w, scale, &mut changed,
+                |ui, _rail, box_w| {
+                    if pure {
+                        ui.disable();
+                    }
+                    asth_slider_and_box(ui, &mut bias, box_w, ASTH_BOX_GAP * scale,
+                        |ui, val| ui.add(egui::Slider::new(val, -1.0..=1.0).show_value(false))
+                            .on_hover_text("◄ smooth low rumble · high-frequency texture ►. \
+                                            The modulator band is rendered as a rapid amplitude \
+                                            flutter on the felt carrier (the Switch LRA can't play a separate tone).")
+                            .on_disabled_hover_text("Pure tones is on: the bands don't modulate each other."),
+                        |val| egui::DragValue::new(val).speed(0.01).range(-1.0..=1.0).max_decimals(2))
+                });
+            if (bias - a.freq_bias).abs() > f32::EPSILON { a.freq_bias = bias; changed = true; }
+            rect
         }
         AsthRow::Swap => ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
@@ -302,18 +343,39 @@ pub(crate) fn asth_draw_row(
                                 HF on the right. A pad that plays one pitch per side then \
                                 plays two at once.")
                 .clicked();
-            ui.add_space(4.0 * scale);
+            ui.add_space(ASTH_BOX_GAP * scale);
             changed |= word_switch(ui, &mut a.pure, "pure tones")
                 .on_hover_text("The bands don't modulate each other: each carrier plays \
                                 clean, with no flutter from the other band.")
                 .clicked();
         }).response.rect,
-        AsthRow::RumbleMix => asth_slider_row(ui, "Rumble mix", label_w, body_w, scale, &mut changed, |ui, _w| {
-            ui.add(egui::Slider::new(&mut a.modulator, 0.0..=1.0).show_value(false))
-                .on_hover_text("◄ gate (audio only when the game rumbles) · replace (pure audio) ►\n\
-                                The game's own rumble never plays alongside the audio: \
-                                it only decides how much of the audio you feel.")
-        }),
+        AsthRow::Pads => ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            slider_label(ui, "Trackpads", label_w);
+            for (i, (value, word, tip)) in ASTH_PAD_CHOICES.into_iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(ASTH_BOX_GAP * scale);
+                }
+                let mut on = a.pads == value;
+                if word_switch(ui, &mut on, word).on_hover_text(tip).clicked() && a.pads != value {
+                    a.pads = value.to_string();
+                    changed = true;
+                }
+            }
+        }).response.rect,
+        AsthRow::RumbleMix => {
+            let mut mix = a.modulator;
+            let rect = asth_value_row(ui, "Rumble mix", cells, body_w, scale, &mut changed,
+                |ui, _rail, box_w| asth_slider_and_box(ui, &mut mix, box_w, ASTH_BOX_GAP * scale,
+                    |ui, val| ui.add(egui::Slider::new(val, 0.0..=1.0).show_value(false))
+                        .on_hover_text("◄ gate (audio only when the game rumbles) · replace (pure audio) ►\n\
+                                        The game's own rumble never plays alongside the audio: \
+                                        it only decides how much of the audio you feel."),
+                    |val| egui::DragValue::new(val).speed(0.01).range(0.0..=1.0).max_decimals(2)),
+            );
+            if (mix - a.modulator).abs() > f32::EPSILON { a.modulator = mix; changed = true; }
+            rect
+        }
     };
     (changed, rect)
 }
@@ -324,25 +386,30 @@ pub(crate) fn asth_draw_row(
 /// authored height. Returns the applied scale so the caller can scale the row's fixed
 /// cell widths (label / value box) by the SAME factor — otherwise the grown text
 /// overflows those fixed cells (the overlap/crop the user saw).
-/// Analytic minimum row width at scale 1.0: fixed cells (label / value box /
-/// curve box / inset) plus the flexible rail collapsed to its 40px minimum.
-/// Used to cap the height-driven scale by the available WIDTH — without it a
-/// short-and-narrow pin grows its text until nothing is left for the slider.
-pub(crate) fn asth_row_min_w(row: AsthRow) -> f32 {
+/// A row's minimum width in the current style: its label column and fixed cells
+/// (value box / curve box / inset) plus the flexible rail at its minimum, or its
+/// switches. Used to cap the height-driven scale by the available WIDTH — without
+/// it a short-and-narrow pin grows its text until nothing is left for the slider —
+/// and, the widest of them, as the narrowest the rows' column gets.
+pub(crate) fn asth_row_min_w(ui: &egui::Ui, row: AsthRow) -> f32 {
+    let c = AsthCells::measure(ui);
+    let fixed = c.label_w + ASTH_RIGHT_INSET;
     match row {
-        // Capture-mode block: App/Focused/System selector + caption.
-        AsthRow::Mode => 240.0,
-        // label 64 + rail 40 + gap 4 + value box 50 + inset 6.
-        AsthRow::Volume | AsthRow::Release | AsthRow::Crossover => 164.0,
-        // label 64 + rail 40 + gap 4 + curve box 34 + inset 6.
-        AsthRow::Amplitude => 148.0,
-        // label 64 + rail 40 + inset 6.
-        AsthRow::Balance | AsthRow::RumbleMix => 110.0,
-        // label cell + "HF carrier / LF texture" checkbox.
-        AsthRow::Swap => 230.0,
-        // label cell + "Split L/R" and "Pure tones" checkboxes.
-        AsthRow::Bands => 250.0,
+        AsthRow::Mode => fixed + switches_w(ui, &ASTH_CAPTURE_CHOICES.map(|c| c.1)),
+        AsthRow::Volume | AsthRow::Release | AsthRow::Crossover | AsthRow::Amplitude | AsthRow::Balance
+        | AsthRow::RumbleMix => fixed + ASTH_MIN_RAIL + ASTH_BOX_GAP + c.box_w,
+        AsthRow::Swap => fixed + switches_w(ui, &["HF carrier / LF texture"]),
+        AsthRow::Bands => fixed + switches_w(ui, &["split L/R", "pure tones"]),
+        AsthRow::Pads => fixed + switches_w(ui, &ASTH_PAD_CHOICES.map(|c| c.1)),
     }
+}
+
+/// The narrowest the capture mode and the rows get beside the scope: their widest.
+fn asth_rows_min_w(ui: &egui::Ui) -> f32 {
+    AsthRow::ALL.into_iter().chain([AsthRow::Mode])
+        .map(|r| asth_row_min_w(ui, r))
+        .fold(0.0f32, f32::max)
+        .ceil()
 }
 
 /// Publish an ASTH pin's analytic natural size into the shared per-pin cache
@@ -390,12 +457,13 @@ pub(crate) fn asth_params_from_node(snarl: &Snarl<NodeData>, node_id: NodeId) ->
             swap: p.get("asth_swap").and_then(|v| v.as_bool()).unwrap_or(false),
             split: p.get("asth_split").and_then(|v| v.as_bool()).unwrap_or(false),
             pure: p.get("asth_pure").and_then(|v| v.as_bool()).unwrap_or(false),
+            pads: p.get("asth_pads").and_then(|v| v.as_str()).unwrap_or("off").to_string(),
         }
     }).unwrap_or(AsthParams {
         mode: "system".into(), target_name: String::new(), include_tree: true,
         modulator: 1.0, volume: 1.0, freq_bias: 0.0, curve: 1.0,
         amp_min: 0.0, amp_max: 1.0, release: 30.0, crossover: 250.0, swap: false,
-        split: false, pure: false,
+        split: false, pure: false, pads: "off".into(),
     })
 }
 
@@ -414,6 +482,7 @@ pub(crate) fn asth_write_params(snarl: &mut Snarl<NodeData>, node_id: NodeId, a:
         n.params.insert("asth_swap".into(), serde_json::Value::Bool(a.swap));
         n.params.insert("asth_split".into(), serde_json::Value::Bool(a.split));
         n.params.insert("asth_pure".into(), serde_json::Value::Bool(a.pure));
+        n.params.insert("asth_pads".into(), serde_json::Value::String(a.pads.clone()));
     }
 }
 
@@ -429,15 +498,17 @@ pub(crate) fn asth_draw_mode_block(
     salt: egui::Id,
 ) -> (bool, egui::Rect) {
     let mut changed = false;
+    let cells = AsthCells::measure(ui);
     let resp = ui.vertical(|ui| {
         ui.set_max_width(body_w);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Capture from").small().weak());
-            for (mode, word, tip) in [
-                ("process", "app", "One app's audio, picked below."),
-                ("focused", "focused", "Whatever app has the focus."),
-                ("system", "system", "The whole system mix."),
-            ] {
+            // In the rows' label column, so these switches line up with their controls.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            slider_label(ui, "Capture from", cells.label_w);
+            for (i, (mode, word, tip)) in ASTH_CAPTURE_CHOICES.into_iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(ASTH_BOX_GAP);
+                }
                 let mut on = a.mode == mode;
                 if word_switch(ui, &mut on, word).on_hover_text(tip).clicked() && a.mode != mode {
                     a.mode = mode.to_string();
@@ -484,7 +555,7 @@ pub(crate) fn render_asth_pinned_mode(
 ) {
     let mut a = asth_params_from_node(snarl, inner_id);
     ui.set_max_width(container.x);
-    let min_w = asth_row_min_w(AsthRow::Mode);
+    let min_w = asth_row_min_w(ui, AsthRow::Mode);
     asth_seed_pin_natural(ui, egui::vec2(min_w, 96.0));
     let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 96.0,
         container.x / min_w);
@@ -516,7 +587,7 @@ pub(crate) fn render_asth_pinned_row(
     // below). The returned scale also grows the row's fixed cells (label /
     // value box) so the enlarged text doesn't overflow them, and is capped by
     // the width so those cells never squeeze the rail below its minimum.
-    let min_w = asth_row_min_w(row);
+    let min_w = asth_row_min_w(ui, row);
     asth_seed_pin_natural(ui, egui::vec2(min_w, 22.0));
     let scale = apply_asth_row_height_scale(ui, container.y.max(20.0), 22.0,
         container.x / min_w);
@@ -545,7 +616,7 @@ pub(crate) fn render_asth_pinned_scope(
     let uid = effective_publish_uid(inner_id, bridged_parent);
     let a = asth_params_from_node(snarl, inner_id);
     let mut eq = snarl.get_node(inner_id)
-        .and_then(|n| n.params.get("asth_eq_points").and_then(|v| v.as_array()).map(|arr| {
+        .and_then(|n| n.params.get("asth_eq_wide").and_then(|v| v.as_array()).map(|arr| {
             arr.iter().filter_map(|pt| {
                 let p = pt.as_array()?;
                 Some([p.get(0)?.as_f64()? as f32, p.get(1)?.as_f64()? as f32])
@@ -571,7 +642,7 @@ pub(crate) fn render_asth_pinned_scope(
         if let Some(n) = snarl.get_node_mut(inner_id) {
             let arr = serde_json::Value::Array(eq.iter()
                 .map(|p| serde_json::json!([p[0], p[1]])).collect());
-            n.params.insert("asth_eq_points".into(), arr);
+            n.params.insert("asth_eq_wide".into(), arr);
         }
     }
     // Outline on top of the scope content (drawn last so it frames everything).
@@ -579,9 +650,6 @@ pub(crate) fn render_asth_pinned_scope(
         ui.painter().rect_stroke(frame_rect, 2.0, stroke, egui::StrokeKind::Inside);
     }
 }
-
-/// The narrowest the capture mode and the rows get beside the scope.
-const ASTH_ROWS_MIN_W: f32 = 240.0;
 
 /// rumble modulator slider. All persisted into `params` (`asth_*`) which the
 /// engine reads (see `eval::loopback_request_from_params` + the eval block).
@@ -602,7 +670,7 @@ pub(crate) fn show_audio_stream_haptics_body(
     // Band EQ control points (x = band position 0..1, y = gain 0..1). Default flat
     // at unity → single-carrier behavior until the user sculpts it.
     let mut asth_eq_points: Vec<[f32; 2]> = snarl.get_node(node_id)
-        .and_then(|n| n.params.get("asth_eq_points").and_then(|v| v.as_array()).map(|arr| {
+        .and_then(|n| n.params.get("asth_eq_wide").and_then(|v| v.as_array()).map(|arr| {
             arr.iter().filter_map(|pt| {
                 let a = pt.as_array()?;
                 Some([a.get(0)?.as_f64()? as f32, a.get(1)?.as_f64()? as f32])
@@ -627,12 +695,13 @@ pub(crate) fn show_audio_stream_haptics_body(
     // Wider than it's tall, with room for both, the scope goes in a column of its own on the
     // right, as tall as the module, the capture mode and the rows in a column beside it, a
     // bar between the two sharing the width out. Else the scope is under the rows.
+    let rows_min_w = asth_rows_min_w(ui);
     let wide = if scope_size.x > frame_h {
-        super::kit::beside(snarl, node_id, scope_size.x, ASTH_ROWS_MIN_W, 180.0, "view_frac", 0.5)
+        super::kit::beside(snarl, node_id, scope_size.x, rows_min_w, 180.0, "view_frac", 0.5)
     } else {
         None
     };
-    let body_w = wide.map_or(scope_size.x.clamp(180.0, 900.0), |b| b.left_w);
+    let body_w = wide.map_or(scope_size.x.clamp(rows_min_w.min(900.0), 900.0), |b| b.left_w);
 
     // The scope - the EF oscilloscope over the spectrum/EQ - under its caption: `scope_size`
     // big, or beside the rows as wide as its column and down to `bottom`.
@@ -740,9 +809,10 @@ pub(crate) fn show_audio_stream_haptics_body(
             n.params.insert("asth_swap".into(), serde_json::Value::Bool(a.swap));
             n.params.insert("asth_split".into(), serde_json::Value::Bool(a.split));
             n.params.insert("asth_pure".into(), serde_json::Value::Bool(a.pure));
+            n.params.insert("asth_pads".into(), serde_json::Value::String(a.pads));
             let eq = serde_json::Value::Array(asth_eq_points.iter()
                 .map(|p| serde_json::json!([p[0], p[1]])).collect());
-            n.params.insert("asth_eq_points".into(), eq);
+            n.params.insert("asth_eq_wide".into(), eq);
         }
     }
 }
@@ -823,7 +893,7 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
 
 /// Live spectrum + interactive band-EQ editor for the Audio Stream Haptics node.
 ///
-/// Draws the log-band audio spectrum (~40 Hz – 1.25 kHz) as bars, overlays an
+/// Draws the log-band audio spectrum (40 Hz – 2 kHz, the wide pitch scale) as bars, overlays an
 /// editable per-band gain curve (the "band EQ" — x = band position, y = gain),
 /// and highlights the band the multi-band engine collapses to as the Switch Pro
 /// carrier (the pad plays one carrier per side). The EQ gain is applied to the

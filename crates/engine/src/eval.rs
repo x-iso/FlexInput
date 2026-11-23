@@ -1080,7 +1080,9 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                         let routed = if classic && matches!(dst_pin, "hd_l_amp" | "hd_r_amp") {
                             shape_hd_feedback(sig, fb.rumble_floor, fb.rumble_max, fb.rumble_exp)
                         } else {
-                            sig
+                            // A pitch a virtual pad measured is on the wide scale;
+                            // this pad plays it on its own.
+                            feedback::game_pitch_on_pad(dst_pin, sig, &dst_pins)
                         };
                         // COMBINE, don't first-wins. Multiple virtual sinks can
                         // auto-map FROM the same physical device (e.g. a virtual

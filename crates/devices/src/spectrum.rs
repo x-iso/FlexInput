@@ -2,9 +2,11 @@
 //!
 //! Feeds on the same captured render-mix samples as [`crate::haptic_pcm`], but
 //! instead of one envelope+carrier it produces a **log-spaced magnitude band
-//! spectrum** over the Switch Pro HD-rumble frequency range (~40–1250 Hz). That
+//! spectrum** over the wide pitch scale (40–2000 Hz, `automap::WIDE_HZ`): a
+//! Switch Pro's HD rumble to 1253 Hz and a Steam Controller's to 2000. That
 //! spectrum is what the node's spectrum view draws and what the multi-band engine
-//! maps onto Switch Pro carriers (one carrier per side after collapse).
+//! maps onto carriers (one carrier per side after collapse); a band's position IS
+//! its pitch on that scale.
 //!
 //! Pure DSP, no I/O. The FFT (`rustfft`) is pure Rust — it carries no `windows`
 //! crate so it can't reintroduce the COM-major conflict the wasapi pin guards.
@@ -26,9 +28,9 @@ pub const SAMPLE_RATE_HZ: f32 = 48_000.0;
 /// count in the spectrum view and the band count the multi-band engine maps.
 pub const N_BANDS: usize = 32;
 
-/// Haptic frequency range the bands span — the Switch Pro HD-rumble usable band.
-pub const BAND_MIN_HZ: f32 = 40.0;
-pub const BAND_MAX_HZ: f32 = 1253.0;
+/// Haptic frequency range the bands span: the wide pitch scale.
+pub const BAND_MIN_HZ: f32 = flexinput_core::automap::WIDE_HZ.0;
+pub const BAND_MAX_HZ: f32 = flexinput_core::automap::WIDE_HZ.1;
 
 /// A streaming spectrum analyzer: push samples, read the latest log-band spectrum.
 pub struct SpectrumAnalyzer {
@@ -131,8 +133,8 @@ pub fn band_center_hz(b: usize) -> f32 {
     BAND_MIN_HZ * (BAND_MAX_HZ / BAND_MIN_HZ).powf(t)
 }
 
-/// Normalized position (0..1) of band `b`'s center, matching the `*_freq` pin /
-/// Switch Pro carrier convention so the engine can map a band straight to a carrier.
+/// Normalized position (0..1) of band `b`'s center: its pitch on the wide scale
+/// (`automap::PitchScale::Wide`).
 pub fn band_center_norm(b: usize) -> f32 {
     (b as f32 + 0.5) / N_BANDS as f32
 }

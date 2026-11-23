@@ -39,20 +39,21 @@ pub const FEEDBACK_PAIRS: &[(&str, &[&str])] = &[
     ("rumble_strong", &["rumble_strong", "hd_l_amp", "hd_rumble_l"]),
     ("rumble_weak",   &["rumble_weak",   "hd_r_amp", "hd_rumble_r"]),
     // HD-rumble first carrier, as a virtual DualSense with USB audio measures it
-    // from the haptic waveform a game streams to it. Direct id match: pads with
-    // HD actuators (Switch Pro, a USB DualSense) take it; the engine combines it
-    // with any classic rumble on the same pin by magnitude.
-    ("hd_l_amp",  &["hd_l_amp"]),
-    ("hd_l_freq", &["hd_l_freq"]),
-    ("hd_r_amp",  &["hd_r_amp"]),
-    ("hd_r_freq", &["hd_r_freq"]),
-    // HD-rumble second carrier (HF). Direct id match — only pads that expose the
-    // hd2_* inputs (Switch Pro, DualSense) receive it; others drop it silently and
-    // play carrier 1 alone.
-    ("hd2_l_amp",  &["hd2_l_amp"]),
-    ("hd2_l_freq", &["hd2_l_freq"]),
-    ("hd2_r_amp",  &["hd2_r_amp"]),
-    ("hd2_r_freq", &["hd2_r_freq"]),
+    // from the haptic waveform a game streams to it. Pads with HD actuators
+    // (Switch Pro, a USB DualSense) take it on the same pins, a Steam Controller on
+    // its grips'; the engine combines it with any classic rumble on the same pin
+    // by magnitude. The pitch goes over on each pad's own scale (`PitchScale`).
+    ("hd_l_amp",  &["hd_l_amp", "grip_l_amp"]),
+    ("hd_l_freq", &["hd_l_freq", "grip_l_freq"]),
+    ("hd_r_amp",  &["hd_r_amp", "grip_r_amp"]),
+    ("hd_r_freq", &["hd_r_freq", "grip_r_freq"]),
+    // HD-rumble second carrier (HF): only pads that play two carriers (Switch Pro,
+    // DualSense, a Steam Controller's grips) receive it; others drop it silently
+    // and play carrier 1 alone.
+    ("hd2_l_amp",  &["hd2_l_amp", "grip2_l_amp"]),
+    ("hd2_l_freq", &["hd2_l_freq", "grip2_l_freq"]),
+    ("hd2_r_amp",  &["hd2_r_amp", "grip2_r_amp"]),
+    ("hd2_r_freq", &["hd2_r_freq", "grip2_r_freq"]),
     ("lightbar_r",    &["lightbar_r"]),
     ("lightbar_g",    &["lightbar_g"]),
     ("lightbar_b",    &["lightbar_b"]),
@@ -124,7 +125,8 @@ pub fn feedback_group(pin: &str) -> Option<FeedbackGroup> {
         p if p.starts_with("trigger_r_") => TriggerRight,
         p if p.starts_with("hd_") || p.starts_with("hd2_") || p.starts_with("ds_") => Rumble,
         p if p.starts_with("tp_") => Trackpad,
-        "grip_l_click" | "grip_r_click" => Rumble,
+        // A Steam Controller's grip motors: its rumble, carriers and clicks.
+        p if p.starts_with("grip_l_") || p.starts_with("grip_r_") || p.starts_with("grip2_") => Rumble,
         _ => return None,
     })
 }
@@ -496,6 +498,83 @@ pub fn switch_hd_freq(hz: f32) -> f32 {
     ((hz.max(1.0) / SWITCH_HD_HZ.0).log2() * 32.0 / 126.0).clamp(0.0, 1.0)
 }
 
+/// The pitches the wide scale spans, 0 to 1, evenly by octave: a Steam
+/// Controller's own (`grip*_freq`, `tp_*_freq`), and what a game's haptics and
+/// Audio Stream Haptics carry a pitch on to whatever pad plays it.
+pub const WIDE_HZ: (f32, f32) = (40.0, 2000.0);
+
+/// How a pad reads a frequency pin's 0–1 as a pitch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PitchScale {
+    /// A DualSense's actuators: straight across
+    /// [`haptic_pcm::FREQ_MIN_HZ`](crate::haptic_pcm::FREQ_MIN_HZ)..`FREQ_MAX_HZ`.
+    DualSense,
+    /// A Switch Pro's HD rumble: its frequency table, [`SWITCH_HD_HZ`].
+    Switch,
+    /// [`WIDE_HZ`], evenly by octave.
+    Wide,
+}
+
+impl PitchScale {
+    /// The pitch at `v` (0–1).
+    pub fn hz(self, v: f32) -> f32 {
+        use crate::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
+        let v = v.clamp(0.0, 1.0);
+        match self {
+            PitchScale::DualSense => FREQ_MIN_HZ + (FREQ_MAX_HZ - FREQ_MIN_HZ) * v,
+            PitchScale::Switch => SWITCH_HD_HZ.0 * 2f32.powf(v * 126.0 / 32.0),
+            PitchScale::Wide => WIDE_HZ.0 * (WIDE_HZ.1 / WIDE_HZ.0).powf(v),
+        }
+    }
+
+    /// The 0–1 that plays `hz`, held to the scale's ends.
+    pub fn value(self, hz: f32) -> f32 {
+        use crate::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
+        match self {
+            PitchScale::DualSense => ((hz - FREQ_MIN_HZ) / (FREQ_MAX_HZ - FREQ_MIN_HZ)).clamp(0.0, 1.0),
+            PitchScale::Switch => switch_hd_freq(hz),
+            PitchScale::Wide => ((hz.max(1.0) / WIDE_HZ.0).ln() / (WIDE_HZ.1 / WIDE_HZ.0).ln()).clamp(0.0, 1.0),
+        }
+    }
+
+    /// `v` on this scale, as the same pitch on `to`.
+    pub fn to(self, v: f32, to: PitchScale) -> f32 {
+        if self == to { v } else { to.value(self.hz(v)) }
+    }
+
+    /// The scale a pad with `pad_pins` reads its frequency pin `pin` on, or `None`
+    /// for a pin that carries no pitch (a trigger's effect rate is a byte).
+    pub fn of_pin<'a>(pin: &str, pad_pins: impl IntoIterator<Item = &'a str>) -> Option<PitchScale> {
+        if !pin.ends_with("_freq") {
+            return None;
+        }
+        if pin.starts_with("grip") || pin.starts_with("tp_") {
+            Some(PitchScale::Wide)
+        } else if pin.starts_with("ds_") {
+            Some(PitchScale::DualSense)
+        } else if pin.starts_with("hd") {
+            // The Switch Pro layout's legacy pin tells its pads apart.
+            let switch = pad_pins.into_iter().any(|p| p == "hd_rumble_l");
+            Some(if switch { PitchScale::Switch } else { PitchScale::DualSense })
+        } else {
+            None
+        }
+    }
+}
+
+/// Pitches in Hz that a module hands a pad, each with the frequency pin it
+/// lands on: the pad's feedback pass puts the pitch on that pin's own scale
+/// ([`PitchScale::of_pin`]). Audio Stream Haptics sends its pitches this way, so
+/// whichever pad it drives plays the pitch it heard.
+pub const PITCH_HZ_PINS: [(&str, &str); 6] = [
+    ("hd_l_hz", "hd_l_freq"),
+    ("hd_r_hz", "hd_r_freq"),
+    ("hd2_l_hz", "hd2_l_freq"),
+    ("hd2_r_hz", "hd2_r_freq"),
+    ("tp_l_hz", "tp_l_freq"),
+    ("tp_r_hz", "tp_r_freq"),
+];
+
 /// The pitch a Switch Pro's rumble plays when nothing gives it one (a game's
 /// classic rumble, the ping): near its actuator's resonance, where it is felt
 /// most.
@@ -828,6 +907,16 @@ pub const FEEDBACK_INLET_PINS: &[AutoMapPin] = &[
     AutoMapPin { id: "tp_r_click", display_name: "Trackpad R: Click",     signal_type: SignalType::Bool },
     AutoMapPin { id: "grip_l_click", display_name: "Grip L: Click",       signal_type: SignalType::Bool },
     AutoMapPin { id: "grip_r_click", display_name: "Grip R: Click",       signal_type: SignalType::Bool },
+    // ── Steam Controller grip motors (two carriers each, the wide pitch scale) ─
+    // After the trackpads, for the same reason.
+    AutoMapPin { id: "grip_l_amp",   display_name: "Grip L: Amplitude",      signal_type: SignalType::Float },
+    AutoMapPin { id: "grip_l_freq",  display_name: "Grip L: Frequency",      signal_type: SignalType::Float },
+    AutoMapPin { id: "grip_r_amp",   display_name: "Grip R: Amplitude",      signal_type: SignalType::Float },
+    AutoMapPin { id: "grip_r_freq",  display_name: "Grip R: Frequency",      signal_type: SignalType::Float },
+    AutoMapPin { id: "grip2_l_amp",  display_name: "Grip L: Amp (carrier 2)",  signal_type: SignalType::Float },
+    AutoMapPin { id: "grip2_l_freq", display_name: "Grip L: Freq (carrier 2)", signal_type: SignalType::Float },
+    AutoMapPin { id: "grip2_r_amp",  display_name: "Grip R: Amp (carrier 2)",  signal_type: SignalType::Float },
+    AutoMapPin { id: "grip2_r_freq", display_name: "Grip R: Freq (carrier 2)", signal_type: SignalType::Float },
 ];
 
 /// Basic feedback OUTPUT taps the game is requesting on the virtual destination
@@ -1317,6 +1406,37 @@ mod tests {
         // The default pitch stays on the step it has played on: 51.
         let step = 32.0 + switch_hd_freq(SWITCH_RUMBLE_HZ) * 126.0;
         assert_eq!(step.round(), 51.0, "{step}");
+    }
+
+    // Each scale's ends, a pitch carried from one to another, and which scale a pad
+    // reads a pin on.
+    #[test]
+    fn a_pitch_keeps_its_hz_across_scales() {
+        use PitchScale::*;
+        assert_eq!(Wide.hz(0.0), 40.0);
+        assert!((Wide.hz(1.0) - 2000.0).abs() < 0.5);
+        assert!((Wide.hz(0.5) - 282.8).abs() < 0.5, "the middle is the octaves' middle");
+        assert_eq!(DualSense.hz(0.5), 290.0);
+        assert!((Switch.hz(0.5) - 320.0).abs() < 1.0);
+        for hz in [100.0f32, 180.0, 320.0, 480.0] {
+            for (from, to) in [(Wide, DualSense), (DualSense, Switch), (Switch, Wide), (Wide, Switch)] {
+                let v = from.value(hz);
+                assert!((to.hz(from.to(v, to)) - hz).abs() < 1.5, "{hz} Hz {from:?} -> {to:?}");
+            }
+        }
+        assert_eq!(Wide.to(Wide.value(1500.0), DualSense), 1.0, "past its top, a DualSense plays its top");
+        assert_eq!(Wide.to(0.0, Switch), 0.0, "and under its bottom, a Switch Pro its bottom");
+
+        let switch = ["hd_l_amp", "hd_l_freq", "hd_rumble_l"];
+        let ds = ["hd_l_freq", "ds_l_freq"];
+        assert_eq!(PitchScale::of_pin("hd_l_freq", switch), Some(Switch));
+        assert_eq!(PitchScale::of_pin("hd2_r_freq", switch), Some(Switch));
+        assert_eq!(PitchScale::of_pin("hd_l_freq", ds), Some(DualSense));
+        assert_eq!(PitchScale::of_pin("ds_l_freq", ds), Some(DualSense));
+        assert_eq!(PitchScale::of_pin("grip2_l_freq", []), Some(Wide));
+        assert_eq!(PitchScale::of_pin("tp_r_freq", []), Some(Wide));
+        assert_eq!(PitchScale::of_pin("trigger_l_freq", ds), None, "a trigger's rate isn't a pitch");
+        assert_eq!(PitchScale::of_pin("hd_l_amp", ds), None);
     }
 
     /// The step the encoder lands on for a pin value (`gyro.rs`

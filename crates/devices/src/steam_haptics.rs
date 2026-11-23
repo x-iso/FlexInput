@@ -8,9 +8,9 @@
 //! on the hardware (2026-10-31, over the puck):
 //!
 //!   * grip motors: a PCM stream, because only a waveform plays both carriers of
-//!     an `hd_*` / `hd2_*` pair. Report 0x86 sets the stream up for both motors,
-//!     then 0x87 pushes each side's samples. 0x44 reports back how each buffer
-//!     is doing, and the sending rate leans on it.
+//!     a `grip_*` / `grip2_*` pair. Report 0x86 sets the stream up for both motors,
+//!     then each 0x88 carries both sides' samples. 0x44 reports back how each
+//!     buffer is doing, and the sending rate trims itself by it, a little.
 //!   * trackpads: tones (report 0x83), which need no pacing. A stream reaches
 //!     each pad alone as well (see [`PAD_STREAM`]), which a soft click uses.
 //!   * trackpad clicks: the firmware's click command (report 0x82).
@@ -24,12 +24,11 @@
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use flexinput_core::automap::{click_envelope, TriggerCrossing, TriggerEdges};
-use flexinput_core::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
+use flexinput_core::automap::{click_envelope, PitchScale, TriggerCrossing, TriggerEdges};
 use hidapi::{HidApi, HidDevice};
 
 /// The Steam Controller and its dongles (`automap::capacitive_misc_mask` knows
@@ -44,7 +43,10 @@ const VENDOR_FIRST_USAGE_PAGE: u16 = 0xFF00;
 const REPORT_TONE: u8 = 0x83;
 const REPORT_COMMAND: u8 = 0x82;
 const REPORT_STREAM_OP: u8 = 0x86;
+/// Samples for one actuator: a trackpad's burst.
 const REPORT_STREAM_PUSH: u8 = 0x87;
+/// Samples for both grips in one report, `[0x88, n, left × 31, right × 31]`.
+const REPORT_STREAM_PUSH_GRIPS: u8 = 0x88;
 const REPORT_STREAM_STATUS: u8 = 0x44;
 /// Feature report 1 carries settings as `[1, op, len, id, value_le16]`.
 const FEATURE_REPORT: u8 = 1;
@@ -64,14 +66,18 @@ const COMMAND_CLICK_STRONG: u8 = 2;
 const STREAM_STOP: u8 = 1;
 const STREAM_START: u8 = 2;
 const STREAM_BOTH_GRIPS: u8 = 2;
-/// 4 kHz, signed 8-bit: a tenth of the puck's report rate for the two sides, and
-/// well above the highest carrier.
-const STREAM_FORMAT: u8 = 5;
+/// 4 kHz µ-law (G.711), which both the grips and the trackpads take. Heard on
+/// the pad over the puck (2026-11-23, `scbuzz` probe): clean through 0x88, as
+/// was 8-bit linear (format 5); at 8 kHz (format 8) the puck doesn't carry
+/// enough reports and the stream keeps running dry, a galloping stutter.
+const STREAM_FORMAT: u8 = 9;
 const STREAM_RATE: f32 = 4000.0;
+/// Samples in a trackpad's 0x87 report.
 const STREAM_CHUNK: usize = 62;
-/// 0x87's target for each motor. Not the sides the tone report uses, and id 1
-/// is ignored, so the right motor can't be reached as "1".
-const PUSH_TARGET: [u8; 2] = [0, 4];
+/// Samples per grip in a 0x88 report. The grips' samples went out in 0x87s first,
+/// each grip its own, and every tone rattled under the probe, even with the
+/// right grip sent nothing; through 0x88 the same tone is clean.
+const GRIP_SLOT: usize = 31;
 /// Each trackpad's stream, `(0x86 target, 0x87 target)`. Set up alone, the right
 /// pad takes id 5, which otherwise writes both.
 const PAD_STREAM: [(u8, u8); 2] = [(3, 3), (4, 5)];
@@ -89,15 +95,34 @@ const STATUS_ALREADY_RUNNING: u8 = 0x40;
 /// A stream with nothing to play ends this long after going quiet, so that a
 /// signal fading in and out doesn't set it up again every time.
 const STREAM_IDLE: Duration = Duration::from_millis(250);
-/// Ceiling on samples owed to a motor, so a stalled thread doesn't send a burst.
+/// Ceiling on samples owed to the grips, so a stalled thread doesn't send a burst.
 const MAX_OWED: f32 = STREAM_RATE * 0.1;
-/// How far to lean on the sending rate while a buffer reports low or high.
-const FLOW_LEAN: f32 = 1.0 / 8.0;
-const OVERRUN_BACKOFF: f32 = STREAM_RATE * 0.004;
+/// What a stream starts with in hand, and is topped up by when the pad says it
+/// ran dry: ~46 ms, so a late wake doesn't leave it nothing to play. 120 ms
+/// overran the pad's buffer under the probe: a thump each time.
+const STREAM_PRIME: f32 = 6.0 * GRIP_SLOT as f32;
+/// How long after it starts a stream's "ran dry" is the start's, not a real one.
+const STREAM_SETTLE: Duration = Duration::from_millis(200);
+/// How far the sending rate trims itself each time a buffer reports low or full,
+/// and how far it goes at most. Others streaming to this pad found it follows
+/// the pace samples arrive at (sent slow, a tone "plays longer and lower"), so a
+/// rate that swung by an eighth, as this one did, would swing the pitch two
+/// semitones back and forth.
+const TRIM_STEP: f32 = 0.001;
+const TRIM_MAX: f32 = 0.006;
+
+/// How fast a grip's carriers follow a new strength and pitch: about 3 ms, so a
+/// change that lands between two chunks glides rather than steps (a step every
+/// chunk, ~65 times a second, is a rattle of its own).
+const GLIDE_S: f32 = 0.003;
+/// The highest pitch the grips' stream plays: past it the 4 kHz stream has too
+/// few samples a cycle to make a tone. The trackpads' tones aren't sampled and go
+/// to the scale's top.
+const GRIP_STREAM_MAX_HZ: f32 = 1600.0;
 
 const SILENCE: f32 = 1.0 / 255.0;
 /// Where a carrier with an amplitude but no frequency sits: near the resonance.
-const DEFAULT_FREQ_NORM: f32 = 0.25;
+const DEFAULT_HZ: f32 = 185.0;
 const GAIN_DB_MIN: f32 = -23.0;
 
 /// How long a tone lasts unless renewed, so a lost update can't hold it on.
@@ -109,8 +134,9 @@ const TONE_MIN_GAP: Duration = Duration::from_millis(30);
 /// A one-shot click pin counts as up above this.
 const CLICK_PIN_MIN: f32 = 0.02;
 /// A one-shot's tone report would take anything; these keep it something an
-/// actuator can play and a finger can feel.
-const CLICK_HZ_RANGE: (f32, f32) = (40.0, 1000.0);
+/// actuator can play: the wide scale. As samples it goes no higher than
+/// [`GRIP_STREAM_MAX_HZ`].
+const CLICK_HZ_RANGE: (f32, f32) = flexinput_core::automap::WIDE_HZ;
 const CLICK_MS_RANGE: (f32, f32) = (1.0, 200.0);
 /// A trackpad's tone click lets go at half the strength it pressed with.
 const PAD_RELEASE_DB: i8 = -6;
@@ -135,15 +161,15 @@ const GRIP_WRITE_DELAY: Duration = Duration::from_millis(150);
 
 /// The analog pins the worker reads, in the order of [`Shared::targets`].
 const TARGET_PINS: [&str; 14] = [
-    "hd_l_amp", "hd_l_freq", "hd_r_amp", "hd_r_freq",
-    "hd2_l_amp", "hd2_l_freq", "hd2_r_amp", "hd2_r_freq",
+    "grip_l_amp", "grip_l_freq", "grip_r_amp", "grip_r_freq",
+    "grip2_l_amp", "grip2_l_freq", "grip2_r_amp", "grip2_r_freq",
     "tp_l_amp", "tp_l_freq", "tp_r_amp", "tp_r_freq",
     "rumble_strong", "rumble_weak",
 ];
 
 /// Each side's offset into [`TARGET_PINS`] from carrier 1, carrier 2 and pad.
-const HD: usize = 0;
-const HD2: usize = 4;
+const GRIP: usize = 0;
+const GRIP2: usize = 4;
 const TP: usize = 8;
 /// The two rumble levels, strong (left) then weak (right).
 const RUMBLE: usize = 12;
@@ -172,9 +198,9 @@ impl Shared {
     }
 }
 
-fn carrier_hz(freq_norm: f32) -> f32 {
-    let f = if freq_norm <= 0.0 { DEFAULT_FREQ_NORM } else { freq_norm.min(1.0) };
-    FREQ_MIN_HZ + f * (FREQ_MAX_HZ - FREQ_MIN_HZ)
+/// A frequency pin's pitch, on the wide scale; 0 (unset) is [`DEFAULT_HZ`].
+fn carrier_hz(freq: f32) -> f32 {
+    if freq <= 0.0 { DEFAULT_HZ } else { PitchScale::Wide.hz(freq) }
 }
 
 /// An amplitude as the dB the tone report takes.
@@ -234,7 +260,7 @@ impl ClickBurst {
             at: 0,
             total: shape.samples(),
             level: 10f32.powf(gain_db as f32 / 20.0).min(1.0),
-            hz: shape.hz as f32,
+            hz: (shape.hz as f32).min(GRIP_STREAM_MAX_HZ),
             soft: shape.soft,
         }
     }
@@ -658,15 +684,21 @@ struct PadBurst {
     last: Instant,
 }
 
-/// Both grip motors' stream.
+/// Both grip motors' stream, the two sides in step.
 struct Stream {
     running: bool,
+    started: Instant,
     last_sound: Instant,
     last_pump: Instant,
-    owed: [f32; 2],
-    low: [bool; 2],
+    owed: f32,
+    /// The sending rate, as a share above or below [`STREAM_RATE`].
+    trim: f32,
     /// Carrier 1 and 2 phase per side.
     phase: [[f32; 2]; 2],
+    /// Carrier 1 and 2 strength and phase step per side as they play, gliding to
+    /// the targets.
+    level: [[f32; 2]; 2],
+    step: [[f32; 2]; 2],
     /// What a click adds to a side's stream: the tone report isn't known to play
     /// over a stream on the same motor, and a soft one needs a stream anyway.
     click: [ClickBurst; 2],
@@ -677,42 +709,79 @@ impl Stream {
         let now = Instant::now();
         Self {
             running: false,
+            started: now,
             last_sound: now,
             last_pump: now,
-            owed: [0.0; 2],
-            low: [true; 2],
+            owed: 0.0,
+            trim: 0.0,
             phase: [[0.0; 2]; 2],
+            level: [[0.0; 2]; 2],
+            step: [[0.0; 2]; 2],
             click: Default::default(),
         }
     }
 
-    /// One side's next samples, from the current targets.
-    fn chunk(&mut self, side: usize, shared: &Shared) -> [u8; STREAM_CHUNK + 2] {
-        let (a1, f1) = shared.carrier(HD, side);
-        let (a2, f2) = shared.carrier(HD2, side);
-        let tau = std::f32::consts::TAU;
-        let steps = [
-            carrier_hz(f1) / STREAM_RATE,
-            carrier_hz(f2) / STREAM_RATE,
-        ];
-        let mut out = [0u8; STREAM_CHUNK + 2];
-        out[0] = REPORT_STREAM_PUSH;
-        out[1] = PUSH_TARGET[side];
-        let (phase, click) = (&mut self.phase[side], &mut self.click[side]);
-        for s in &mut out[2..] {
-            let v = a1.clamp(0.0, 1.0) * (phase[0] * tau).sin()
-                + a2.clamp(0.0, 1.0) * (phase[1] * tau).sin()
-                + click.next();
-            phase[0] = (phase[0] + steps[0]).fract();
-            phase[1] = (phase[1] + steps[1]).fract();
-            *s = pcm_s8(v);
+    /// Both sides' next samples, from the current targets, as one 0x88 report.
+    fn report(&mut self, shared: &Shared) -> [u8; 2 + 2 * GRIP_SLOT] {
+        let mut out = [0u8; 2 + 2 * GRIP_SLOT];
+        out[0] = REPORT_STREAM_PUSH_GRIPS;
+        out[1] = GRIP_SLOT as u8;
+        for side in 0..2 {
+            let at = 2 + side * GRIP_SLOT;
+            self.fill(side, shared, &mut out[at..at + GRIP_SLOT]);
         }
         out
     }
+
+    /// One side's next samples.
+    fn fill(&mut self, side: usize, shared: &Shared, out: &mut [u8]) {
+        let targets = [shared.carrier(GRIP, side), shared.carrier(GRIP2, side)]
+            .map(|(a, f)| (a.clamp(0.0, 1.0), carrier_hz(f).min(GRIP_STREAM_MAX_HZ) / STREAM_RATE));
+        let (phase, level, step, click) =
+            (&mut self.phase[side], &mut self.level[side], &mut self.step[side], &mut self.click[side]);
+        for (k, (_, to)) in targets.into_iter().enumerate() {
+            // A carrier starting from silence starts at its pitch, not gliding up
+            // from wherever it last was.
+            if level[k] <= SILENCE {
+                step[k] = to;
+            }
+        }
+        let glide = 1.0 - (-1.0 / (STREAM_RATE * GLIDE_S)).exp();
+        for s in out {
+            let mut v = click.next();
+            for (k, (amp, to)) in targets.into_iter().enumerate() {
+                level[k] += (amp - level[k]) * glide;
+                step[k] += (to - step[k]) * glide;
+                v += level[k] * (phase[k] * std::f32::consts::TAU).sin();
+                phase[k] = (phase[k] + step[k]).fract();
+            }
+            *s = mulaw(soft_limit(v));
+        }
+    }
 }
 
-fn pcm_s8(v: f32) -> u8 {
-    (v.clamp(-1.0, 1.0) * 127.0) as i8 as u8
+/// Over 0.8, eased into full scale rather than cut off at it: two carriers and a
+/// click can add up past it, and a clipped wave buzzes.
+fn soft_limit(v: f32) -> f32 {
+    const KNEE: f32 = 0.8;
+    let a = v.abs();
+    if a <= KNEE {
+        v
+    } else {
+        v.signum() * (KNEE + (1.0 - KNEE) * ((a - KNEE) / (1.0 - KNEE)).tanh())
+    }
+}
+
+/// A sample (−1..1) as G.711 µ-law, the stream's format.
+fn mulaw(v: f32) -> u8 {
+    const BIAS: i32 = 0x84;
+    const CLIP: i32 = 32635;
+    let s = (v.clamp(-1.0, 1.0) * 32767.0) as i32;
+    let sign = if s < 0 { 0x80 } else { 0 };
+    let mag = s.abs().min(CLIP) + BIAS;
+    let exponent = (31 - mag.leading_zeros() as i32 - 7).clamp(0, 7);
+    let mantissa = (mag >> (exponent + 3)) & 0x0F;
+    !(sign | (exponent << 4) | mantissa) as u8
 }
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
@@ -890,6 +959,62 @@ impl Diag {
     }
 }
 
+/// How often the worker sends what is due while a stream plays.
+const PUMP_EVERY: Duration = Duration::from_millis(2);
+
+/// A wait that lands within a fraction of a millisecond. On Windows a
+/// high-resolution waitable timer (Win10 1803+), which doesn't raise the global
+/// timer resolution; elsewhere a plain sleep already does.
+struct Waiter {
+    #[cfg(windows)]
+    timer: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl Waiter {
+    fn new() -> Self {
+        // SAFETY: FFI with null names and attributes; a null result is handled in
+        // `wait`.
+        #[cfg(windows)]
+        let timer = unsafe {
+            use windows_sys::Win32::System::Threading::{
+                CreateWaitableTimerExW, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+            };
+            CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS)
+        };
+        Self {
+            #[cfg(windows)]
+            timer,
+        }
+    }
+
+    fn wait(&self, dur: Duration) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{SetWaitableTimer, WaitForSingleObject};
+            let due: i64 = -((dur.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
+            // SAFETY: FFI on our own timer handle.
+            let armed = !self.timer.is_null()
+                && unsafe { SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0) } != 0;
+            if armed {
+                // SAFETY: as above.
+                unsafe { WaitForSingleObject(self.timer, dur.as_millis() as u32 + 50) };
+                return;
+            }
+        }
+        std::thread::sleep(dur);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        if !self.timer.is_null() {
+            // SAFETY: our handle, unused after this.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.timer) };
+        }
+    }
+}
+
 /// One trackpad's tone, as last sent.
 #[derive(Default, Clone, Copy)]
 struct PadTone {
@@ -953,11 +1078,26 @@ impl Worker {
         if self.setting(SETTING_THRESHOLD) == Some(THRESHOLD_OUT_OF_REACH) {
             self.set_setting(SETTING_THRESHOLD, THRESHOLD_DEFAULT);
         }
-        loop {
-            match cmds.recv_timeout(Duration::from_millis(2)) {
-                Ok(cmd) => self.command(cmd),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+        let waiter = Waiter::new();
+        'run: loop {
+            // While samples go out, a wait that lands when asked: a plain one rounds
+            // up to the system's ~15.6 ms tick on Windows, and the chunks would go
+            // out in clumps.
+            if self.stream.running || self.pad_bursts.iter().any(Option::is_some) {
+                waiter.wait(PUMP_EVERY);
+                loop {
+                    match cmds.try_recv() {
+                        Ok(cmd) => self.command(cmd),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break 'run,
+                    }
+                }
+            } else {
+                match cmds.recv_timeout(PUMP_EVERY) {
+                    Ok(cmd) => self.command(cmd),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
             // With diagnostics on, the input is watched while idle too, for a
             // baseline; streaming reads it anyway.
@@ -1049,7 +1189,7 @@ impl Worker {
                 report[0] = REPORT_STREAM_PUSH;
                 report[1] = PAD_STREAM[side].1;
                 for s in &mut report[2..] {
-                    *s = pcm_s8(p.burst.next());
+                    *s = mulaw(soft_limit(p.burst.next()));
                 }
                 self.write(&report);
                 p.owed -= STREAM_CHUNK as f32;
@@ -1092,7 +1232,7 @@ impl Worker {
     fn pump_stream(&mut self) {
         let now = Instant::now();
         let shared = Arc::clone(&self.shared);
-        let sounding = [HD, HD2].iter()
+        let sounding = [GRIP, GRIP2].iter()
             .any(|&b| (0..2).any(|side| shared.carrier(b, side).0 > SILENCE));
         let clicking = self.stream.click.iter().any(ClickBurst::playing);
         if sounding || clicking {
@@ -1109,9 +1249,11 @@ impl Worker {
                 d.line(format_args!("grip stream started"));
             }
             self.stream.last_pump = now;
-            self.stream.low = [true; 2];
-            // A chunk goes out at once rather than after a chunk's worth of wait.
-            self.stream.owed = [STREAM_CHUNK as f32; 2];
+            self.stream.started = now;
+            self.stream.trim = 0.0;
+            self.stream.level = [[0.0; 2]; 2];
+            // Some in hand at once rather than after a report's worth of wait.
+            self.stream.owed = STREAM_PRIME;
         } else if now.duration_since(self.stream.last_sound) >= STREAM_IDLE {
             self.write(&[REPORT_STREAM_OP, STREAM_STOP, STREAM_BOTH_GRIPS, 0]);
             self.stream.running = false;
@@ -1126,16 +1268,14 @@ impl Worker {
         }
         let dt = now.duration_since(self.stream.last_pump).as_secs_f32();
         self.stream.last_pump = now;
-        for side in 0..2 {
-            let lean = if self.stream.low[side] { 1.0 + FLOW_LEAN } else { 1.0 - FLOW_LEAN };
-            self.stream.owed[side] = (self.stream.owed[side] + STREAM_RATE * dt * lean).min(MAX_OWED);
-            while self.stream.owed[side] >= STREAM_CHUNK as f32 {
-                let chunk = self.stream.chunk(side, &shared);
-                self.write(&chunk);
-                self.stream.owed[side] -= STREAM_CHUNK as f32;
-                if let Some(d) = self.diag.as_mut() {
-                    d.sent[side] += 1;
-                }
+        let rate = STREAM_RATE * (1.0 + self.stream.trim);
+        self.stream.owed = (self.stream.owed + rate * dt).min(MAX_OWED);
+        while self.stream.owed >= GRIP_SLOT as f32 {
+            let report = self.stream.report(&shared);
+            self.write(&report);
+            self.stream.owed -= GRIP_SLOT as f32;
+            if let Some(d) = self.diag.as_mut() {
+                d.sent = d.sent.map(|n| n + 1);
             }
         }
     }
@@ -1159,18 +1299,32 @@ impl Worker {
             }
             let Some(side) = [0u8, 1].iter().position(|m| *m == buf[1]) else { continue };
             let status = buf[2];
-            if status & STATUS_OVERRUN != 0 {
-                self.stream.owed[side] -= OVERRUN_BACKOFF;
-                if !self.logged_overrun {
-                    self.logged_overrun = true;
-                    eprintln!("[steam-haptics] the pad's stream buffer overran");
+            // Both grips are fed in step, so their buffers fill alike: the left's
+            // status paces the stream, and either counts for the log.
+            if side == 0 {
+                let trim = &mut self.stream.trim;
+                if status & STATUS_OVERRUN != 0 {
+                    // Too far ahead: a report's worth held back.
+                    self.stream.owed -= GRIP_SLOT as f32;
+                    *trim = (*trim - TRIM_STEP).max(-TRIM_MAX);
+                    if !self.logged_overrun {
+                        self.logged_overrun = true;
+                        eprintln!("[steam-haptics] the pad's stream buffer overran");
+                    }
                 }
-            }
-            if status & (STATUS_STOPPED | STATUS_NEEDS_MORE) != 0 {
-                self.stream.low[side] = true;
-            }
-            if status & STATUS_HAS_ENOUGH != 0 {
-                self.stream.low[side] = false;
+                // Ran dry: some in hand again, as at the start. Not as it starts,
+                // when the pad says so before the first samples land (the probe
+                // saw one on every stream): topped up then, it holds twice as
+                // much, near where it overruns.
+                if status & STATUS_STOPPED != 0 && self.stream.started.elapsed() >= STREAM_SETTLE {
+                    self.stream.owed = self.stream.owed.max(STREAM_PRIME);
+                }
+                if status & (STATUS_STOPPED | STATUS_NEEDS_MORE) != 0 {
+                    *trim = (*trim + TRIM_STEP).min(TRIM_MAX);
+                }
+                if status & STATUS_HAS_ENOUGH != 0 {
+                    *trim = (*trim - TRIM_STEP).max(-TRIM_MAX);
+                }
             }
             if let Some(d) = self.diag.as_mut() {
                 d.overruns += u32::from(status & STATUS_OVERRUN != 0);
@@ -1349,7 +1503,7 @@ mod tests {
     #[test]
     fn carrier_slots_match_the_pin_table() {
         let index = |pin: &str| TARGET_PINS.iter().position(|p| *p == pin).unwrap();
-        for (base, prefix) in [(HD, "hd"), (HD2, "hd2"), (TP, "tp")] {
+        for (base, prefix) in [(GRIP, "grip"), (GRIP2, "grip2"), (TP, "tp")] {
             for (side, letter) in ["l", "r"].iter().enumerate() {
                 assert_eq!(index(&format!("{prefix}_{letter}_amp")), base + side * 2);
                 assert_eq!(index(&format!("{prefix}_{letter}_freq")), base + side * 2 + 1);
@@ -1425,7 +1579,8 @@ mod tests {
     #[test]
     fn a_click_shape_stays_something_an_actuator_can_play() {
         assert_eq!(ClickShape::new(0.0, 0.0, -1.0), ClickShape { hz: 40, ms: 1, soft: 0.0 });
-        assert_eq!(ClickShape::new(9000.0, 9000.0, 2.0), ClickShape { hz: 1000, ms: 200, soft: 1.0 });
+        assert_eq!(ClickShape::new(9000.0, 9000.0, 2.0), ClickShape { hz: 2000, ms: 200, soft: 1.0 });
+        assert_eq!(ClickBurst::new(ClickShape::new(2000.0, 10.0, 0.5), 0).hz, GRIP_STREAM_MAX_HZ, "as samples, capped");
         assert_eq!(ClickShape::new(170.4, 20.0, 0.0).samples(), 80);
     }
 
@@ -1472,12 +1627,38 @@ mod tests {
         assert_eq!(grip_value(0, 0.0), None);
     }
 
+    /// G.711's decoder, to check the encoder against.
+    fn from_mulaw(b: u8) -> f32 {
+        let b = !b;
+        let exponent = i32::from((b >> 4) & 0x07);
+        let mantissa = i32::from(b & 0x0F);
+        let mag = (((mantissa << 3) + 0x84) << exponent) - 0x84;
+        (if b & 0x80 != 0 { -mag } else { mag }) as f32 / 32767.0
+    }
+
+    /// Silence, the ends, and every level in between back within µ-law's step,
+    /// which is finest near silence.
     #[test]
-    fn samples_are_signed() {
-        assert_eq!(pcm_s8(0.0), 0);
-        assert_eq!(pcm_s8(1.0), 127);
-        assert_eq!(pcm_s8(-1.0) as i8, -127);
-        assert_eq!(pcm_s8(3.0), 127, "two loud carriers clip rather than wrap");
+    fn samples_are_mulaw() {
+        assert_eq!(mulaw(0.0), 0xFF, "silence");
+        assert_eq!(mulaw(1.0), 0x80);
+        assert_eq!(mulaw(-1.0), 0x00);
+        assert_eq!(mulaw(3.0), 0x80, "past full scale holds there rather than wrapping");
+        for i in -100..=100 {
+            let v = i as f32 / 100.0;
+            let back = from_mulaw(mulaw(v));
+            assert!((back - v).abs() <= 0.02 + v.abs() * 0.07, "{v} came back {back}");
+        }
+        assert!((from_mulaw(mulaw(0.003)) - 0.003).abs() < 0.0005, "a quiet tone keeps its shape");
+    }
+
+    #[test]
+    fn the_limiter_is_straight_to_its_knee_then_eases_into_full() {
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-0.8), -0.8);
+        assert!(soft_limit(1.0) > 0.9 && soft_limit(1.0) < 1.0);
+        assert!(soft_limit(2.0) < 1.0 && soft_limit(2.0) > soft_limit(1.0));
+        assert_eq!(soft_limit(-2.0), -soft_limit(2.0));
     }
 
     #[test]
@@ -1489,36 +1670,85 @@ mod tests {
 
     #[test]
     fn a_carrier_without_a_frequency_sits_near_the_resonance() {
-        assert_eq!(carrier_hz(0.0), carrier_hz(DEFAULT_FREQ_NORM));
-        assert_eq!(carrier_hz(1.0), FREQ_MAX_HZ);
+        assert_eq!(carrier_hz(0.0), DEFAULT_HZ);
+        assert!((carrier_hz(1.0) - 2000.0).abs() < 0.5, "the wide scale's top");
+        assert!((carrier_hz(0.5) - 282.8).abs() < 0.5);
     }
 
+    const SILENT: u8 = 0xFF;
+
+    fn left(r: &[u8]) -> &[u8] {
+        &r[2..2 + GRIP_SLOT]
+    }
+
+    fn right(r: &[u8]) -> &[u8] {
+        &r[2 + GRIP_SLOT..]
+    }
+
+    /// Each report carries both grips' next samples, the left's first.
     #[test]
-    fn a_stream_chunk_fills_one_report_for_its_side() {
+    fn a_stream_report_carries_both_grips() {
         let shared = Shared::default();
         shared.targets[0].store(1.0f32.to_bits(), Ordering::Relaxed);
         let mut stream = Stream::new();
-        let left = stream.chunk(0, &shared);
-        let right = stream.chunk(1, &shared);
-        assert_eq!((left[0], left[1]), (REPORT_STREAM_PUSH, 0));
-        assert_eq!((right[0], right[1]), (REPORT_STREAM_PUSH, 4));
-        assert!(left[2..].iter().any(|s| *s != 0), "left carries the tone");
-        assert!(right[2..].iter().all(|s| *s == 0), "right is silent");
+        let r = stream.report(&shared);
+        assert_eq!(r.len(), 64);
+        assert_eq!((r[0], r[1]), (REPORT_STREAM_PUSH_GRIPS, GRIP_SLOT as u8));
+        assert!(left(&r).iter().any(|s| *s != SILENT), "left carries the tone");
+        assert!(right(&r).iter().all(|s| *s == SILENT), "right is silent");
+    }
+
+    /// A steady tone runs on from one report into the next with no seam, and a new
+    /// strength or pitch glides in rather than stepping at the report's edge.
+    #[test]
+    fn a_tone_runs_on_across_reports_and_glides_to_a_change() {
+        let shared = Shared::default();
+        let set = |i: usize, v: f32| shared.targets[i].store(v.to_bits(), Ordering::Relaxed);
+        set(0, 0.5);
+        set(1, PitchScale::Wide.value(200.0));
+        let mut stream = Stream::new();
+        let mut wave: Vec<f32> = Vec::new();
+        for _ in 0..8 {
+            wave.extend(left(&stream.report(&shared)).iter().map(|b| from_mulaw(*b)));
+        }
+        // 200 Hz at 4 kHz: neighbours differ by at most 0.5·sin(2π/20) ≈ 0.155.
+        let worst = wave.windows(2).skip(60).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.18, "a seam: {worst}");
+        // Twice as strong: the first samples after the change are still near the old.
+        set(0, 1.0);
+        let next: Vec<f32> = [stream.report(&shared), stream.report(&shared)].iter()
+            .flat_map(|r| left(r).iter().map(|b| from_mulaw(*b)).collect::<Vec<_>>())
+            .collect();
+        assert!(next[0].abs() < 0.62, "{}", next[0]);
+        assert!(next.iter().any(|s| s.abs() > 0.85), "and it gets there within two reports");
+    }
+
+    /// The grips' stream plays no higher than it can make a tone of.
+    #[test]
+    fn the_grip_stream_tops_out_where_its_samples_still_make_a_tone() {
+        let shared = Shared::default();
+        shared.targets[0].store(1.0f32.to_bits(), Ordering::Relaxed);
+        shared.targets[1].store(1.0f32.to_bits(), Ordering::Relaxed);
+        let mut stream = Stream::new();
+        let _ = stream.report(&shared);
+        assert!((stream.step[0][0] * STREAM_RATE - GRIP_STREAM_MAX_HZ).abs() < 1.0);
     }
 
     #[test]
     fn a_click_mixes_into_a_running_stream_for_its_length() {
         let shared = Shared::default();
         let mut stream = Stream::new();
-        // Longer than a chunk, so it spans two.
+        // 80 samples: it spans three reports.
         let shape = ClickShape::new(170.0, 20.0, 0.0);
         let samples = shape.samples();
         stream.click[1] = ClickBurst::new(shape, 0);
-        let first = stream.chunk(1, &shared);
-        assert!(first[2..].iter().any(|s| *s != 0));
-        assert_eq!(stream.click[1].total - stream.click[1].at, samples - STREAM_CHUNK as u32);
-        let _ = stream.chunk(1, &shared);
+        let first = stream.report(&shared);
+        assert!(right(&first).iter().any(|s| *s != SILENT));
+        assert!(left(&first).iter().all(|s| *s == SILENT), "on its own side only");
+        assert_eq!(stream.click[1].total - stream.click[1].at, samples - GRIP_SLOT as u32);
+        let _ = stream.report(&shared);
+        let _ = stream.report(&shared);
         assert!(!stream.click[1].playing());
-        assert!(stream.chunk(1, &shared)[2..].iter().all(|s| *s == 0), "and then stops");
+        assert!(right(&stream.report(&shared)).iter().all(|s| *s == SILENT), "and then stops");
     }
 }

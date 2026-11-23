@@ -2182,12 +2182,14 @@ fn pad_click_controls(ui: &mut egui::Ui, canvas: &mut Canvas, node_id: NodeId, s
     }
 }
 
-/// The pitches a click can take.
+/// The pitches a click can take on a DualSense.
 const CLICK_HZ_RANGE: std::ops::RangeInclusive<f32> = 60.0..=600.0;
+/// And on a Steam Controller: its whole scale.
+const STEAM_CLICK_HZ_RANGE: std::ops::RangeInclusive<f32> = automap::WIDE_HZ.0..=automap::WIDE_HZ.1;
 
-/// A click's pitch. True when it changed.
+/// A Steam Controller trackpad click's pitch. True when it changed.
 pub(crate) fn click_tone_slider(ui: &mut egui::Ui, hz: &mut f32, name: &str) -> bool {
-    ui.add(egui::Slider::new(hz, CLICK_HZ_RANGE).logarithmic(true).step_by(1.0).suffix(" Hz").text(name))
+    ui.add(egui::Slider::new(hz, STEAM_CLICK_HZ_RANGE).logarithmic(true).step_by(1.0).suffix(" Hz").text(name))
         .on_hover_text("The click's pitch. Lower feels like a thud, higher like a tick.")
         .changed()
 }
@@ -5605,7 +5607,8 @@ fn click_edge_faders(
         |v| format!("{v:.0} dB"), gain_hover);
     // What the pad can play: a pitch, how short, and a fade.
     let (pitches, lengths, fades) = match actuator {
-        ClickActuator::Own | ClickActuator::Hd => (Some(CLICK_HZ_RANGE), CLICK_MS_RANGE, true),
+        ClickActuator::Own => (Some(STEAM_CLICK_HZ_RANGE), CLICK_MS_RANGE, true),
+        ClickActuator::Hd => (Some(CLICK_HZ_RANGE), CLICK_MS_RANGE, true),
         ClickActuator::Switch => {
             let (lo, hi) = automap::SWITCH_HD_HZ;
             (Some(lo..=hi), automap::SWITCH_CLICK_MIN_MS..=*RUMBLE_CLICK_MS_RANGE.end(), true)

@@ -149,7 +149,9 @@ pub fn biases_from_params(params: &HashMap<String, Value>) -> Vec<f32> {
 
 /// Read curve points from a CUSTOM params key (the standard helper is fixed to
 /// `"points"`). Used by the Audio Stream Haptics band EQ, which lives under
-/// `"asth_eq_points"` so it doesn't collide with any `"points"` key. Returns
+/// `"asth_eq_wide"` so it doesn't collide with any `"points"` key (its points
+/// sit on the wide scale; `asth_eq_points` held them on the old 40–1253 Hz
+/// span, and is moved over on load). Returns
 /// `None` when the key is absent (→ EQ disabled, single-carrier path), or the
 /// `[[x,y],…]` control points (x = band position 0..1, y = gain 0..1) otherwise.
 pub fn curve_points_from_params_keyed(params: &HashMap<String, Value>, key: &str) -> Option<Vec<[f32; 2]>> {
@@ -298,12 +300,10 @@ pub fn multiband_collapse_band(spectrum: &[f32], eq_pts: &[[f32; 2]], lo: f32, h
 }
 
 /// Convert a crossover frequency (Hz) to a band position 0..1 on the log-spaced
-/// spectrum range (40 Hz–1253 Hz), matching `flexinput_devices::spectrum`'s bands.
+/// spectrum range, the wide scale (40 Hz–2000 Hz), matching
+/// `flexinput_devices::spectrum`'s bands.
 pub fn crossover_hz_to_pos(hz: f32) -> f32 {
-    const MIN: f32 = 40.0;
-    const MAX: f32 = 1253.0;
-    let hz = hz.clamp(MIN, MAX);
-    ((hz / MIN).ln() / (MAX / MIN).ln()).clamp(0.0, 1.0)
+    flexinput_core::automap::PitchScale::Wide.value(hz)
 }
 
 pub fn read_scale_t(params: &HashMap<String, Value>) -> f32 {

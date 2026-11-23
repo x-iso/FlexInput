@@ -304,7 +304,7 @@ pub(crate) fn audio_stream_haptics_publish(
     #[cfg(windows)]
     {
         // Flat unity EQ if none configured, so the two-band split still applies.
-        let eq_pts = curve_points_from_params_keyed(&snap.params, "asth_eq_points")
+        let eq_pts = curve_points_from_params_keyed(&snap.params, "asth_eq_wide")
             .unwrap_or_else(|| vec![[0.0, 0.5], [1.0, 0.5]]);
         let spectrum = flexinput_devices::loopback_manager::latest_spectrum(uid);
         let xpos = crossover_hz_to_pos(crossover_hz);
@@ -395,7 +395,7 @@ pub(crate) fn audio_stream_haptics_publish(
     let raw_r_lf_ef = (audio_r_amp * lf_frac).clamp(0.0, 1.0);
     let raw_r_hf_ef = (audio_r_amp * hf_frac).clamp(0.0, 1.0);
     // Band carrier frequencies, converted from the engine's 0..1 spectral position
-    // to Hz (log scale 40–1253, matching the spectrum/crossover mapping).
+    // to Hz (the wide scale, 40–2000, matching the spectrum/crossover mapping).
     let raw_lf_hz = band_pos_to_hz(lf_carrier);
     let raw_hf_hz = if hf_frac > 0.0 { band_pos_to_hz(hf_carrier) } else { 0.0 };
 
@@ -515,12 +515,42 @@ pub(crate) fn audio_stream_haptics_publish(
     put("hd_r_amp", r_lf_amp, true);
     put("hd2_l_amp", l_hf_amp, true);
     put("hd2_r_amp", r_hf_amp, true);
-    // hd_*_freq = carrier pitch (the felt frequency); hd2_*_freq = modulator pitch =
-    // AM mod rate (Switch) / second-sine pitch (DualSense). Both follow the swap.
-    if l_lf_amp > 0.0 { put("hd_l_freq", l_carrier_freq, false); }
-    if r_lf_amp > 0.0 { put("hd_r_freq", r_carrier_freq, false); }
-    if l_hf_amp > 0.0 { put("hd2_l_freq", l_mod_freq, false); }
-    if r_hf_amp > 0.0 { put("hd2_r_freq", r_mod_freq, false); }
+    // Trackpads (`asth_pads`: off / low / high): a Steam Controller's pads as two
+    // more channels, each side's playing one band as its own tone, on top of
+    // whatever the grips play. The stronger band plays at the side's full
+    // loudness and the other in proportion, as Split does. Off, nothing is written,
+    // so the pads stay free for whatever else drives them.
+    let pad_band = match snap.params.get("asth_pads").and_then(|v| v.as_str()) {
+        Some("low") => Some((lf_frac, lf_carrier)),
+        Some("high") => Some((hf_frac, hf_carrier)),
+        _ => None,
+    };
+    let pads = pad_band.map(|(frac, pos)| {
+        let top = lf_frac.max(hf_frac);
+        let share = if top > 0.0 { frac / top } else { 0.0 };
+        ([l_amp * share, r_amp * share], pos)
+    });
+    if let Some(([l, r], _)) = pads {
+        put("tp_l_amp", l, true);
+        put("tp_r_amp", r, true);
+    }
+    // Carrier pitch (the felt frequency) for hd_*; modulator pitch = AM mod rate
+    // (Switch) / second-sine pitch (DualSense, Steam Controller) for hd2_*. Both
+    // follow the swap. In Hz (`automap::PITCH_HZ_PINS`), so each pad plays the
+    // pitch heard on its own scale: a band's position is its pitch on the wide one.
+    let mut put_hz = |pin: &str, pos: f32| {
+        let hz = band_pos_to_hz(pos);
+        collector_sigs.merge_pin(&key, pin, Signal::Float(hz),
+            |cur| *cur = Signal::Float(cur.as_float().max(hz)));
+    };
+    if l_lf_amp > 0.0 { put_hz("hd_l_hz", l_carrier_freq); }
+    if r_lf_amp > 0.0 { put_hz("hd_r_hz", r_carrier_freq); }
+    if l_hf_amp > 0.0 { put_hz("hd2_l_hz", l_mod_freq); }
+    if r_hf_amp > 0.0 { put_hz("hd2_r_hz", r_mod_freq); }
+    if let Some(([l, r], pos)) = pads {
+        if l > 0.0 { put_hz("tp_l_hz", pos); }
+        if r > 0.0 { put_hz("tp_r_hz", pos); }
+    }
 
     out
 }
@@ -690,6 +720,16 @@ pub(crate) fn publish_recv_feedback_frames(
                     any = true;
                 }
             }
+            // A pitch a module handed over in Hz goes out on the wide scale, as the
+            // game's do: the far pad plays it on its own.
+            for key in [&override_key, &inject_key] {
+                for (hz_pin, freq_pin) in flexinput_core::automap::PITCH_HZ_PINS {
+                    if let Some(hz) = collector_sigs.get_pin(key, &hz_pin) {
+                        fb.set(freq_pin, flexinput_core::automap::PitchScale::Wide.value(hz.as_float()));
+                        any = true;
+                    }
+                }
+            }
             if any {
                 flexinput_net::publish_feedback_frame(uid, fb);
             }
@@ -700,14 +740,11 @@ pub(crate) fn publish_recv_feedback_frames(
     }
 }
 
-/// Inverse of [`crossover_hz_to_pos`]: map a 0..1 spectral band position back to Hz
-/// on the same log scale (40 Hz–1253 Hz). Used to expose the band carrier frequencies
-/// as Hz on the Audio Stream Haptics output pins.
+/// Inverse of [`crossover_hz_to_pos`]: a 0..1 spectral band position as Hz, on the
+/// wide scale (`automap::PitchScale::Wide`, 40–2000 Hz). For the Audio Stream
+/// Haptics output pins and the pitches it hands each pad.
 pub(crate) fn band_pos_to_hz(pos: f32) -> f32 {
-    const MIN: f32 = 40.0;
-    const MAX: f32 = 1253.0;
-    let pos = pos.clamp(0.0, 1.0);
-    MIN * (MAX / MIN).powf(pos)
+    flexinput_core::automap::PitchScale::Wide.hz(pos)
 }
 
 pub(crate) fn automap_fork_publish(

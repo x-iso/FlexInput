@@ -359,9 +359,10 @@ mod tests {
     #[test]
     fn haptic_pcm_becomes_hd_pins() {
         let mut d = CompositeDevice::detached("virtual.usb.dualsense", "D", DUALSENSE_COMPOSITE_JSON).unwrap();
-        // 20 ms of a 160 Hz sine on the left actuator (channel 3) only.
+        // 60 ms of a 160 Hz sine on the left actuator (channel 3) only: past the
+        // detector's window, so the pitch is the one it found.
         let mut pcm = Vec::new();
-        for n in 0..960 {
+        for n in 0..2880 {
             let s = ((n as f32 * 160.0 / 48_000.0) * std::f32::consts::TAU).sin();
             for ch in 0..4 {
                 let v = if ch == 2 { (s * 20_000.0) as i16 } else { 0 };
@@ -373,7 +374,8 @@ mod tests {
         let get = |p: &str| out.iter().find(|(id, _)| *id == p).map(|(_, s)| s.as_float()).unwrap();
         assert!(get("hd_l_amp") > 0.3, "left actuator driven: {}", get("hd_l_amp"));
         assert!(get("hd_r_amp") < 0.01, "right actuator silent");
-        let hz = 80.0 + get("hd_l_freq") * 420.0;
-        assert!((hz - 160.0).abs() < 25.0, "carrier near 160 Hz, got {hz}");
+        // On the wide scale, which every pad plays a game's pitch from.
+        let hz = flexinput_core::automap::PitchScale::Wide.hz(get("hd_l_freq"));
+        assert!((hz - 160.0).abs() < 10.0, "carrier near 160 Hz, got {hz}");
     }
 }

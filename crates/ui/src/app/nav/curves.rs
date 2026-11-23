@@ -172,7 +172,7 @@ impl FlexInputApp {
         let node = nav_scope(&canvas.snarl, outer_id)
             .and_then(|sp| sp.get_node(inner));
         if node.map(|n| n.module_id.as_str()) == Some("module.audio_stream_haptics") {
-            return ("asth_eq_points", None);
+            return ("asth_eq_wide", None);
         }
         if node.map(|n| n.module_id.as_str()) == Some("module.vec_reshape") {
             // Nav edits whichever curve the body's Edit toggle has active.
@@ -230,7 +230,7 @@ impl FlexInputApp {
             // otherwise the driver reads None and bails out immediately ("the EQ
             // graph won't enter editing"). The first dot move persists it via
             // `nav_curve_write_points`.
-            None if pts_key == "asth_eq_points" => vec![[0.0, 0.5], [1.0, 0.5]],
+            None if pts_key == "asth_eq_wide" => vec![[0.0, 0.5], [1.0, 0.5]],
             None => return None,
         };
         if pts.len() < 2 { return None; }

@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use flexinput_core::automap::{self, ClickActuator, FeedbackGroup};
+use flexinput_core::automap::{self, ClickActuator, FeedbackGroup, PitchScale};
 use flexinput_core::{BusMap, PinMapExt, Signal};
 
 use crate::graph::{NodeSnap, SinkTarget};
@@ -226,6 +226,31 @@ fn route_pin<'a>(
     Some((dst, sig))
 }
 
+/// A pitch the game sends — a virtual pad's measure of a game's haptics, or a
+/// network peer's — is on the wide scale; as pad pin `dst` plays it, on its own
+/// ([`PitchScale::of_pin`]). Anything that isn't a pitch passes as it is.
+pub(crate) fn game_pitch_on_pad(dst: &str, sig: Signal, dst_pins: &[&str]) -> Signal {
+    match PitchScale::of_pin(dst, dst_pins.iter().copied()) {
+        Some(scale) => Signal::Float(PitchScale::Wide.to(sig.as_float(), scale)),
+        None => sig,
+    }
+}
+
+/// A module's value for feedback pin `pin`, routed onto the pad's `dst`: a pitch
+/// meant for a pin the pad hasn't got (a DualSense's `hd_l_freq`, on a Steam
+/// Controller's `grip_l_freq`) is carried over to the pin it landed on. On its
+/// own pin, a value is the pad's own already.
+fn module_pitch_on_pad(pin: &str, dst: &str, sig: Signal, dst_pins: &[&str]) -> Signal {
+    if pin == dst {
+        return sig;
+    }
+    let scales = (PitchScale::of_pin(pin, dst_pins.iter().copied()), PitchScale::of_pin(dst, dst_pins.iter().copied()));
+    match scales {
+        (Some(from), Some(to)) => Signal::Float(from.to(sig.as_float(), to)),
+        _ => sig,
+    }
+}
+
 fn combine_into(
     sink_outputs: &mut BusMap,
     dev: &str,
@@ -274,7 +299,7 @@ pub(crate) fn apply_pad_feedback(
     // The game, from a network peer (local virtual pads landed in the main loop).
     for (pin, sig) in game_net {
         if let Some((dst, sig)) = route_pin(pin, sig, &dst_pins, &directly_wired) {
-            combine_into(sink_outputs, dev, dst, sig);
+            combine_into(sink_outputs, dev, dst, game_pitch_on_pad(dst, sig, &dst_pins));
         }
     }
 
@@ -295,14 +320,26 @@ pub(crate) fn apply_pad_feedback(
     }
     for (pin, sig) in overrides {
         if let Some((dst, sig)) = route_pin(pin, sig, &dst_pins, &directly_wired) {
-            combine_into(sink_outputs, dev, dst, sig);
+            combine_into(sink_outputs, dev, dst, module_pitch_on_pad(pin, dst, sig, &dst_pins));
         }
     }
 
     // Additive injections on top.
     for (pin, sig) in additive {
         if let Some((dst, sig)) = route_pin(pin, sig, &dst_pins, &directly_wired) {
-            combine_into(sink_outputs, dev, dst, sig);
+            combine_into(sink_outputs, dev, dst, module_pitch_on_pad(pin, dst, sig, &dst_pins));
+        }
+    }
+
+    // Pitches handed over in Hz, on whichever frequency pin they land on, at
+    // that pin's own scale.
+    for prefix in [FEEDBACK_OVERRIDE, FEEDBACK_INJECT] {
+        let key = format!("{prefix}{dev}");
+        for (hz_pin, freq_pin) in automap::PITCH_HZ_PINS {
+            let Some(&hz) = collector_sigs.get_pin(&key, &hz_pin) else { continue };
+            let Some((dst, _)) = route_pin(freq_pin, hz, &dst_pins, &directly_wired) else { continue };
+            let Some(scale) = PitchScale::of_pin(dst, dst_pins.iter().copied()) else { continue };
+            combine_into(sink_outputs, dev, dst, Signal::Float(scale.value(hz.as_float())));
         }
     }
 
@@ -551,14 +588,10 @@ fn play_trigger_click(st: &SinkTarget, side: usize, level: f32, freq_value: f32,
 }
 
 /// A pitch as the pad's `hd_*_freq` value: a Switch Pro's on its own frequency
-/// table ([`automap::switch_hd_freq`]); every other HD pad reads it linearly over
-/// `haptic_pcm`'s range.
+/// table; every other HD pad's (a DualSense's) straight across its range.
 fn hd_freq_norm(actuator: ClickActuator, hz: f32) -> f32 {
-    use flexinput_core::haptic_pcm::{FREQ_MAX_HZ, FREQ_MIN_HZ};
-    if actuator == ClickActuator::Switch {
-        return automap::switch_hd_freq(hz);
-    }
-    ((hz - FREQ_MIN_HZ) / (FREQ_MAX_HZ - FREQ_MIN_HZ)).clamp(0.0, 1.0)
+    let scale = if actuator == ClickActuator::Switch { PitchScale::Switch } else { PitchScale::DualSense };
+    scale.value(hz)
 }
 
 /// A Steam Controller's click feedback on its trackpads (Calibration window), on

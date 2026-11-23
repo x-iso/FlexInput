@@ -903,6 +903,7 @@ impl FlexInputApp {
             | ("module.audio_stream_haptics", "asth_balance")
             | ("module.audio_stream_haptics", "asth_swap_row")
             | ("module.audio_stream_haptics", "asth_bands_row")
+            | ("module.audio_stream_haptics", "asth_pads_row")
             | ("module.audio_stream_haptics", "asth_rumble_mix")
             | ("module.menu", "options")
             | ("module.area_mapper", "options") | ("module.area_mapper", "border")
@@ -3098,7 +3099,7 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
             ("module.audio_stream_haptics", "asth_release") =>
                 vec![f!("Release", v("asth_release",1.0,500.0,30.0,Decade))],
             ("module.audio_stream_haptics", "asth_crossover") =>
-                vec![f!("Crossover", v("asth_crossover",60.0,800.0,250.0,Decade))],
+                vec![f!("Crossover", v("asth_crossover",60.0,1200.0,250.0,Decade))],
             ("module.audio_stream_haptics", "asth_amplitude") => vec![
                 f!("Floor", v("asth_amp_min",0.0,1.0,0.0,Linear)),
                 f!("Ceiling", v("asth_amp_max",0.0,1.0,1.0,Linear)),
@@ -3112,6 +3113,8 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
                 f!("Split L/R", Toggle{key:"asth_split"}),
                 f!("Pure tones", Toggle{key:"asth_pure"}),
             ],
+            ("module.audio_stream_haptics", "asth_pads_row") =>
+                vec![f!("Trackpads", Enum{key:"asth_pads",opts:&["off","low","high"]})],
             ("module.audio_stream_haptics", "asth_rumble_mix") =>
                 vec![f!("Rumble mix", v("asth_modulator",0.0,1.0,1.0,Linear))],
             // Selector mirrors counter's controls.

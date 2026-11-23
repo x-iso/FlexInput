@@ -3787,6 +3787,88 @@ mod trigger_tests {
         assert_eq!((pure[2], pure[3]), (0.0, 0.0), "no flutter");
     }
 
+    /// A Switch Pro as its layout has it: the legacy pin tells its pitch scale.
+    const FB_SWITCH_PINS: &[&str] = &[
+        "hd_l_amp", "hd_l_freq", "hd_r_amp", "hd_r_freq",
+        "hd2_l_amp", "hd2_l_freq", "hd2_r_amp", "hd2_r_freq", "hd_rumble_l", "hd_rumble_r",
+    ];
+    /// A Steam Controller's haptic inputs: its grips are its own.
+    const FB_STEAM: &str = "sdl:generic:steam";
+    const FB_STEAM_PINS: &[&str] = &[
+        "rumble_strong", "rumble_weak",
+        "grip_l_amp", "grip_l_freq", "grip_r_amp", "grip_r_freq",
+        "grip2_l_amp", "grip2_l_freq", "grip2_r_amp", "grip2_r_freq",
+        "tp_l_amp", "tp_l_freq", "tp_r_amp", "tp_r_freq",
+        "tp_l_click", "tp_r_click", "grip_l_click", "grip_r_click",
+    ];
+
+    // A game's HD haptics, as a virtual DualSense measures them, play at the pitch
+    // the game sent on each pad: on a Switch Pro's table, a Steam Controller's
+    // grips (its own pins), and a DualSense held to its top.
+    #[test]
+    fn game_haptics_play_their_pitch_on_each_pads_own_scale() {
+        use flexinput_core::automap::PitchScale;
+        let mut sigs = BusMap::default();
+        sigs.insert((FB_VIRT.to_string(), "hd_l_amp".to_string()), Signal::Float(0.8));
+        sigs.insert((FB_VIRT.to_string(), "hd_l_freq".to_string()), Signal::Float(PitchScale::Wide.value(800.0)));
+        let out = fb_tick(vec![
+            fb_pad(1, FB_PAD, FB_SWITCH_PINS, Some(FB_VIRT)),
+            fb_pad(2, FB_STEAM, FB_STEAM_PINS, Some(FB_VIRT)),
+            fb_pad(3, FB_DS, FB_DS_PINS, Some(FB_VIRT)),
+        ], &sigs);
+        let hz = |dev: &str, pin: &str, scale: PitchScale| scale.hz(pad_value(&out, dev, pin));
+        assert!((hz(FB_PAD, "hd_l_freq", PitchScale::Switch) - 800.0).abs() < 2.0);
+        assert!((hz(FB_STEAM, "grip_l_freq", PitchScale::Wide) - 800.0).abs() < 2.0);
+        assert!((pad_value(&out, FB_STEAM, "grip_l_amp") - 0.8).abs() < 1e-6, "the grips take the strength too");
+        assert_eq!(pad_value(&out, FB_DS, "hd_l_freq"), 1.0, "a DualSense plays its top, 500 Hz");
+    }
+
+    // Audio Stream Haptics hands each pad the pitch it heard, on that pad's scale.
+    #[test]
+    fn asth_pitch_lands_on_each_pads_own_scale() {
+        use flexinput_core::automap::PitchScale;
+        // No spectrum for these ids: the carrier is the captured pitch, 0.3 on the
+        // wide scale.
+        let heard = PitchScale::Wide.hz(0.3);
+        let on = |uid: usize, dev: &str, pins: &[&str], pin: &str| {
+            let out = fb_tick(vec![fb_pad(1, dev, pins, None), asth_node(uid, dev, dev, 1.0, 1.0)], &BusMap::default());
+            (pad_value(&out, dev, pin), out)
+        };
+        let (switch, _) = on(9160, FB_PAD, FB_SWITCH_PINS, "hd_l_freq");
+        assert!((PitchScale::Switch.hz(switch) - heard).abs() < 1.0, "{} vs {heard}", PitchScale::Switch.hz(switch));
+        let (steam, out) = on(9161, FB_STEAM, FB_STEAM_PINS, "grip_l_freq");
+        assert!((steam - 0.3).abs() < 1e-4, "{steam}");
+        assert!(pad_value(&out, FB_STEAM, "grip_l_amp") > 0.99, "and its strength");
+        let (ds, _) = on(9162, FB_DS, FB_DS_PINS, "hd_l_freq");
+        assert!((PitchScale::DualSense.hz(ds) - heard).abs() < 1.0);
+    }
+
+    // Trackpads on: a Steam Controller's pads play the band asked for as a tone of
+    // their own, at its pitch; with no high band in the audio, "high" plays nothing.
+    // Off, the module leaves the pads alone.
+    #[test]
+    fn asth_plays_a_band_on_the_trackpads_when_asked() {
+        let pads = |uid: usize, setting: Option<&str>| {
+            let mut asth = asth_node(uid, FB_STEAM, FB_STEAM, 1.0, 1.0);
+            if let Some(s) = setting {
+                asth.params.insert("asth_pads".into(), Value::from(s));
+            }
+            let out = fb_tick(vec![fb_pad(1, FB_STEAM, FB_STEAM_PINS, None), asth], &BusMap::default());
+            let written = out.sink_outputs.contains_key(&(FB_STEAM.to_string(), "tp_l_amp".to_string()));
+            (pad_value(&out, FB_STEAM, "tp_l_amp"), pad_value(&out, FB_STEAM, "tp_r_freq"), written,
+             pad_value(&out, FB_STEAM, "grip_l_amp"))
+        };
+        // No spectrum for these ids: all the audio is the low band, at 0.3 on the wide scale.
+        let (amp, freq, _, grips) = pads(9166, Some("low"));
+        assert!(amp > 0.99, "{amp}");
+        assert!((freq - 0.3).abs() < 1e-4, "{freq}");
+        assert!(grips > 0.99, "on top of the grips");
+        let (amp, _, written, _) = pads(9167, Some("high"));
+        assert!(written && amp == 0.0, "no high band: quiet, but held at 0");
+        let (_, _, written, _) = pads(9168, None);
+        assert!(!written, "off: the pads are left alone");
+    }
+
     // The module itself must see the game's rumble: at the gate end its OWN
     // output is audio × game rumble (pad shows only the module here).
     #[test]
