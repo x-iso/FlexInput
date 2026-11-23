@@ -26,6 +26,11 @@ fn col(v: Option<[u8; 4]>) -> Option<Color32> {
     v.map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
 }
 
+/// The override's text colour, if set: the faders' names and values, the curve's labels.
+fn text_col(paint: JsmPaint<'_>) -> Option<Color32> {
+    col(paint.and_then(|p| p.text))
+}
+
 /// Channel `n` (0-based) of the override, if set.
 fn channel(paint: JsmPaint<'_>, n: usize) -> Option<Color32> {
     col(paint.and_then(|p| p.channel_colors.get(n).copied().flatten()))
@@ -153,7 +158,7 @@ pub(crate) fn fader(
     // gives way, with an ellipsis. A trimmed number is useless — it can read as a
     // different number — whereas a trimmed name is still recognisable, and the
     // tooltip carries it in full either way.
-    out.toggle_pair = caption_row(ui, width, &knob.label(), &shown_value(knob), chip);
+    out.toggle_pair = caption_row(ui, width, &knob.label(), &shown_value(knob), chip, text_col(paint));
 
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(width, FADER_H),
@@ -279,6 +284,7 @@ pub(crate) fn pinned_fader(
     let mut text = ui.painter().clone();
     text.set_clip_rect(rect.expand2(egui::vec2(rect.width(), rect.height() * 0.6 + 14.0)));
     let vis = ui.visuals();
+    let (weak_c, strong_c) = (text_col(paint).unwrap_or(vis.weak_text_color()), text_col(paint).unwrap_or(vis.strong_text_color()));
     if label_h > 0.0 {
         let font = crate::settings::ui_font((label_h * 0.62).clamp(8.0, 20.0));
         text.text(
@@ -286,14 +292,14 @@ pub(crate) fn pinned_fader(
             egui::Align2::LEFT_CENTER,
             knob.label(),
             font.clone(),
-            vis.weak_text_color(),
+            weak_c,
         );
         text.text(
             egui::pos2(rect.right() - 2.0, rect.top() + label_h * 0.5),
             egui::Align2::RIGHT_CENTER,
             shown_value(knob),
             font,
-            vis.strong_text_color(),
+            strong_c,
         );
     } else if !wide {
         let font = crate::settings::ui_font((avail.y * 0.13).clamp(8.0, 18.0));
@@ -302,14 +308,14 @@ pub(crate) fn pinned_fader(
             egui::Align2::CENTER_BOTTOM,
             knob.label(),
             font.clone(),
-            vis.weak_text_color(),
+            weak_c,
         );
         text.text(
             egui::pos2(rect.center().x, rect.bottom() + 1.0),
             egui::Align2::CENTER_TOP,
             shown_value(knob),
             font,
-            vis.strong_text_color(),
+            strong_c,
         );
     }
     if active {
@@ -353,8 +359,9 @@ pub(crate) fn warp_slider(
 ) -> Option<f32> {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(width, WARP_H), egui::Sense::click_and_drag());
-    let small = crate::settings::ui_font(9.0);
+    let small = crate::settings::graph_font(9.0);
     let vis = ui.visuals();
+    let weak_c = text_col(paint).unwrap_or(vis.weak_text_color());
     let painter = ui.painter_at(rect);
     // End labels, with the track between them — one row, because this is a view
     // control and must not cost the curve the height it needs to be read.
@@ -364,14 +371,14 @@ pub(crate) fn warp_slider(
         egui::Align2::LEFT_CENTER,
         "Log",
         small.clone(),
-        vis.weak_text_color(),
+        weak_c,
     );
     painter.text(
         egui::pos2(rect.right(), rect.center().y),
         egui::Align2::RIGHT_CENTER,
         "Exp",
         small,
-        vis.weak_text_color(),
+        weak_c,
     );
     let track = egui::Rect::from_min_max(
         egui::pos2(rect.left() + ends, rect.top()),
@@ -424,9 +431,13 @@ fn caption_row(
     name: &str,
     value: &str,
     chip: Option<(&str, &str)>,
+    text: Option<Color32>,
 ) -> bool {
     let font = egui::TextStyle::Small.resolve(ui.style());
-    let (weak, strong) = (ui.visuals().weak_text_color(), ui.visuals().text_color());
+    let (weak, strong) = (
+        text.unwrap_or_else(|| ui.visuals().weak_text_color()),
+        text.unwrap_or_else(|| ui.visuals().text_color()),
+    );
     let val = ui.ctx().fonts_mut(|f| {
         f.layout_no_wrap(value.to_string(), egui::FontId::monospace(font.size), strong)
     });
@@ -516,18 +527,20 @@ pub(crate) fn curve_graph(
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     let vis = ui.visuals();
+    let weak_c = text_col(paint).unwrap_or(vis.weak_text_color());
+    let strong_c = text_col(paint).unwrap_or(vis.strong_text_color());
     let sens_color = channel(paint, 0).unwrap_or(SENS_COLOR);
     let output_color = channel(paint, 1).unwrap_or(OUTPUT_COLOR);
     backdrop(&painter, rect, paint, vis.extreme_bg_color);
 
-    let small = crate::settings::ui_font(9.0);
+    let small = crate::settings::graph_font(9.0);
     if points.len() < 2 {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "set a gyro sensitivity to preview its curve",
             small,
-            vis.weak_text_color(),
+            weak_c,
         );
         return rect;
     }
@@ -580,7 +593,7 @@ pub(crate) fn curve_graph(
                 egui::Align2::RIGHT_CENTER,
                 format!("{:.2}", axis_y * i as f32 / 6.0),
                 small.clone(),
-                vis.weak_text_color(),
+                weak_c,
             );
         }
     }
@@ -597,7 +610,7 @@ pub(crate) fn curve_graph(
                 egui::Align2::CENTER_TOP,
                 if v < 10.0 { format!("{v:.1}") } else { format!("{}", v.round() as i64) },
                 small.clone(),
-                vis.weak_text_color(),
+                weak_c,
             );
         }
     }
@@ -660,7 +673,7 @@ pub(crate) fn curve_graph(
                 anchor,
                 text,
                 small.clone(),
-                vis.strong_text_color(),
+                strong_c,
             );
         }
     }
@@ -672,16 +685,16 @@ pub(crate) fn curve_graph(
             egui::Align2::CENTER_BOTTOM,
             "turn speed °/s",
             small.clone(),
-            vis.weak_text_color(),
+            weak_c,
         );
         // The vertical axis's name runs up its own line, inside the plot at the
         // top: the numbers already fill the margin beside it, and the top-left
         // corner is where a sensitivity curve almost never goes — it starts low
         // and climbs to the right.
-        let galley = painter.layout_no_wrap("sensitivity".into(), small.clone(), vis.weak_text_color());
+        let galley = painter.layout_no_wrap("sensitivity".into(), small.clone(), weak_c);
         let pos = egui::pos2(plot.left() + 2.0, plot.top() + 2.0 + galley.size().x);
         painter.add(
-            egui::epaint::TextShape::new(pos, galley, vis.weak_text_color())
+            egui::epaint::TextShape::new(pos, galley, weak_c)
                 .with_angle(-std::f32::consts::FRAC_PI_2),
         );
     } else {
@@ -690,14 +703,14 @@ pub(crate) fn curve_graph(
             egui::Align2::RIGHT_BOTTOM,
             format!("{}°/s", axis_x.round() as i64),
             small.clone(),
-            vis.weak_text_color(),
+            weak_c,
         );
         painter.text(
             plot.left_top() + egui::vec2(1.0, 1.0),
             egui::Align2::LEFT_TOP,
             format!("sens {}", trim((axis_y * 100.0).round() / 100.0)),
             small,
-            vis.weak_text_color(),
+            weak_c,
         );
     }
     rect

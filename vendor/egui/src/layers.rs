@@ -371,11 +371,21 @@ fn relayout_text(text: &mut epaint::TextShape, fonts: &mut epaint::text::FontsVi
     // Only a scale well past what rounding the rows to a finer pixel grid makes of the same
     // text (a percent or two): taken for a scale, that moved text that wasn't scaled at all.
     let scale = if galley.rect.height() > 1e-3 { old.rect.height() / galley.rect.height() } else { 1.0 };
-    let galley = if scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() > 0.04 {
+    let mut galley = if scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() > 0.04 {
         scale_galley(galley, scale)
     } else {
         galley
     };
+    // Only the glyphs are new: every row stays where the old layout had it, which is where a
+    // text field puts its caret and its selection. Rows rounded to the finer pixel grid come
+    // out a fraction of a point shorter or taller, and taken as they were, each line was drawn
+    // that much off the last - by a whole line in a long code editor (JSM Config's), its caret
+    // under the text it was in.
+    for (new, was) in galley.rows.iter_mut().zip(&old.rows) {
+        new.pos = was.pos;
+    }
+    galley.mesh_bounds = galley.mesh_bounds.union(old.mesh_bounds);
+    galley.rect = old.rect;
     text.galley = std::sync::Arc::new(galley);
 }
 

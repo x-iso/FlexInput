@@ -241,7 +241,7 @@ pub(crate) fn show_readout_body(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         &text,
-        egui::FontId::monospace(size),
+        egui::FontId::monospace(size * super::simple_bodies::graph_label_scale()),
         color,
     );
     register_exposable_element(ui, node_id, "value", rect);

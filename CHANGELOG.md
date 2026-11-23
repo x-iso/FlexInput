@@ -203,12 +203,20 @@ All notable changes to FlexInput are documented here. This project adheres to
   strength (0% = plain grey, lightness kept), and the font - normal or console, regular or
   bold, 11 to 18 points (Normal Regular 15 by default; the size applies when the slider is
   let go). The controls - every button, dropdown, value pill, segment and switch - take it at
-  its size; labels, hints, headings, Easy mode's cards, the mapping cards, the calibration
+  its size, and so do a module's own words beside them, on the canvas and pinned: section
+  titles, a row's caption, the words beside a value, a module's notes (they were egui's small
+  9 points beside the pills' 15). Labels inside graphs and pictures - a curve's axis marks, a
+  scope's scale, the 3DOF preview's degrees and legend, a knob's reading - keep their own
+  sizes, which a pin of a module with a graph scales in the Inspector (Text → graph labels,
+  60% to 200%); other labels, hints,
+  headings, Easy mode's cards, the mapping cards, the calibration
   panels and the overlays take its face and weight at their own sizes scaled by it (unchanged
   at the default 15); monospace text and the canvas's pin labels, which are sized to the
   layout grid, keep theirs. Console and bold are drawn as wide as normal text at that size,
   so a setting fits the same room whichever face it is, and a larger size widens the rows
-  (they wrap to another band) instead of spilling out of the pills. Text a control can't hold
+  (they wrap to another band) instead of spilling out of the pills. A pin can cap its text in
+  the Inspector (Text → cap size, at most 11 to 18 points): a larger setting then leaves it
+  as it is at the cap, its rows where they were laid out. Text a control can't hold
   is drawn smaller to fit before anything is cut short. Bold uses the system's bold face
   (Segoe UI / Consolas on Windows, DejaVu on Linux). The tint reaches the greys painted by
   hand too - node borders, graph backdrops, hint text, the calibration panels, Easy mode's
@@ -315,10 +323,32 @@ All notable changes to FlexInput are documented here. This project adheres to
   section (3DOF to 2D's Orientation output and Invert Axes start folded) are in reach; a row
   whose settings are all greyed out is passed by. The Inspector's `zoom` lays the module out as if the widget were
   bigger and draws it smaller to fit (or the other way), from 40% to 200%: zoomed out, its
-  buttons and values come out smaller and a graph takes the room they leave.
+  buttons and values come out smaller and a graph takes the room they leave. The Inspector
+  also picks which of the module's sections the widget shows - 3DOF to 2D's Lean, say,
+  left out - and can keep them all open, with no heading to fold them by. Its graph colours
+  reach the module's graphs, and a JSM Config pin has a colour for its words too (the tuning
+  faders' names and values, the curve's labels). JSM's faders are stops of their own here, so
+  its editor is the text alone - LB / RB don't switch it to a second copy of the faders - and
+  Select on a fader whose setting takes a pair splits or joins it, walked onto or entered.
 
 ### Changed
 
+- **The widget you're working in keeps its buttons from your shortcuts.** A gamepad shortcut
+  you assigned whose chord needs a button the widget being edited acts on - its D-pad, face
+  buttons and triggers, a card list's or Touch Zones' bumpers, Select where it splits a JSM
+  setting's pair - waits until you back out of the widget, instead of firing alongside it or
+  taking the button from it (Home held round the D-pad left the widget without its D-pad).
+  So does one whose chord a list open over the pad uses (the Choose picker, the presets, the
+  gamepad settings), and the layout's tab buttons wherever the widget selected uses them.
+  Between widgets, the Home + D-pad shortcuts work as before, and a second pad's always do.
+- **Settings is laid out as a form.** Every setting's name sits in a column as wide as the
+  longest name, and its controls start at one edge beside it - checkboxes too, named by the column (On launch,
+  Physical mouse, Disconnects) - with its note under the controls at a readable size, the
+  same gap after each and the same width for every slider, value box and dropdown. Names
+  had a colon or not, controls started wherever their name ended, notes came in two greys at
+  egui's smallest size, and the keyboard hotkeys, folder paths and buttons were each drawn
+  their own way. Performance's groups have subheadings (Input and output, Processing,
+  Window, Where the time goes).
 - **A MIDI message is chosen in Choose's MIDI tab.** Beside Keyboard & Mouse, Gamepad and
   Macros, it builds the message from its type, channel and number - the D-pad's Up / Down
   walk them and Left / Right change them - and adds it to the side being chosen, as an
@@ -358,10 +388,14 @@ All notable changes to FlexInput are documented here. This project adheres to
   an element's anchor point, and the line to the element it's anchored to - show for the
   selection only, where every element's were always there; the anchor switch on the
   toolbar shows them all.
-- **The pad's LB / RB step the layout's tabs, and Home + LB / RB the patch tabs.** In a layout
-  with no tabs LB / RB still step the patch tabs, as before. All four are set in Settings -
+- **The pad's LB / RB step the layout's tabs, and Home + LB / RB the patch tabs.** LB / RB
+  keep to the patch you're in: in a layout with no tabs they do nothing, and the legend
+  doesn't offer them (they used to step the patch tabs). All four are set in Settings -
   the patch tabs' as gamepad shortcuts with the others, the layout's as buttons of their own
   - and in the gamepad's settings panel.
+- **An Easy layout taller than its panel shades the edges it's cut off at:** a thin shadow
+  along the top while it's scrolled down, along the bottom while there's more below, so
+  content cut off at the frame reads as scrolling.
 - **The mouse has the layout back from the pad as soon as it's used.** With gamepad
   navigation on, the pad's selection kept its glow and the Easy body kept scrolling back to
   it, so every turn of the wheel was undone. Clicking, scrolling or touching - or moving the
@@ -376,7 +410,9 @@ All notable changes to FlexInput are documented here. This project adheres to
   the right stick, and the cursor comes back on it once it's let go.
 
 - **Module bodies follow one style,** written down in `docs/MODULE_UI_GUIDELINES.md`.
-  Settings are value pills - drag across, or double-click (or Ctrl-click) to type - joined
+  Settings are value pills - drag across, or double-click (or Ctrl-click) to type, in the
+  units shown (74 into a zoom of "74%"); double-click the word before the value to put it
+  back to its default - joined
   segments and switches, in bands that wrap to the module's width, where they were egui's
   checkboxes, bare number fields, sliders and dropdowns of every size. A two-value setting is
   the Switch module's button; a short list is a divided pill - label on the left, current
@@ -775,6 +811,18 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **An overlay opens with its widgets in place.** On the frame the info or config overlay
+  opened, a pinned row came out at a guessed size and jumped into place a frame or two later.
+  That first frame is now laid out until its widgets settle before it shows, and a frame drawn
+  while the window is still being moved onto its monitor shows nothing.
+- **A Macro Output wired into 3DOF to 2D's Reset no longer freezes the patch around it.** A
+  Macro Output runs after every module that can drive its ports, and 3DOF to 2D can (its Lean
+  cards): wired back into it, that made a loop, and the order fell back to the order the
+  modules were made in for everything after it. Modules then read inputs not worked out yet
+  that tick - the Macro's ports read as nothing, so a Selector on them never came on, the gyro
+  it gated stayed still (as if Reset were held) and an RWS Aim flick switched by it stayed
+  off. Where a wire already runs from the Macro into the module, the wire now decides the
+  order, and that module's own macro values reach the Macro a tick later.
 - **Gunfire no longer turns the camera by itself through the click-jolt filter.** Each click
   of a button the filter holds the gyro for holds it at the turn from just before, and a
   click while a hold still ran made it one long hold at the turn from before the first: a

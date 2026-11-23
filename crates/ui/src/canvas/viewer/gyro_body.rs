@@ -295,7 +295,7 @@ pub(crate) fn show_gyro_3dof_body(
                     let mut a = snarl.get_node(node_id).map_or(GYRO_MODEL_ALPHA, gyro_model_alpha);
                     let shown = format!("{:.0}%", a * 100.0);
                     if super::curve_rows::real_pill(ui, node_id, "gyro_model_alpha", r, "\u{03b1}|opacity", &mut a, &shown, 0.05..=1.0, 0.005,
-                        "How opaque the pad's model is over the sphere (its neutral hold's ghost fainter in proportion).")
+                        "How opaque the pad's model is over the sphere (its neutral hold's ghost fainter in proportion).", GYRO_MODEL_ALPHA)
                     {
                         if let Some(n) = snarl.get_node_mut(node_id) {
                             n.params.insert("view_model_alpha".into(), serde_json::json!(a as f64));
@@ -401,6 +401,7 @@ pub(crate) fn show_gyro_3dof_body(
                 changed |= pill_in(
                     ui, true, node_id, &format!("gyro_hold_{i}"), pr,
                     ["pitch", "yaw", "roll"][i], &mut hold[i], &shown, -180.0..=180.0, 0.4, tip,
+                    0.0,
                 );
             }
             hold_rect = Some(r);
@@ -412,7 +413,7 @@ pub(crate) fn show_gyro_3dof_body(
             let r = cell(1);
             let pr = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - ctrl * 0.5), egui::vec2(r.width(), ctrl));
             let shown = format!("{roll_mix:+.0} %");
-            changed |= pill_in(ui, roll_mix_on, node_id, "gyro_roll_mix", pr, "mix|roll mix", &mut roll_mix, &shown, -100.0..=100.0, 0.4, GYRO_ROLL_MIX_TIP);
+            changed |= pill_in(ui, roll_mix_on, node_id, "gyro_roll_mix", pr, "mix|roll mix", &mut roll_mix, &shown, -100.0..=100.0, 0.4, GYRO_ROLL_MIX_TIP, 0.0);
             roll_mix_rect = Some(r);
             row_fields.push(("roll_mix", vec![on(roll_mix_on, pr)]));
         }
@@ -440,10 +441,10 @@ pub(crate) fn show_gyro_3dof_body(
             // the other modes turn about gravity itself.
             let centres = matches!(axis.as_str(), "pitch_yaw" | "pitch_roll");
             changed |= pill_in(ui, steering_on && centres, node_id, "gyro_recenter", ctr, "ctr|recenter", &mut recenter_strength, &shown, 0.0..=4.0, 0.02,
-                "Keeps the wheel centred where Reset put it, from gravity: how far\ngravity has swung about the wheel's axis since then is how far the\nwheel is turned, and the angle added up is pulled toward it this fast,\nper second. Pitch+Yaw sees it with the pad held upright, Pitch+Roll\nwith it held flat; the other modes turn about gravity itself, which it\ncan't see. 0 is off.");
+                "Keeps the wheel centred where Reset put it, from gravity: how far\ngravity has swung about the wheel's axis since then is how far the\nwheel is turned, and the angle added up is pulled toward it this fast,\nper second. Pitch+Yaw sees it with the pad held upright, Pitch+Roll\nwith it held flat; the other modes turn about gravity itself, which it\ncan't see. 0 is off.", 0.0);
             let shown = format!("{reset_ease_in:.2} s");
             changed |= pill_in(ui, steering_on, node_id, "gyro_ease", ease, "ease|reset ease", &mut reset_ease_in, &shown, 0.0..=2.0, 0.01,
-                "Reset eases steering toward 0 over this many seconds.");
+                "Reset eases steering toward 0 over this many seconds.", 0.25);
             stopts_rect = Some(r);
             row_fields.push(("steering_opts", vec![on(steering_on, excl), on(steering_on && centres, ctr), on(steering_on, ease)]));
         }
@@ -497,7 +498,7 @@ pub(crate) fn show_gyro_3dof_body(
             widget_parts.push(("orient_scale", r));
             row_fields.push(("orient_scale", vec![on(pose_rows_on, pr)]));
             changed |= pill_in(ui, pose_rows_on, node_id, "gyro_rot", pr, "rot ×|rotation ×", &mut orient_scale, &shown, 0.05..=5.0, 0.01,
-                "Rotation scale for the 3D Orientation output only.\n1.0 = physically 1:1 on known controllers. If the\non-screen model over- or under-rotates vs. your real\ncontroller, adjust here. Applied to the integration rate\nso it never flips; does NOT affect pointer/steering.");
+                "Rotation scale for the 3D Orientation output only.\n1.0 = physically 1:1 on known controllers. If the\non-screen model over- or under-rotates vs. your real\ncontroller, adjust here. Applied to the integration rate\nso it never flips; does NOT affect pointer/steering.", 1.0);
         }
         {
             let r = cell(2);
@@ -506,7 +507,7 @@ pub(crate) fn show_gyro_3dof_body(
             widget_parts.push(("orient_drift", r));
             row_fields.push(("orient_drift", vec![on(pose_rows_on, pr)]));
             changed |= pill_in(ui, pose_rows_on, node_id, "gyro_drift", pr, "drift|drift fix", &mut orient_drift, &shown, 0.0..=1.0, 0.01,
-                "Accelerometer drift correction for the 3D Orientation\noutput. While the controller is held steady, gravity\npulls accumulated pitch/roll drift back out (yaw can't\nbe corrected — reset for that). OFF by default: linear\nmotion (shakes/swings) is indistinguishable from tilt\nand can rotate the model falsely — prefer Auto re-center.\nHigher = faster pull; reference pose captured on Reset.");
+                "Accelerometer drift correction for the 3D Orientation\noutput. While the controller is held steady, gravity\npulls accumulated pitch/roll drift back out (yaw can't\nbe corrected — reset for that). OFF by default: linear\nmotion (shakes/swings) is indistinguishable from tilt\nand can rotate the model falsely — prefer Auto re-center.\nHigher = faster pull; reference pose captured on Reset.", 0.0);
         }
         {
             let r = cell(3);
@@ -527,7 +528,7 @@ pub(crate) fn show_gyro_3dof_body(
             row_fields.push(("orient_recenter", vec![on(recenter_on, tog), on(recenter_on && yaw_recenter, thr)]));
             let shown = format!("{yaw_thresh:.4}");
             changed |= pill_in(ui, recenter_on && yaw_recenter, node_id, "gyro_thr", thr, "still|still below", &mut yaw_thresh, &shown, 0.0005..=0.2, 0.0005,
-                "Gyro magnitude (normalized, 1.0 = 2000 dps) that counts\nas \"not moving\". With the noise-floor deadzone armed,\nresting readings are exactly 0, so the default is fine.");
+                "Gyro magnitude (normalized, 1.0 = 2000 dps) that counts\nas \"not moving\". With the noise-floor deadzone armed,\nresting readings are exactly 0, so the default is fine.", 0.005);
         }
 
         }
@@ -592,6 +593,7 @@ pub(crate) fn show_gyro_3dof_body(
             changed |= super::curve_rows::real_pill(
                 ui, node_id, "gyro_lean", pr, "lean|lean threshold", &mut lean_threshold, &shown, 0.01..=4.0, 0.01,
                 "|Lean| ≥ threshold triggers the Lean! Bool output.",
+                0.3,
             );
             row_fields.push(("lean_threshold", vec![pr]));
             // Painted, not laid out: the reading moves every frame and the module must not.
@@ -1125,30 +1127,30 @@ impl GyroEdge {
 
             let shown = format!("{:.0}°", self.zone);
             changed |= pill_in(ui, !off, node, "edge_zone", at(0), "zone|edge zone", &mut self.zone, &shown, 0.0..=170.0, 0.5,
-                "Where the edge starts, from neutral. Pure gyro inside.");
+                "Where the edge starts, from neutral. Pure gyro inside.", GyroEdge::default().zone);
             let shown = format!("{:.0}°", self.blend);
             changed |= pill_in(ui, !off, node, "edge_blend", at(1), "blend", &mut self.blend, &shown, 0.0..=170.0, 0.5,
-                "Degrees past the zone over which momentum and the\ngyro hand-off ease in (0 = all at once).");
+                "Degrees past the zone over which momentum and the\ngyro hand-off ease in (0 = all at once).", GyroEdge::default().blend);
             let mut pct = self.gyro_keep * 100.0;
             let shown = format!("{pct:.0} %");
             if pill_in(ui, !off, node, "edge_gyro", at(2), "gyro|gyro kept", &mut pct, &shown, 0.0..=100.0, 0.5,
-                "The gyro's own aim left once past the blend: 100% keeps\nit (the edge only adds), 0% hands over to the edge\nentirely, like a stick.")
+                "The gyro's own aim left once past the blend: 100% keeps\nit (the edge only adds), 0% hands over to the edge\nentirely, like a stick.", 100.0)
             {
                 self.gyro_keep = pct / 100.0;
                 changed = true;
             }
             let shown = format!("{:.0}°", self.ramp);
             changed |= pill_in(ui, ramp_on, node, "edge_ramp", at(3), "ramp|ramp width", &mut self.ramp, &shown, 0.0..=170.0, 0.5,
-                "Degrees past the zone where Ramp reaches max, eased in\n(0 = full speed as soon as you leave it).");
+                "Degrees past the zone where Ramp reaches max, eased in\n(0 = full speed as soon as you leave it).", GyroEdge::default().ramp);
             let shown = format!("{:.0} °/s", self.max_dps);
             changed |= pill_in(ui, ramp_on, node, "edge_max", at(4), "max|max speed", &mut self.max_dps, &shown, 0.0..=4000.0, 2.0,
-                "Ramp's top speed, as a gyro turn rate - downstream\nsensitivity scales it like the gyro.");
+                "Ramp's top speed, as a gyro turn rate - downstream\nsensitivity scales it like the gyro.", GyroEdge::default().max_dps);
             let shown = format!("{:.2}", self.gain);
             changed |= pill_in(ui, mom_on, node, "edge_gain", at(5), "mom ×|momentum ×", &mut self.gain, &shown, 0.0..=10.0, 0.02,
-                "Share of the turn-out speed kept as the camera's floor\n(1 = carries on as fast as the pad was turning).");
+                "Share of the turn-out speed kept as the camera's floor\n(1 = carries on as fast as the pad was turning).", GyroEdge::default().gain);
             let shown = format!("{:.2} s", self.decay);
             changed |= pill_in(ui, mom_on, node, "edge_decay", at(6), "fade|momentum fade", &mut self.decay, &shown, 0.0..=30.0, 0.02,
-                "Momentum fade time constant (0 = holds while you stay out).");
+                "Momentum fade time constant (0 = holds while you stay out).", GyroEdge::default().decay);
 
             for (i, r) in (0..7).map(at).enumerate() {
                 rects[2 + i] = r;
@@ -1264,15 +1266,16 @@ fn pill_in(
     range: std::ops::RangeInclusive<f32>,
     per_px: f32,
     hover: &str,
+    default: f32,
 ) -> bool {
     if enabled {
-        return super::curve_rows::real_pill(ui, node, salt, rect, label, value, shown, range, per_px, hover);
+        return super::curve_rows::real_pill(ui, node, salt, rect, label, value, shown, range, per_px, hover, default);
     }
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("gyro_pill_off", salt)));
     child.disable();
     child.set_opacity(0.45);
     let mut v = *value;
-    super::curve_rows::real_pill(&mut child, node, salt, rect, label, &mut v, shown, range, per_px, hover);
+    super::curve_rows::real_pill(&mut child, node, salt, rect, label, &mut v, shown, range, per_px, hover, None);
     false
 }
 

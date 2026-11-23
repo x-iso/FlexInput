@@ -857,6 +857,13 @@ A dial never gives up a line of frame for
   the scrub (which is how a choice strip or a doubling ladder is set) and opens a field in
   the value cell on a double-click or Ctrl-click. A number the user can only scrub is a
   number they can't set.
+- **A pill's word puts it back**: a double-click on the label before the value resets it to
+  its default, so every pill helper (`real_pill`, `count_pill`, `value_pill_number`, the
+  Inspector's `number`) takes the default as its last argument - the same value the body
+  falls back to where it reads the param (`unwrap_or(..)`), in the units the pill shows.
+  `None` only where there is no one default (a position, a pick, a selection).
+- **Typed in the units shown**: a share shown as a percentage ("74%" for 0.74) takes a typed
+  74 as 0.74 (`simple_bodies::shown_per_unit`), told by the shown number against the value.
 
 ## Surfaces: one grip per module
 

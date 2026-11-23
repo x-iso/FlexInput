@@ -115,8 +115,9 @@ pub fn overlay_geometry(ctx: &egui::Context) -> (egui::Pos2, egui::Vec2) {
 /// Keep an overlay viewport covering the overlay monitor: call from inside it, every
 /// frame. It is moved there in that monitor's pixels, whatever the scales involved, and
 /// once there sized to it. (The overlays sat at the desktop's corner - the primary monitor -
-/// sized from whichever monitor the main window was on.)
-pub fn keep_overlay_on_monitor(vctx: &egui::Context) {
+/// sized from whichever monitor the main window was on.) True when the window isn't there
+/// yet - moved or resized this frame - so what it draws now is laid out for the wrong place.
+pub fn keep_overlay_on_monitor(vctx: &egui::Context) -> bool {
     let (outer, inner, here) = vctx.input(|i| {
         let v = i.viewport();
         (v.outer_rect, v.inner_rect, v.monitor_size)
@@ -125,27 +126,101 @@ pub fn keep_overlay_on_monitor(vctx: &egui::Context) {
     match overlay_monitor() {
         Some(m) => {
             let want = egui::pos2(m.origin[0] as f32, m.origin[1] as f32);
-            let Some(outer) = outer else { return };
+            let Some(outer) = outer else { return false };
             let at = outer.min * ppp;
             if (at - want).length() > 1.5 {
                 vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(want / ppp));
-                return;
+                return true;
             }
             // There: as big as the monitor, in its own points.
             let size = egui::vec2(m.size[0] as f32, m.size[1] as f32) / ppp;
             if inner.is_some_and(|r| (r.size() - size).length() > 1.0) {
                 vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                return true;
             }
+            false
         }
         None => {
             if let (Some(inner), Some(want)) = (inner, here) {
                 if (inner.size() - want).length() > 1.0 {
                     vctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::Pos2::ZERO));
                     vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+                    return true;
                 }
             }
+            false
         }
     }
+}
+
+/// How many frames the overlay `which` has been open, before this one: 0 on the frame it
+/// opens. Call once a frame while it's shown; [`overlay_closed`] while it isn't.
+pub fn overlay_frames_open(ctx: &egui::Context, which: &'static str) -> u32 {
+    let id = egui::Id::new(("fxi_overlay_frames_open", which));
+    let n: u32 = ctx.data(|d| d.get_temp(id)).unwrap_or(0);
+    ctx.data_mut(|d| d.insert_temp(id, n.saturating_add(1)));
+    n
+}
+
+/// The overlay `which` isn't shown: it opens afresh next time.
+pub fn overlay_closed(ctx: &egui::Context, which: &'static str) {
+    ctx.data_mut(|d| d.remove::<u32>(egui::Id::new(("fxi_overlay_frames_open", which))));
+}
+
+/// How an overlay draws a frame while it opens. Its window is made afresh each time, and what
+/// it draws is laid out from what was measured the frame before - a row pinned scales to the
+/// size it measured, a card list stands as tall as it was - so on the frame it opened its
+/// widgets came out at guesses, and a window still being moved onto its monitor drew them
+/// laid out for the wrong place: a glimpse of everything out of place before it settled.
+/// A frame drawn while the window is still being moved into place draws nothing - for a few
+/// frames at most, so a window that can't be moved still shows - and the first frame it does
+/// draw is laid out [`SETTLE_PASSES`] times, all but the last pass discarded (egui's own way to
+/// re-run a frame before showing it), so what shows is laid out from what they measured.
+/// Returns whether to leave this frame empty. The overlay's window is shown inside
+/// [`with_settle_passes`], which lets egui run that many.
+pub fn settle_overlay_frame(vctx: &egui::Context, which: &'static str, frames_open: u32, moved: bool) -> bool {
+    let empty = moved && frames_open < 8;
+    let shown_id = egui::Id::new(("fxi_overlay_shown", which));
+    let settling_id = egui::Id::new(("fxi_overlay_settling", which));
+    // Decided on the frame's first pass, and kept for the passes that re-run it.
+    let settling = if vctx.current_pass_index() == 0 {
+        let shown_before = frames_open > 0 && vctx.data(|d| d.get_temp::<bool>(shown_id)).unwrap_or(false);
+        let settling = !empty && !shown_before;
+        vctx.data_mut(|d| {
+            d.insert_temp(settling_id, settling);
+            d.insert_temp(shown_id, !empty || shown_before);
+        });
+        settling
+    } else {
+        vctx.data(|d| d.get_temp::<bool>(settling_id)).unwrap_or(false)
+    };
+    if settling && vctx.current_pass_index() + 1 < SETTLE_PASSES {
+        vctx.request_discard("an overlay opening: its widgets measured first");
+    }
+    empty
+}
+
+/// How many passes the first frame an overlay shows is laid out in. A row pinned in its first
+/// look scales to what it measured the pass before, and measured at a new scale it comes out a
+/// little different again - from a guess, it is in place by the third measurement.
+pub const SETTLE_PASSES: usize = 4;
+
+/// Show the overlay `which`'s window (`show`, the viewport call) with egui allowed the passes its
+/// first frame settles in ([`settle_overlay_frame`]) while it hasn't shown one yet - two
+/// otherwise, egui's own, put back as soon as the window is drawn. (egui reads the limit as a
+/// frame starts, so the main window's frame, already under way, keeps its own.)
+pub fn with_settle_passes<R>(ctx: &egui::Context, which: &'static str, frames_open: u32, show: impl FnOnce() -> R) -> R {
+    let shown = frames_open > 0
+        && ctx.data(|d| d.get_temp::<bool>(egui::Id::new(("fxi_overlay_shown", which)))).unwrap_or(false);
+    if shown {
+        return show();
+    }
+    let was = ctx.options(|o| o.max_passes);
+    let want = std::num::NonZeroUsize::new(SETTLE_PASSES).expect("passes").max(was);
+    ctx.options_mut(|o| o.max_passes = want);
+    let r = show();
+    ctx.options_mut(|o| o.max_passes = was);
+    r
 }
 
 /// The header's picker, beside the overlay buttons: which monitor the overlays cover.
@@ -256,5 +331,47 @@ mod tests {
         assert_eq!(id(Some("DISPLAY3")), Some("DISPLAY1"), "a monitor gone away falls back");
         assert_eq!(list[1].describe(), "Display 2: 2560×1440");
         assert_eq!(list[0].describe(), "Display 1: 1920×1080, primary");
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    /// The passes egui ran for an overlay's frame `frames_open` (`moved`: its window still
+    /// being moved into place), and whether it was left empty.
+    fn frame(ctx: &egui::Context, frames_open: u32, moved: bool) -> (usize, bool) {
+        let mut passes = 0;
+        let mut empty = false;
+        super::with_settle_passes(ctx, "test", frames_open, || {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                passes += 1;
+                empty = super::settle_overlay_frame(ctx, "test", frames_open, moved);
+            });
+        });
+        (passes, empty)
+    }
+
+    // The first frame an overlay shows is laid out in several passes (all but the last
+    // measure, the last is shown), and only that one; a frame while its window is still being
+    // moved shows nothing - for a few frames at most. The limit on passes is egui's own again
+    // after each.
+    #[test]
+    fn an_overlay_lays_out_its_first_shown_frame_until_it_settles() {
+        let n = super::SETTLE_PASSES;
+        let ctx = egui::Context::default();
+        let stock = ctx.options(|o| o.max_passes);
+        assert_eq!(frame(&ctx, 0, false), (n, false), "the frame it opens on");
+        assert_eq!(ctx.options(|o| o.max_passes), stock, "egui's limit put back");
+        assert_eq!(frame(&ctx, 1, false), (1, false), "and none after");
+        let ctx = egui::Context::default();
+        assert_eq!(frame(&ctx, 0, true), (1, true), "moved: nothing shown, nothing to measure for");
+        assert_eq!(frame(&ctx, 1, true), (1, true));
+        assert_eq!(frame(&ctx, 2, false), (n, false), "the first frame shown, once in place");
+        assert_eq!(frame(&ctx, 3, false), (1, false));
+        // Reopened: afresh.
+        assert_eq!(frame(&ctx, 0, false), (n, false));
+        // A window that never gets into place still shows, after a few frames.
+        let ctx = egui::Context::default();
+        let shown = (0..20).find(|&n| !frame(&ctx, n, true).1).expect("it shows");
+        assert!(shown <= 8, "empty for {shown} frames");
     }
 }

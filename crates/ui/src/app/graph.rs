@@ -2175,10 +2175,31 @@ pub(crate) fn build_processing_graph_rec(
         is_macro_reader(&node.module_id)
             || node.subpatch.as_deref().is_some_and(|sp| subpatch_has_module(sp, &is_macro_reader))
     }).map(|(i, _)| i).collect();
+    // An ordering edge that would close a loop is left out: a reader wired into a publisher
+    // (a Macro Output's port into 3DOF to 2D's Reset - and 3DOF publishes, for its Lean cards)
+    // already runs before it by the wire, and that publisher's own macro values reach it a
+    // tick late. Added, the loop left the sort to fall back on the nodes' order for the loop
+    // and everything after it, so modules read inputs not yet worked out that tick: the
+    // Macro's ports read as nothing, a Selector on them never came on, and the gyro it gated
+    // and the RWS flick on it stayed off - the camera frozen, as if Reset were held.
     if !macro_readers.is_empty() {
+        let reaches = |dependents: &Vec<Vec<usize>>, from: usize, to: usize| -> bool {
+            let mut seen = vec![false; n];
+            let mut stack = vec![from];
+            while let Some(i) = stack.pop() {
+                if i == to {
+                    return true;
+                }
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                stack.extend(dependents[i].iter().copied());
+            }
+            false
+        };
         for &p in &macro_publishers {
             for &m in &macro_readers {
-                if p == m { continue; }
+                if p == m || reaches(&dependents, m, p) { continue; }
                 dependents[p].push(m);
                 in_degree[m] += 1;
             }
@@ -2215,6 +2236,59 @@ pub(crate) fn build_processing_graph_rec(
     }).collect();
 
     (ProcessingGraph::new(nodes), dirty_uids)
+}
+
+#[cfg(test)]
+mod macro_order_tests {
+    use super::*;
+    use flexinput_core::{PinDescriptor, SignalType};
+
+    fn node(module_id: &str, ins: &[SignalType], outs: &[SignalType]) -> NodeData {
+        NodeData {
+            module_id: module_id.to_string(),
+            display_name: module_id.to_string(),
+            category: "test".to_string(),
+            inputs: ins.iter().enumerate().map(|(i, t)| PinDescriptor::new(format!("in{i}"), *t)).collect(),
+            outputs: outs.iter().enumerate().map(|(i, t)| PinDescriptor::new(format!("out{i}"), *t)).collect(),
+            params: std::collections::HashMap::new(),
+            subpatch: None,
+            extra: crate::canvas::node::NodeExtra::default(),
+        }
+    }
+
+    /// A Macro Output's port wired into 3DOF to 2D's Reset - 3DOF publishes macro values
+    /// itself, for its Lean cards - with a Selector on the Macro's other ports. Every module
+    /// still runs after what it reads: the Macro before 3DOF (its wire) and before the
+    /// Selector. The ordering edge 3DOF -> Macro closed a loop, and the sort fell back on the
+    /// nodes' order: 3DOF and the Selector ran before the Macro and read nothing from it.
+    #[test]
+    fn a_macro_wired_into_a_publisher_runs_before_it() {
+        use SignalType::{Bool, Float, Vec2};
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        // Made in this order on purpose: the fallback ran them in it.
+        let gyro = s.insert_node(p, node("processing.gyro_3dof", &[SignalType::AutoMap, Bool, Float], &[Vec2, Float]));
+        let sel = s.insert_node(p, node("module.selector", &[Bool, Bool], &[Bool]));
+        let remap = s.insert_node(p, node("module.remapper", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        let mac = s.insert_node(p, node("module.macro", &[], &[Bool, Bool]));
+        let mul = s.insert_node(p, node("math.multiply", &[Float, Float], &[Float]));
+        s.connect(OutPinId { node: mac, output: 1 }, InPinId { node: gyro, input: 1 });
+        s.connect(OutPinId { node: mac, output: 0 }, InPinId { node: sel, input: 0 });
+        s.connect(OutPinId { node: gyro, output: 1 }, InPinId { node: mul, input: 0 });
+        s.connect(OutPinId { node: sel, output: 0 }, InPinId { node: mul, input: 1 });
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let at = |id: NodeId| graph.nodes.iter().position(|n| n.node_uid == id.0).expect("in the graph");
+        assert!(at(remap) < at(mac), "the Remapper publishes before the Macro reads");
+        assert!(at(mac) < at(gyro), "the Macro runs before the 3DOF it's wired into");
+        assert!(at(mac) < at(sel), "the Macro runs before the Selector on it");
+        assert!(at(gyro) < at(mul) && at(sel) < at(mul), "the multiply after both its inputs");
+        // Every input reads a module that ran before it.
+        for (i, n) in graph.nodes.iter().enumerate() {
+            for src in n.input_sources.iter().flatten() {
+                assert!(src.0 < i, "{} reads node {} that runs after it", n.module_id, graph.nodes[src.0].module_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

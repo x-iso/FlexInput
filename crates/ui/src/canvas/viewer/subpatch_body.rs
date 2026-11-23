@@ -334,7 +334,7 @@ pub(crate) fn show_subpatch_body(
                 let iv_style_ov = m.iv_style_override.clone();
                 let menu_style_ov = m.menu_style_override;
                 let pin_style = m.pin_style.unwrap_or(1);
-                let zoom = m.zoom.unwrap_or(1.0);
+                let look = crate::canvas::node::WidgetLook::of(m);
                 let outer_snap_ref = outer_snapshot.as_ref();
                 let prev_suppressed = ui.ctx().data(|d| {
                     d.get_temp::<bool>(egui::Id::new(OVERLAY_PICK_SUPPRESSED_KEY)).unwrap_or(false)
@@ -359,7 +359,7 @@ pub(crate) fn show_subpatch_body(
                                     inner_id, &module_id, &element_id, ui, &mut sp.snarl,
                                     mod_size, live_signals, panic_shortcut, automap_parent,
                                     outer_snap_ref, outer_id, is_unlocked, graph_ov, iv_style_ov,
-                                    menu_style_ov, pin_style, zoom,
+                                    menu_style_ov, pin_style, &look,
                                 );
                             }
                         });

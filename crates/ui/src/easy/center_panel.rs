@@ -1573,6 +1573,15 @@ fn render_subpatch_body(
                 };
                 painter.rect_filled(thumb_rect, 3.0, thumb_col);
             }
+            // A shadow along the top while the layout is scrolled down, and along the bottom
+            // while there's more of it below: content cut off at the panel's edges scrolls.
+            // Above the body and every pin's own layer under it, as the nav glows are.
+            if scroll_overflow > 0.0 {
+                let shadow = crate::widgets::nav_glow_layer(
+                    ui.ctx(), egui::Order::Foreground, egui::Id::new(("easy_scroll_shadow", outer_id.0)), area_layer);
+                let painter = ui.ctx().layer_painter(shadow).with_clip_rect(panel_rect);
+                crate::widgets::paint_scroll_shadows(&painter, panel_rect, scroll_y > 0.5, scroll_y < scroll_overflow - 0.5);
+            }
             let _ = scaled_w; // reserved for future right-edge layout
         });
 
@@ -3082,6 +3091,267 @@ mod layout_editor_shots {
         // On the pad's own pose, rotation and drift fix grey out and pass by.
         let stops = stops_with(open(serde_json::json!({ "orient_source": "device" })));
         assert!(fields_of(&stops, "orient_scale").is_empty() && fields_of(&stops, "orient_drift").is_empty(), "{stops:?}");
+    }
+
+    /// 3DOF to 2D pinned whole with `extra` on its pin: its stops, and the sections the
+    /// widget found in its body.
+    fn widget_with(extra: serde_json::Value, params: serde_json::Value) -> (Vec<(String, Option<usize>)>, Vec<(String, String)>) {
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1100.0, 800.0));
+        let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+            .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let mut node = NodeData::from(&desc);
+            if let serde_json::Value::Object(m) = params {
+                node.params.extend(m);
+            }
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), node);
+            let mut pin = serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [520.0, 760.0],
+            });
+            if let serde_json::Value::Object(m) = extra {
+                pin.as_object_mut().expect("an object").extend(m);
+            }
+            sp.items.push(LayoutItem::Module(serde_json::from_value(pin).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        for _ in 0..6 {
+            scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1090.0, 790.0))]);
+        }
+        let stops = crate::app::FlexInputApp::nav_widget_stops(&scene.ctx, "processing.gyro_3dof", "whole_module", inner.0, egui::ViewportId::ROOT)
+            .expect("the widget has stops");
+        let found = crate::canvas::viewer::widget_sections(&scene.ctx, inner.0, "processing.gyro_3dof");
+        (stops.into_iter().map(|(p, f, _)| (p, f)).collect(), found)
+    }
+
+    /// The Inspector picks which of a module's sections its widget shows, and can keep them
+    /// all open: a section left out is gone - heading, settings and stops - while the
+    /// Inspector still lists it; kept open, a section folded on the module shows its settings
+    /// in the widget, with no heading to fold it by.
+    #[test]
+    fn a_module_widget_shows_the_sections_its_pin_picks() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let has = |stops: &[(String, Option<usize>)], part: &str| stops.iter().any(|(p, _)| p == part);
+
+        let (stops, found) = widget_with(serde_json::json!({}), serde_json::json!({ "fold_orient": false }));
+        let keys: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
+        for key in ["mode", "orient", "axes", "lean"] {
+            assert!(keys.contains(&key), "the Inspector is offered {key}: {found:?}");
+        }
+        assert!(has(&stops, "fold:orient") && has(&stops, "orient_scale"), "{stops:?}");
+
+        let (stops, found) = widget_with(serde_json::json!({ "hidden_sections": ["orient"] }), serde_json::json!({ "fold_orient": false }));
+        assert!(!has(&stops, "fold:orient") && !has(&stops, "orient_scale") && !has(&stops, "orient_source"), "left out: {stops:?}");
+        assert!(has(&stops, "fold:mode"), "the rest stay: {stops:?}");
+        assert!(found.iter().any(|(k, _)| k == "orient"), "a section left out is still offered: {found:?}");
+
+        // Folded on the module (Orientation starts folded), kept open in the widget.
+        let (stops, _) = widget_with(serde_json::json!({ "sections_open": true }), serde_json::json!({}));
+        assert!(has(&stops, "orient_scale") && has(&stops, "gyro_invert"), "open: {stops:?}");
+        assert!(!stops.iter().any(|(p, _)| p.starts_with("fold:")), "nothing to fold: {stops:?}");
+    }
+
+    /// JSM Config pinned whole wears its pin's graph colours - its curve's pane - and its
+    /// text colour on the tuning faders' names. Pinned whole, the module draws its own body,
+    /// which handed its graphs no colours, so the Inspector's changed nothing there.
+    #[test]
+    fn a_jsm_module_pinned_whole_wears_its_pins_colours() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let red = egui::Color32::from_rgb(200, 10, 10);
+        let green = egui::Color32::from_rgb(10, 200, 10);
+        let painted = |styled: bool| -> (bool, Option<egui::Color32>) {
+            let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(900.0, 760.0));
+            let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+                .find(|d| d.id == "module.jsm").expect("JSM Config");
+            {
+                let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                let mut node = NodeData::from(&desc);
+                node.params.insert("jsm_tabs".into(), serde_json::json!([{ "name": "aim", "text": "MIN_GYRO_SENS = 1\nMAX_GYRO_SENS = 2\n" }]));
+                node.params.insert("jsm_show_knobs".into(), serde_json::json!(true));
+                let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), node);
+                let ov = styled.then(|| serde_json::json!({ "background": [200, 10, 10, 255], "text": [10, 200, 10, 255] }));
+                sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [560.0, 620.0],
+                    "graph_override": ov,
+                })).expect("a pin")));
+                sp.selected_item = None;
+                sp.selected_items.clear();
+            }
+            let mut shapes = Vec::new();
+            for _ in 0..6 {
+                shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(890.0, 750.0))]);
+            }
+            fn walk(s: &egui::Shape, red: egui::Color32, pane: &mut bool, name: &mut Option<egui::Color32>) {
+                match s {
+                    egui::Shape::Rect(r) if r.fill == red => *pane = true,
+                    egui::Shape::Text(t) if t.galley.text() == "MIN_GYRO_SENS" => {
+                        *name = t.galley.job.sections.first().map(|sec| sec.format.color);
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, red, pane, name)),
+                    _ => {}
+                }
+            }
+            let (mut pane, mut name) = (false, None);
+            shapes.iter().for_each(|c| walk(&c.shape, red, &mut pane, &mut name));
+            (pane, name)
+        };
+        let (pane, name) = painted(true);
+        assert!(pane, "no pane in the pin's colour");
+        assert_eq!(name, Some(green), "the fader's name isn't in the pin's text colour");
+        let (pane, name) = painted(false);
+        assert!(!pane, "a pane in that colour without the pin's colours");
+        assert!(name.is_some_and(|c| c != green), "the fader's name: {name:?}");
+    }
+
+    /// A pin's text capped at a size stays as it is at that size under a larger text size
+    /// setting: RWS Aim pinned whole, capped at 15 points, has its fields where they are at 15
+    /// with the setting at 18 - where the larger font's wider rows wrap onto more lines.
+    #[test]
+    fn a_pins_capped_text_keeps_its_rows_under_a_larger_text_size() {
+        use crate::canvas::viewer::simple_bodies::{apply_text_styles, with_test_font_size};
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fields = |size: f32, cap: Option<f32>| -> Vec<(String, egui::Rect)> {
+            with_test_font_size(size, || {
+                let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(900.0, 760.0));
+                // egui's own text styles at the setting, as the app sets them.
+                let mut style = (*scene.ctx.style()).clone();
+                apply_text_styles(&mut style);
+                scene.ctx.set_style(style);
+                let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+                    .find(|d| d.id == "processing.rws").expect("RWS Aim");
+                let inner = {
+                    let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                    let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+                    sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                        "inner_node_id": inner.0, "element_id": "whole_module", "pos": [16.0, 16.0], "size": [440.0, 600.0],
+                        "text_max": cap,
+                    })).expect("a pin")));
+                    sp.selected_item = None;
+                    sp.selected_items.clear();
+                    inner.0
+                };
+                for _ in 0..6 {
+                    scene.frame(vec![egui::Event::PointerMoved(egui::pos2(890.0, 750.0))]);
+                }
+                let (_, parts) = widget_parts(&scene.ctx, inner).expect("the widget's fields");
+                let origin = parts.iter().fold(egui::pos2(f32::INFINITY, f32::INFINITY), |o, (_, r)| o.min(r.min));
+                parts.into_iter().map(|(e, r)| (e, r.translate(-origin.to_vec2()))).collect()
+            })
+        };
+        let same = |a: &[(String, egui::Rect)], b: &[(String, egui::Rect)]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((ea, ra), (eb, rb))| ea == eb && (ra.min - rb.min).length() < 0.6 && (ra.size() - rb.size()).length() < 0.6)
+        };
+        let plain = fields(15.0, None);
+        let larger = fields(18.0, None);
+        let capped = fields(18.0, Some(15.0));
+        assert!(plain.len() > 4, "the widget has fields: {plain:?}");
+        assert!(!same(&plain, &larger), "the larger setting moves nothing, so this shows nothing");
+        assert!(same(&plain, &capped), "capped at 15 under 18, the fields moved:\n{plain:?}\n{capped:?}");
+        // A cap the setting is under changes nothing.
+        assert!(same(&plain, &fields(15.0, Some(17.0))), "a cap above the setting moved the fields");
+    }
+
+    /// A pin's graph labels are its own: 3DOF to 2D's preview pinned at 150% draws its
+    /// legend half as large again as one left as it is.
+    #[test]
+    fn a_pins_graph_labels_take_its_own_size() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let legend = |labels: Option<f32>| -> f32 {
+            let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(900.0, 600.0));
+            let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+                .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+            {
+                let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+                let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+                sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                    "inner_node_id": inner.0, "element_id": "preview", "pos": [16.0, 16.0], "size": [420.0, 300.0],
+                    "graph_labels": labels,
+                })).expect("a pin")));
+                sp.selected_item = None;
+                sp.selected_items.clear();
+            }
+            let mut shapes = Vec::new();
+            for _ in 0..6 {
+                shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(890.0, 590.0))]);
+            }
+            painted_texts(&shapes).into_iter().find(|(t, _, _)| t == "output").map(|(_, r, _)| r.height())
+                .expect("the legend's first line")
+        };
+        let (plain, big) = (legend(None), legend(Some(1.5)));
+        assert!((big / plain - 1.5).abs() < 0.15, "the legend at 150% is {big} tall beside {plain}");
+    }
+
+    /// 3DOF to 2D pinned whole sizes freely: its Lean card lists keep their own height, so
+    /// the layout holds the widget to no "top part and one card" floor - read at the pin's
+    /// width, that floor held its height to its width, and widening it only made it taller.
+    #[test]
+    fn a_module_widgets_card_lists_hold_it_to_no_height() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut scene = EasyScene::new(Vec::new(), 0, false, egui::vec2(1300.0, 800.0));
+        let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+            .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+        let inner = {
+            let sp = scene.canvas.snarl.get_node_mut(scene.oid).and_then(|n| n.subpatch.as_mut()).expect("the sub-patch");
+            let inner = sp.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+            sp.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+                "inner_node_id": inner.0, "element_id": "whole_module", "pos": [0.0, 0.0], "size": [988.0, 592.0],
+            })).expect("a pin")));
+            sp.selected_item = None;
+            sp.selected_items.clear();
+            inner
+        };
+        for _ in 0..8 {
+            scene.frame(vec![egui::Event::PointerMoved(egui::pos2(1290.0, 790.0))]);
+        }
+        let key = crate::canvas::viewer::pin_ws_nat_key(&scene.ctx, scene.oid.0, inner.0, "whole_module");
+        let floor: Option<f32> = scene.ctx.data(|d| d.get_temp(crate::canvas::viewer::pin_min_body_h_id(key)));
+        assert_eq!(floor, None, "the widget is held to a height");
+    }
+
+    /// A layout taller than the panel shades the edge its cut-off content is past: the
+    /// bottom at first, the top as well once it's scrolled part way, so it reads as scrolling.
+    #[test]
+    fn a_layout_that_scrolls_shades_its_cut_off_edges() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let items = vec![
+            rect_item([16.0, 16.0], [200.0, 80.0], [60, 60, 60, 255], None),
+            rect_item([16.0, 1600.0], [200.0, 80.0], [60, 60, 60, 255], None),
+        ];
+        let mut scene = EasyScene::new(items, 0, false, egui::vec2(700.0, 500.0));
+        let shades = |shapes: &[egui::epaint::ClippedShape]| -> Vec<f32> {
+            fn walk(s: &egui::Shape, out: &mut Vec<f32>) {
+                match s {
+                    egui::Shape::Mesh(m) if m.vertices.len() == 4
+                        && m.vertices.iter().any(|v| v.color == egui::Color32::from_black_alpha(110)) =>
+                    {
+                        let ys: Vec<f32> = m.vertices.iter().map(|v| v.pos.y).collect();
+                        out.push(ys.iter().sum::<f32>() / 4.0);
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            out
+        };
+        let mid = 250.0;
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(350.0, 300.0))]);
+        }
+        let at_top = shades(&shapes);
+        assert!(at_top.iter().any(|y| *y > mid) && !at_top.iter().any(|y| *y < mid), "only the bottom: {at_top:?}");
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -300.0), modifiers: Default::default() };
+        scene.frame(vec![egui::Event::PointerMoved(egui::pos2(350.0, 300.0)), wheel]);
+        for _ in 0..3 {
+            shapes = scene.frame(vec![egui::Event::PointerMoved(egui::pos2(350.0, 300.0))]);
+        }
+        let between = shades(&shapes);
+        assert!(between.iter().any(|y| *y > mid) && between.iter().any(|y| *y < mid), "both edges: {between:?}");
     }
 
     /// A picture of a Response Curve pinned whole, the pad on its range row:

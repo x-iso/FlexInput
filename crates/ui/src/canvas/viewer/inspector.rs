@@ -127,13 +127,14 @@ impl<'u> Insp<'u> {
     }
 
     /// A value pill for a real number. Compact, as wide as its word and its value need - the
-    /// value given room for four figures, so the row doesn't shift as it's dragged.
+    /// value given room for four figures, so the row doesn't shift as it's dragged. A
+    /// double-click on its word puts it back to `default`, where it has one.
     #[allow(clippy::too_many_arguments)]
-    pub fn number(&mut self, r: egui::Rect, key: &str, label: &str, value: &mut f32, shown: &str, range: std::ops::RangeInclusive<f32>, per_px: f32, hover: &str) -> bool {
+    pub fn number(&mut self, r: egui::Rect, key: &str, label: &str, value: &mut f32, shown: &str, range: std::ops::RangeInclusive<f32>, per_px: f32, hover: &str, default: impl Into<Option<f32>>) -> bool {
         let short = simple_bodies::pill_label_parts(label).0;
         let label_w = if short.is_empty() { 0.0 } else { self.word(short) + 12.0 };
         let Some(r) = self.fit(r, label_w + self.word(shown).max(self.word("8888")) + 16.0) else { return false };
-        curve_rows::real_pill(self.ui, self.node, key, r, label, value, shown, range, per_px, hover)
+        curve_rows::real_pill(self.ui, self.node, key, r, label, value, shown, range, per_px, hover, default)
     }
 
     /// [`Self::colour`] whose word a compact Inspector leaves off, where the section's caption
@@ -195,6 +196,12 @@ impl<'u> Insp<'u> {
         curve_rows::pill_combo(self.ui, r, label, value, options, hover, (self.salt, key))
     }
 
+
+    /// An on/off word in the house style: lit while on.
+    pub fn toggle(&mut self, r: egui::Rect, key: &str, word: &str, on: &mut bool, hover: &str) -> bool {
+        let Some(r) = self.fit(r, self.word(word) + 18.0) else { return false };
+        curve_rows::word_toggle(self.ui, r, on, word, hover, (self.salt, key))
+    }
 
     /// A button in the house style, filling `r`.
     pub fn button(&mut self, r: egui::Rect, word: &str, hover: &str) -> bool {
@@ -439,9 +446,37 @@ pub(crate) fn layout_inspector(
                 let range = crate::canvas::node::WIDGET_ZOOM;
                 if insp.number(r, "zoom", "zoom", &mut z, &shown, range, 0.002,
                     "How large the module is drawn in the widget: under 100% its buttons and values come out \
-                     smaller and the rest - a graph - takes the room; over 100% everything is larger")
+                     smaller and the rest - a graph - takes the room; over 100% everything is larger", 1.0)
                 {
                     m.zoom = ((z - 1.0).abs() > 0.005).then_some(z);
+                }
+                // The sections of its body: which the widget shows, and whether they stay
+                // open. Known from the widget's last drawing.
+                let found = super::widget_sections(insp.ui.ctx(), m.inner_node_id, mid);
+                if !found.is_empty() {
+                    let r = insp.row(&[200.0])[0];
+                    let mut open = m.sections_open;
+                    if insp.toggle(r, "sections_open", "sections always open", &mut open,
+                        "Every section shown open, with no heading to fold it by")
+                    {
+                        m.sections_open = open;
+                    }
+                    insp.note("Sections shown:");
+                    for pair in found.chunks(2) {
+                        let rs = insp.row(&vec![120.0; pair.len()]);
+                        for ((key, title), r) in pair.iter().zip(rs) {
+                            let mut shown = !m.hidden_sections.contains(key);
+                            if insp.toggle(r, &format!("section_{key}"), title, &mut shown,
+                                "Whether the widget shows this section of the module")
+                            {
+                                if shown {
+                                    m.hidden_sections.retain(|k| k != key);
+                                } else {
+                                    m.hidden_sections.push(key.clone());
+                                }
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -469,13 +504,15 @@ pub(crate) fn layout_inspector(
             | "module.twoway_response_curve"
             | "module.automap_response_curve"
             | "module.automap_vec_response_curve"
-            | "module.automap_twoway_response_curve" => graph_pin_sections(ui, col_w, salt, m, channels, 2),
-            "generator.envelope" => graph_pin_sections(ui, col_w, salt, m, channels, 3),
-            "display.oscilloscope" | "display.vectorscope" | "display.trigscope" | "module.audio_stream_haptics" | "module.jsm" => {
-                graph_pin_sections(ui, col_w, salt, m, channels, 0)
+            | "module.automap_twoway_response_curve" => graph_pin_sections(ui, col_w, salt, m, channels, 2, false),
+            "generator.envelope" => graph_pin_sections(ui, col_w, salt, m, channels, 3, false),
+            "display.oscilloscope" | "display.vectorscope" | "display.trigscope" | "module.audio_stream_haptics" => {
+                graph_pin_sections(ui, col_w, salt, m, channels, 0, false)
             }
+            "module.jsm" => graph_pin_sections(ui, col_w, salt, m, channels, 0, true),
             _ => {}
         }
+        text_section(ui, col_w, salt, m, pin_has_graph(mid, &m.element_id));
     };
     if let Some(room) = compact {
         // How wide each section would be in a line, before anything is drawn.
@@ -560,6 +597,63 @@ pub(crate) fn layout_inspector(
 
 /// Whether a module pinned whole is drawn as its zoomable widget (`pinned::render_module_widget`)
 /// rather than a card view of its own (the mapping modules, the network ones).
+/// Whether a pin of `mid`'s `element` draws a graph or a picture with labels in it - a
+/// curve's axis marks, a scope's scale, the 3DOF preview's degrees - which the Inspector then
+/// sizes ([`text_section`]).
+fn pin_has_graph(mid: &str, element: &str) -> bool {
+    let curve = matches!(
+        mid,
+        "module.response_curve" | "module.vec_response_curve" | "module.twoway_response_curve"
+            | "module.automap_response_curve" | "module.automap_vec_response_curve"
+            | "module.automap_twoway_response_curve" | "generator.envelope" | "module.vec_reshape"
+    );
+    let picture = mid.starts_with("display.")
+        || matches!(mid, "module.input_viewer" | "module.touch_zones" | "module.menu" | "module.knob" | "module.audio_stream_haptics");
+    match element {
+        "whole_module" | "default" => curve || picture || matches!(mid, "processing.gyro_3dof" | "processing.rws" | "module.stick_rotation" | "module.jsm"),
+        "curve" => curve,
+        "preview" => mid == "processing.gyro_3dof",
+        _ => picture,
+    }
+}
+
+/// A module pin's text: the most it grows with the text size setting, and - where it draws a
+/// graph or a picture (`graph`) - how large the labels inside that are, as a share of their
+/// own size.
+fn text_section(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut ExposedModule, graph: bool) {
+    section(ui, w, salt, "Text", |insp| {
+        let rs = insp.row(&[110.0, 120.0]);
+        let mut capped = m.text_max.is_some();
+        if insp.toggle(rs[0], "text_cap", "cap size", &mut capped,
+            "Keep this pin's text from growing past a size: a larger Control font size (Settings → Display) \
+             then leaves it as it is at that size - its rows stay as laid out instead of wrapping onto more lines")
+        {
+            m.text_max = capped.then_some(simple_bodies::CONTROL_FONT_BASIS);
+        }
+        if let Some(max) = m.text_max.as_mut() {
+            let shown = format!("{} pt", (*max * 10.0).round() / 10.0);
+            let mut v = *max;
+            if insp.number(rs[1], "text_max", "at most", &mut v, &shown, crate::canvas::node::TEXT_MAX, 0.02,
+                "The largest this pin's text is drawn, in the points of Settings → Display → Control font size", simple_bodies::CONTROL_FONT_BASIS)
+            {
+                *max = ((v * 2.0).round() / 2.0).clamp(*crate::canvas::node::TEXT_MAX.start(), *crate::canvas::node::TEXT_MAX.end());
+            }
+        }
+        if graph {
+            let r = insp.row(&[170.0])[0];
+            let mut pct = m.graph_labels.unwrap_or(1.0) * 100.0;
+            let shown = format!("{pct:.0}%");
+            let range = crate::canvas::node::GRAPH_LABELS;
+            if insp.number(r, "graph_labels", "graph labels", &mut pct, &shown, range.start() * 100.0..=range.end() * 100.0, 0.25,
+                "How large the labels inside this pin's graph or picture are: a curve's axis marks, a scope's scale, the 3DOF preview's degrees and legend", 100.0)
+            {
+                let v = pct / 100.0;
+                m.graph_labels = ((v - 1.0).abs() > 0.005).then_some(v);
+            }
+        }
+    });
+}
+
 fn module_widget_zooms(mid: &str) -> bool {
     !matches!(
         mid,
@@ -573,7 +667,7 @@ fn place_rows(insp: &mut Insp<'_>, item: &mut LayoutItem) {
         let rs = insp.row(&[110.0, 110.0]);
         for i in 0..2 {
             let shown = format!("{:.0}", v[i]);
-            insp.number(rs[i], keys[i], keys[i], &mut v[i], &shown, min..=100_000.0, 1.0, hover[i]);
+            insp.number(rs[i], keys[i], keys[i], &mut v[i], &shown, min..=100_000.0, 1.0, hover[i], None);
         }
     };
     match item {
@@ -608,7 +702,7 @@ fn decoration_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, d: &mut Layout
                 insp.text(text, "text");
                 let rs = insp.row(&[100.0, 130.0]);
                 let shown = format!("{font_size:.0} px");
-                insp.number(rs[0], "size", "size", font_size, &shown, 6.0..=96.0, 0.25, "How big the type is");
+                insp.number(rs[0], "size", "size", font_size, &shown, 6.0..=96.0, 0.25, "How big the type is", 16.0);
                 if let Some(v) = insp.choice(rs[1], "align", align, &[
                     (TextAlign::Left, "left", "From the left edge"),
                     (TextAlign::Center, "mid", "In the middle"),
@@ -630,24 +724,24 @@ fn decoration_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, d: &mut Layout
                 insp.colour(rs[1], "outline", "outline", outline, "The colour round each letter");
                 let r = insp.row(&[130.0])[0];
                 let shown = format!("{outline_px:.1} px");
-                insp.number(r, "outline_px", "outline", outline_px, &shown, 0.0..=8.0, 0.02, "How thick the outline round the letters is");
+                insp.number(r, "outline_px", "outline", outline_px, &shown, 0.0..=8.0, 0.02, "How thick the outline round the letters is", 0.0);
             });
         }
         LayoutDecoration::Rect { fill, fill_gradient, stroke, stroke_px, corner_radius, .. } => {
             section(ui, w, salt, "Fill", |insp| fill_rows(insp, "fill", fill, fill_gradient));
             section(ui, w, salt, "Stroke", |insp| {
-                stroke_rows(insp, stroke, stroke_px);
+                stroke_rows(insp, stroke, stroke_px, 1.0);
                 let r = insp.row(&[130.0])[0];
                 let shown = format!("{corner_radius:.0}");
-                insp.number(r, "corner", "corners", corner_radius, &shown, 0.0..=64.0, 0.1, "How round the corners are");
+                insp.number(r, "corner", "corners", corner_radius, &shown, 0.0..=64.0, 0.1, "How round the corners are", 4.0);
             });
         }
         LayoutDecoration::Ellipse { fill, fill_gradient, stroke, stroke_px, .. } => {
             section(ui, w, salt, "Fill", |insp| fill_rows(insp, "fill", fill, fill_gradient));
-            section(ui, w, salt, "Stroke", |insp| stroke_rows(insp, stroke, stroke_px));
+            section(ui, w, salt, "Stroke", |insp| stroke_rows(insp, stroke, stroke_px, 1.0));
         }
         LayoutDecoration::Line { stroke, stroke_px, .. } => {
-            section(ui, w, salt, "Line", |insp| stroke_rows(insp, stroke, stroke_px));
+            section(ui, w, salt, "Line", |insp| stroke_rows(insp, stroke, stroke_px, 1.5));
         }
         LayoutDecoration::Svg { tint, tint_mode, tint_gradient, stroke, stroke_px, svg_data, rev, icon_key, .. } => {
             section(ui, w, salt, "Picture", |insp| {
@@ -677,17 +771,17 @@ fn decoration_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, d: &mut Layout
                 }
                 fill_rows(insp, "tint", tint, tint_gradient);
             });
-            section(ui, w, salt, "Frame", |insp| stroke_rows(insp, stroke, stroke_px));
+            section(ui, w, salt, "Frame", |insp| stroke_rows(insp, stroke, stroke_px, 0.0));
         }
     }
 }
 
 /// A stroke's colour and width.
-fn stroke_rows(insp: &mut Insp<'_>, stroke: &mut [u8; 4], stroke_px: &mut f32) {
+fn stroke_rows(insp: &mut Insp<'_>, stroke: &mut [u8; 4], stroke_px: &mut f32, default: f32) {
     let rs = insp.row(&[110.0, 110.0]);
     insp.swatch(rs[0], "stroke", "colour", stroke, "The stroke's colour");
     let shown = format!("{stroke_px:.1} px");
-    insp.number(rs[1], "stroke_px", "width", stroke_px, &shown, 0.0..=12.0, 0.02, "How thick the stroke is (0 for none)");
+    insp.number(rs[1], "stroke_px", "width", stroke_px, &shown, 0.0..=12.0, 0.02, "How thick the stroke is (0 for none)", default);
 }
 
 /// A fill or a tint: one colour, or a gradient - linear or radial - with its colours, each
@@ -731,7 +825,7 @@ fn fill_rows(insp: &mut Insp<'_>, word: &str, solid: &mut [u8; 4], gradient: &mu
         insp.swatch(rs[0], &format!("stop{i}"), &format!("colour {}", i + 1), &mut stop.color, "One of the gradient's colours");
         let mut pct = stop.at * 100.0;
         let shown = format!("{pct:.0}%");
-        if insp.number(rs[1], &format!("at{i}"), "at", &mut pct, &shown, 0.0..=100.0, 0.25, "Where this colour sits along the line") {
+        if insp.number(rs[1], &format!("at{i}"), "at", &mut pct, &shown, 0.0..=100.0, 0.25, "Where this colour sits along the line", None) {
             stop.at = pct / 100.0;
             moved = true;
         }
@@ -748,7 +842,7 @@ fn fill_rows(insp: &mut Insp<'_>, word: &str, solid: &mut [u8; 4], gradient: &mu
     }
     let mut pct = g.bias * 100.0;
     let shown = format!("{pct:.0}%");
-    if insp.number(rs[1], "bias", "middle", &mut pct, &shown, 2.0..=98.0, 0.25, "Where along the line the middle of the colours falls: 50% for evenly") {
+    if insp.number(rs[1], "bias", "middle", &mut pct, &shown, 2.0..=98.0, 0.25, "Where along the line the middle of the colours falls: 50% for evenly", 50.0) {
         g.bias = pct / 100.0;
     }
     if moved {
@@ -785,7 +879,7 @@ fn text_pin_section(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut ExposedMo
         let r = insp.row(&[130.0])[0];
         let mut px = ov.outline_px.unwrap_or(0.0);
         let shown = format!("{px:.1} px");
-        if insp.number(r, "outline_px", "outline", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the outline round the letters is") {
+        if insp.number(r, "outline_px", "outline", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the outline round the letters is", 0.0) {
             ov.outline_px = Some(px);
         }
         clear = reset_row(insp, "The Text module's own colours");
@@ -822,7 +916,7 @@ fn switch_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut Expose
         let r = insp.row(&[130.0])[0];
         let mut px = ov.outline_px.unwrap_or(1.0);
         let shown = format!("{px:.1} px");
-        if insp.number(r, "outline_px", "width", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the outline is, on and off") {
+        if insp.number(r, "outline_px", "width", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the outline is, on and off", 1.0) {
             ov.outline_px = Some(px);
         }
         clear = reset_row(insp, "The theme's colours");
@@ -850,7 +944,7 @@ fn board_pin_section(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut ExposedM
         insp.colour(rs[1], "outline", "outline", &mut o.outline, "The board's outline colour");
         let r = insp.row(&[130.0])[0];
         let shown = format!("{:.1} px", o.outline_px);
-        insp.number(r, "outline_px", "outline", &mut o.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the board's outline is (0 for none)");
+        insp.number(r, "outline_px", "outline", &mut o.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the board's outline is (0 for none)", crate::canvas::input_viewer::IvStyle::default().to_override().outline_px);
         reset = reset_row(insp, "The default board style");
     });
     if reset {
@@ -927,7 +1021,7 @@ fn gyro_preview_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut Expo
         insp.colour(rs[1], "outline", "outline", &mut ov.outline, "The frame's outline colour");
         let r = insp.row(&[130.0])[0];
         let shown = format!("{:.1} px", ov.outline_px);
-        insp.number(r, "outline_px", "outline", &mut ov.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the frame's outline is (0 for none)");
+        insp.number(r, "outline_px", "outline", &mut ov.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the frame's outline is (0 for none)", picture_override(dark).outline_px);
     });
     section(ui, w, salt, "Pad", |insp| {
         let r = insp.row(&[240.0])[0];
@@ -943,7 +1037,7 @@ fn gyro_preview_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut Expo
         let r = insp.row(&[150.0])[0];
         let mut a = ov.c3d_composite.unwrap_or(0.5) * 100.0;
         let shown = format!("{a:.0}%");
-        if insp.number(r, "opacity", "model", &mut a, &shown, 5.0..=100.0, 0.25, "How opaque the pad's 3D model is in this pin (until set, the module's own)") {
+        if insp.number(r, "opacity", "model", &mut a, &shown, 5.0..=100.0, 0.25, "How opaque the pad's 3D model is in this pin (until set, the module's own)", 50.0) {
             ov.c3d_composite = Some(a / 100.0);
         }
         reset = reset_row(insp, "The pane's own fill, no outline, the pad as the module draws it");
@@ -968,35 +1062,35 @@ fn controller3d_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut 
         let rs = insp.row(&[110.0, 110.0]);
         insp.colour(rs[0], "outline", "outline", &mut ov.outline, "The frame's outline colour");
         let shown = format!("{:.1} px", ov.outline_px);
-        insp.number(rs[1], "outline_px", "width", &mut ov.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the frame's outline is (0 for none)");
+        insp.number(rs[1], "outline_px", "width", &mut ov.outline_px, &shown, 0.0..=6.0, 0.02, "How thick the frame's outline is (0 for none)", picture_override([0, 0, 0, 0]).outline_px);
     });
     section(ui, w, salt, "Display", |insp| {
         let rs = insp.row(&[110.0, 110.0]);
         let mut pitch = ov.c3d_pitch.unwrap_or(C3D_DEFAULT_PITCH_DEG);
         let shown = format!("{pitch:.0}°");
-        if insp.number(rs[0], "pitch", "view", &mut pitch, &shown, 0.0..=85.0, 0.25, "How far above the pad this pin's camera looks from") {
+        if insp.number(rs[0], "pitch", "view", &mut pitch, &shown, 0.0..=85.0, 0.25, "How far above the pad this pin's camera looks from", C3D_DEFAULT_PITCH_DEG) {
             ov.c3d_pitch = Some(pitch);
         }
         let mut alpha = ov.c3d_alpha.unwrap_or(1.0) * 100.0;
         let shown = format!("{alpha:.0}%");
-        if insp.number(rs[1], "alpha", "opacity", &mut alpha, &shown, 10.0..=100.0, 0.25, "How see-through the model is in this pin") {
+        if insp.number(rs[1], "alpha", "opacity", &mut alpha, &shown, 10.0..=100.0, 0.25, "How see-through the model is in this pin", 100.0) {
             ov.c3d_alpha = Some(alpha / 100.0);
         }
         let rs = insp.row(&[110.0, 110.0]);
         let mut fade = ov.c3d_fade.unwrap_or(0.25);
         let shown = format!("{fade:.2} s");
-        if insp.number(rs[0], "fade", "fade", &mut fade, &shown, 0.05..=2.0, 0.005, "How long a highlight takes to fade out in this pin") {
+        if insp.number(rs[0], "fade", "fade", &mut fade, &shown, 0.05..=2.0, 0.005, "How long a highlight takes to fade out in this pin", 0.25) {
             ov.c3d_fade = Some(fade);
         }
         let mut comp = ov.c3d_composite.unwrap_or(1.0) * 100.0;
         let shown = format!("{comp:.0}%");
-        if insp.number(rs[1], "composite", "fade all", &mut comp, &shown, 5.0..=100.0, 0.25, "Fades the whole picture of the pad as one image, without the see-through look") {
+        if insp.number(rs[1], "composite", "fade all", &mut comp, &shown, 5.0..=100.0, 0.25, "Fades the whole picture of the pad as one image, without the see-through look", 100.0) {
             ov.c3d_composite = Some(comp / 100.0);
         }
         let r = insp.row(&[150.0])[0];
         let mut xray = ov.c3d_xray.unwrap_or(crate::model::callback::GHOST_VIS_LOW) * 100.0;
         let shown = format!("{xray:.0}%");
-        if insp.number(r, "xray", "x-ray", &mut xray, &shown, 0.0..=100.0, 0.25, "A pressed input shows through the shell once less than this much of it is in view") {
+        if insp.number(r, "xray", "x-ray", &mut xray, &shown, 0.0..=100.0, 0.25, "A pressed input shows through the shell once less than this much of it is in view", crate::model::callback::GHOST_VIS_LOW * 100.0) {
             ov.c3d_xray = Some(xray / 100.0);
         }
     });
@@ -1057,7 +1151,7 @@ fn controller3d_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut 
 
 /// A pinned graph's colours - its pane, grid and lines - and the switches its module keeps
 /// in its header (`switches` of grid, labels and snap), for this copy alone.
-fn graph_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut ExposedModule, channels: usize, switches: usize) {
+fn graph_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut ExposedModule, channels: usize, switches: usize, text: bool) {
     use crate::canvas::node::PinGraphOverride;
     let mut ov = m.graph_override.clone().unwrap_or_default();
     let mut clear = false;
@@ -1078,8 +1172,15 @@ fn graph_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut Exposed
         }
         let mut px = ov.outline_px.unwrap_or(0.0);
         let shown = format!("{px:.1} px");
-        if insp.number(rs[1], "outline_px", "width", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the pane's outline is (0 for none)") {
+        if insp.number(rs[1], "outline_px", "width", &mut px, &shown, 0.0..=8.0, 0.02, "How thick the pane's outline is (0 for none)", 0.0) {
             ov.outline_px = Some(px);
+        }
+        if text {
+            let r = insp.row(&[110.0])[0];
+            let mut t = ov.text.unwrap_or([220, 220, 220, 255]);
+            if insp.colour(r, "text", "text", &mut t, "The words: the tuning faders' names and values, the curve's labels") {
+                ov.text = Some(t);
+            }
         }
         // The module's header switches as this copy's own: `module` follows the module on
         // the canvas, `on` and `off` set it for this copy alone.
@@ -1115,7 +1216,7 @@ fn graph_pin_sections(ui: &mut egui::Ui, w: Col, salt: egui::Id, m: &mut Exposed
     } else {
         let any = ov.background.is_some() || ov.outline.is_some() || ov.outline_px.is_some() || ov.gridline.is_some()
             || ov.show_grid.is_some() || ov.show_labels.is_some() || ov.snap.is_some()
-            || ov.channel_colors.iter().any(|c| c.is_some());
+            || ov.text.is_some() || ov.channel_colors.iter().any(|c| c.is_some());
         while matches!(ov.channel_colors.last(), Some(None)) {
             ov.channel_colors.pop();
         }

@@ -178,8 +178,16 @@ impl FlexInputApp {
 
         // A selected JSM editor takes the bumpers for its own panes, so the bar
         // must stop offering them as tab switching — a legend that names a
-        // shortcut the widget has taken is worse than no legend.
+        // shortcut the widget has taken is worse than no legend. (An editor that is a
+        // stop of a module pinned whole has no panes: its faders are stops of their own.)
         let jsm = self.nav_jsm_editor_selected();
+        let jsm_bumpers = self.nav_jsm_takes_bumpers();
+        // Select splits or joins the focused JSM fader's pair where it can, instead of Alt-Tab.
+        let select = match self.nav_jsm_pair_action() {
+            Some("Split") => "Split H / V",
+            Some(_) => "Join H / V",
+            None => "Alt-Tab",
+        };
         match self.gamepad_nav.edit_level {
             EditLevel::Widget => {
                 let mut v = vec![
@@ -187,17 +195,21 @@ impl FlexInputApp {
                     (vec!["right_stick"], "Cursor"),
                     (vec!["btn_south", "right_trigger"], "Select / Edit"),
                     (vec!["btn_north"], "Show/Hide devices"),
-                    if jsm {
+                    if jsm_bumpers {
                         (vec!["btn_lb", "btn_rb"], "Edit / Tune")
-                    } else {
+                    } else if self.easy_layout_has_tabs() {
                         (vec!["btn_lb", "btn_rb"], "Tab")
+                    } else {
+                        // No layout tabs here: LB / RB do nothing to offer.
+                        (vec![], "")
                     },
                     (vec!["btn_start"], "Presets"),
                     (vec!["btn_start"], "Hold: Settings"),
-                    (vec!["btn_back"], "Alt-Tab"),
+                    (vec!["btn_back"], select),
                     (vec!["btn_ls"], "Undo"),
                     (vec!["btn_rs"], "Redo"),
                 ];
+                v.retain(|(keys, _)| !keys.is_empty());
                 // On a device card whose pad has a gyro.
                 if self.gamepad_nav.left_gyro_card.is_some() {
                     v.insert(3, (vec!["btn_west"], "Calibrate gyro"));
@@ -239,9 +251,11 @@ impl FlexInputApp {
                             crate::gamepad_nav::JsmPane::Text => "Token",
                             crate::gamepad_nav::JsmPane::Tune => "Adjust",
                         }),
-                        (vec!["btn_lb", "btn_rb"], "Edit / Tune"),
                         (vec!["left_trigger", "right_trigger"], "Config tab"),
                     ];
+                    if jsm_bumpers {
+                        hints.insert(2, (vec!["btn_lb", "btn_rb"], "Edit / Tune"));
+                    }
                     // The two panes do different things with the face buttons,
                     // so the bar shows the pane's own, not a union that is half
                     // wrong wherever you are.
@@ -490,7 +504,11 @@ impl FlexInputApp {
                     (vec!["right_stick"], "Cursor"),
                     (vec!["btn_south", "right_trigger"], "Select / Edit"),
                     (vec!["btn_east"], "Exit edit"),
-                    (vec!["btn_back"], "Alt-Tab"),
+                    (vec!["btn_back"], match self.nav_jsm_pair_action() {
+                        Some("Split") => "Split H / V",
+                        Some(_) => "Join H / V",
+                        None => "Alt-Tab",
+                    }),
                 ]
             };
         // Advertise the actual control input in the icons: when a stick passes

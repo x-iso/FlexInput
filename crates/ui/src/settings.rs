@@ -153,6 +153,7 @@ pub const CONTROL_FONT_SIZE_DEFAULT: f32 = 15.0;
 pub const CONTROL_FONT_SIZE_MIN: f32 = 11.0;
 pub const CONTROL_FONT_SIZE_MAX: f32 = 18.0;
 fn default_control_font_size() -> f32 { CONTROL_FONT_SIZE_DEFAULT }
+
 fn default_see_through_alpha() -> f32 { 0.55 }
 fn default_pin_shortcut() -> PinShortcut { PinShortcut::default() }
 fn default_cursor_max_speed() -> f32 { 4000.0 }
@@ -367,6 +368,7 @@ pub struct AppSettings {
     /// font would be at this size (`simple_bodies::calibrate_control_fonts`).
     #[serde(default = "default_control_font_size")]
     pub control_font_size: f32,
+
     /// Whole-UI scale on top of the OS display scale (egui zoom factor), one of
     /// [`UI_SCALE_STEPS`]. Fonts re-rasterize at the resulting pixels-per-point,
     /// so text stays sharp at any step. Applied at startup and on the Settings
@@ -1244,17 +1246,9 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
     // dropdown from the Button text style - so none is left in the font it had.
     let size = settings.control_font_size.clamp(CONTROL_FONT_SIZE_MIN, CONTROL_FONT_SIZE_MAX);
     crate::canvas::viewer::simple_bodies::set_control_font(settings.control_font_mono, settings.control_font_bold, size);
-    style.text_styles.insert(
-        egui::TextStyle::Button,
-        crate::canvas::viewer::simple_bodies::control_font_at(size.min(crate::canvas::viewer::simple_bodies::CONTROL_FONT_MAX_PX)),
-    );
     // And every other text style in it, at egui's sizes scaled by the setting: labels,
-    // hints and headings were left in egui's font. (Monospace stays: it is for code.)
-    for (ts, base) in egui::Style::default().text_styles {
-        if base.family == egui::FontFamily::Proportional && ts != egui::TextStyle::Button {
-            style.text_styles.insert(ts, crate::canvas::viewer::simple_bodies::ui_font(base.size));
-        }
-    }
+    // hints and headings were left in egui's font.
+    crate::canvas::viewer::simple_bodies::apply_text_styles(&mut style);
 
     // See-through mode is NOT applied here on the global style — that
     // would tint sub-windows (Settings, Calibration, Subpatch editors)
@@ -1266,7 +1260,7 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
 }
 
 
-pub(crate) use crate::canvas::viewer::simple_bodies::{ui_font, ui_size};
+pub(crate) use crate::canvas::viewer::simple_bodies::{graph_font, ui_font, ui_size};
 
 /// The grey tint's per-channel factors, as [`apply_gray_tint`] last set them (1, 1, 1 =
 /// none), for the greys painted by hand rather than taken from the style: [`tinted`].

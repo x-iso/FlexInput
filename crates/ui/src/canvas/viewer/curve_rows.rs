@@ -336,6 +336,31 @@ pub(crate) fn split(rect: egui::Rect, weights: &[f32]) -> Vec<egui::Rect> {
 /// and unfolds what is under it. The fold is kept on the node (`fold_<key>`), so it saves
 /// with the patch. Returns whether the category is open.
 pub(crate) fn section(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node_id: NodeId, key: &str, title: &str, default_open: bool) -> bool {
+    // In a module pinned whole, the pin can leave a section out - heading and all, as if it
+    // were folded away for good - or keep every section open, with nothing to fold.
+    if let Some(rules) = super::widget_section_rules(ui.ctx(), node_id) {
+        super::note_widget_section(ui.ctx(), &rules, key, title);
+        if rules.hidden.iter().any(|k| k == key) {
+            return false;
+        }
+        if rules.open {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+            let v = ui.visuals();
+            let col = v.text_color();
+            let font = egui::TextStyle::Small.resolve(ui.style());
+            let g = ui.painter().layout_no_wrap(title.to_string(), font, col);
+            let text_w = g.size().x;
+            ui.painter().galley(egui::pos2(rect.left() + 4.0, rect.center().y - g.size().y * 0.5), g, col);
+            let line_x = rect.left() + 10.0 + text_w;
+            if line_x < rect.right() {
+                ui.painter().line_segment(
+                    [egui::pos2(line_x, rect.center().y), egui::pos2(rect.right(), rect.center().y)],
+                    egui::Stroke::new(1.0_f32, v.widgets.noninteractive.bg_stroke.color),
+                );
+            }
+            return true;
+        }
+    }
     let param = format!("fold_{key}");
     let open = snarl
         .get_node(node_id)
@@ -655,14 +680,16 @@ fn unit_range_pill(
     hover: &str,
 ) -> bool {
     let salt = format!("crv_range_{i}");
+    // Back to the full range: a min to the bottom of it, a max to the top.
+    let default = if i % 2 == 0 { *bus_range.start() } else { *bus_range.end() };
     let Some(u) = unit else {
         let shown = format!("{:.2}", *v);
-        return real_pill(ui, node_id, &salt, rect, label, v, &shown, bus_range, 0.01, hover);
+        return real_pill(ui, node_id, &salt, rect, label, v, &shown, bus_range, 0.01, hover, default);
     };
     let (lo, hi) = (u.reading(0.0), u.reading(1.0));
     let mut x = u.reading(*v);
     let shown = u.text(*v);
-    if real_pill(ui, node_id, &salt, rect, label, &mut x, &shown, lo.min(hi)..=lo.max(hi), u.per_px(), hover) {
+    if real_pill(ui, node_id, &salt, rect, label, &mut x, &shown, lo.min(hi)..=lo.max(hi), u.per_px(), hover, u.reading(default)) {
         *v = u.from_reading(x);
         true
     } else {
@@ -683,6 +710,7 @@ pub(crate) fn real_pill(
     range: std::ops::RangeInclusive<f32>,
     per_px: f32,
     hover: &str,
+    default: impl Into<Option<f32>>,
 ) -> bool {
     let label_w = pill_label_w(ui, label);
     let (resp, typed) = simple_bodies::value_pill_number(
@@ -695,6 +723,7 @@ pub(crate) fn real_pill(
         label_w,
         f64::from(*range.start())..=f64::from(*range.end()),
         simple_bodies::PillFill::span(f64::from(*value), f64::from(*range.start())..=f64::from(*range.end())),
+        default.into().map(f64::from),
     );
     let before = *value;
     if let Some(v) = typed {
@@ -720,10 +749,11 @@ pub(crate) fn count_pill(
     range: std::ops::RangeInclusive<f64>,
     per_px: f32,
     hover: &str,
+    default: impl Into<Option<f64>>,
 ) -> bool {
     let label_w = pill_label_w(ui, label);
     let fill = simple_bodies::PillFill::span(*value, range.clone());
-    let (resp, typed) = simple_bodies::value_pill_number(ui, node, salt, rect, label, shown, label_w, range.clone(), fill);
+    let (resp, typed) = simple_bodies::value_pill_number(ui, node, salt, rect, label, shown, label_w, range.clone(), fill, default);
     let before = *value;
     let acc_id = egui::Id::new(("curve_pill_acc", node.0, salt));
     if let Some(v) = typed {
@@ -950,7 +980,7 @@ pub(crate) fn curve_settings(
                     for (k, &i) in idx.iter().enumerate() {
                         let a = axes[i / 2];
                         let shown = format!("{:.*}{}", a.decimals, view[i], a.suffix);
-                        moved |= real_pill(ui, node_id, &format!("crv_range_{i}"), pills[k], labels[i], &mut view[i], &shown, -a.full_scale..=a.full_scale, a.step * 0.2, &hover);
+                        moved |= real_pill(ui, node_id, &format!("crv_range_{i}"), pills[k], labels[i], &mut view[i], &shown, -a.full_scale..=a.full_scale, a.step * 0.2, &hover, None);
                         fields.push((NAMES[i], pills[k]));
                     }
                     let mlinked = !deflects && linked;
@@ -989,11 +1019,13 @@ pub(crate) fn curve_settings(
         let h_changed = count_pill(
             ui, node_id, "crv_grid_x", pills[0], "H", s.gx, &shown, 1.0..=s.grid_max, 0.08,
             "Grid divisions across the input. A dragged point settles on one when Snap is on.",
+            4.0,
         );
         let shown = format!("{}", s.gy.round() as i64);
         let v_changed = count_pill(
             ui, node_id, "crv_grid_y", pills[1], "V", s.gy, &shown, 1.0..=s.grid_max, 0.08,
             "Grid divisions across the output.",
+            4.0,
         );
         fields.extend([("grid_x", pills[0]), ("grid_y", pills[1])]);
         let hover = if unlinked {
@@ -1024,6 +1056,7 @@ pub(crate) fn curve_settings(
         if count_pill(
             ui, node_id, "crv_trail", r, "trail", &mut t, &shown, 0.0..=TRAIL_MS_MAX as f64, 5.0,
             "How long the live input's trail stays on the graph. 0 turns it off.",
+            300.0,
         ) {
             *s.trail = t.round() as i64;
             changed = true;

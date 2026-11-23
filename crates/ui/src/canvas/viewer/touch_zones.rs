@@ -938,7 +938,7 @@ pub(crate) fn mapping_curve_editor(
             g.left_top(),
             egui::Align2::LEFT_TOP,
             format!("{} · struck {:.0}%", n.source, n.vel * 100.0),
-            crate::settings::ui_font(10.0),
+            crate::settings::graph_font(10.0),
             visuals.weak_text_color(),
         );
     }
@@ -1130,7 +1130,7 @@ pub(crate) fn mapping_card_curve_section(
         };
         let tri = if open { "⏷" } else { "⏵" };
         painter.text(row.left_center() + egui::vec2(6.0, 0.0), egui::Align2::LEFT_CENTER,
-            format!("{tri} Response curve"), crate::settings::ui_font(10.5), col);
+            format!("{tri} Response curve"), super::simple_bodies::label_font(), col);
         // Accent dot: this card carries a custom curve and/or threshold.
         if has_custom {
             painter.circle_filled(row.left_center() + egui::vec2(96.0, 0.0), 2.5, accent);
@@ -1532,7 +1532,7 @@ pub(crate) fn tz_paint_zone_mapping(
     if analog_pins.is_empty() && digital_pins.is_empty() {
         // Unmapped zone: faint index so it's still identifiable as a target.
         painter.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
-            crate::settings::ui_font(11.0), visuals.weak_text_color().gamma_multiply(0.5));
+            crate::settings::graph_font(11.0), visuals.weak_text_color().gamma_multiply(0.5));
         return;
     }
 
@@ -1727,7 +1727,7 @@ pub(crate) fn tz_draw_field(
             tz_paint_zone_mapping(zp, &ctx, node_id, zr, field, idx, &zone_maps, skin, deflect, accent, visuals, &zone_meta);
         } else {
             zp.text(zr.center(), egui::Align2::CENTER_CENTER, format!("{idx}"),
-                crate::settings::ui_font(12.0), visuals.weak_text_color());
+                crate::settings::graph_font(12.0), visuals.weak_text_color());
         }
     }
     // Gamepad-nav focused-zone highlight (accent overlay), drawn over the zone
@@ -2648,7 +2648,7 @@ pub(crate) fn tz_zone_icon_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
     let cells = super::curve_rows::pill_bands(ui, w, &mins);
     let mut z_edit = zone as f64;
     if super::curve_rows::count_pill(ui, node_id, "tz_zone_pick", cells[0], "zone", &mut z_edit, &format!("{zone}"),
-        0.0..=max_id as f64, 0.05, "Which zone the icon / name override applies to. Clicking a zone in the field selects it too.")
+        0.0..=max_id as f64, 0.05, "Which zone the icon / name override applies to. Clicking a zone in the field selects it too.", None)
     {
         if let Some(node) = snarl.get_node_mut(node_id) {
             node.params.insert("sel_field".into(), serde_json::json!(sel_f as u64));

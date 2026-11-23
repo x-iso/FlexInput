@@ -807,14 +807,14 @@ pub(crate) fn draw_asth_ef_scope_sized(uid: usize, ui: &mut egui::Ui, params: &A
             for w in hf.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, hf_col)); }
         } else {
             painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-                "no signal", crate::settings::ui_font(11.0), visuals.weak_text_color());
+                "no signal", crate::settings::graph_font(11.0), visuals.weak_text_color());
         }
     }
     #[cfg(not(windows))]
     {
         let _ = points;
         painter.text(rect.center(), egui::Align2::CENTER_CENTER,
-            "Windows only", crate::settings::ui_font(11.0), visuals.weak_text_color());
+            "Windows only", crate::settings::graph_font(11.0), visuals.weak_text_color());
     }
 
     // Keep the scope live while the node body is on screen.

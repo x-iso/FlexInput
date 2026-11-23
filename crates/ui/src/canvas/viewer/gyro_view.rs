@@ -682,7 +682,7 @@ fn draw_gimbal(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect, v
     let pitch_col = v.axes.rate(Rate::Pitch);
     let roll_col = v.axes.rate(Rate::Roll);
     let lean_col = egui::Color32::from_rgb(190, 140, 255);
-    let small = crate::settings::ui_font(9.0);
+    let small = crate::settings::graph_font(9.0);
 
     // ── The sphere: its outline, latitudes every 30°, meridians every 45°, and the heading
     //    ring (the equator) marked every 15° and numbered every 45°.
@@ -903,7 +903,7 @@ fn draw_gimbal(ctx: &egui::Context, painter: &egui::Painter, rect: egui::Rect, v
             egui::pos2(centre.x, rect.top() + 8.0),
             egui::Align2::CENTER_TOP,
             "no Orientation reading",
-            crate::settings::ui_font(10.0),
+            crate::settings::graph_font(10.0),
             weak,
         );
     }

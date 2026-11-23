@@ -168,7 +168,7 @@ pub(crate) fn show_rws_body(
         let mut shown = unit.shown(scale);
         let text = unit.text(scale);
         if super::curve_rows::real_pill(ui, node_id, "rws_scale", cal[0], "scale|mouse scale", &mut shown, &text, 0.0..=100_000.0 * unit.factor(), if unit.per_360() { 10.0 } else { 0.05 },
-            "Mouse Move (XY) output: mouse dots per degree of turn, or per 360°\n(the unit switch is in the header) — the calibrated 1:1 ground truth.\nCalibrate this and RWS 1 feels like a 1:1 physical rotation.")
+            "Mouse Move (XY) output: mouse dots per degree of turn, or per 360°\n(the unit switch is in the header) — the calibrated 1:1 ground truth.\nCalibrate this and RWS 1 feels like a 1:1 physical rotation.", unit.shown(100.0))
         {
             if let Some(p) = unit.to_param(shown) { set.push(("scale", p)); }
         }
@@ -179,7 +179,7 @@ pub(crate) fn show_rws_body(
         let mut sm = stick_max;
         let text = format!("{sm:.0} °/s");
         if super::curve_rows::real_pill(ui, node_id, "rws_sdps", cal[1], "stick|stick speed", &mut sm, &text, 1.0..=100_000.0, 5.0,
-            "Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.")
+            "Right-Stick output: the game's camera turn rate at full deflection.\nWire the Stick output to a virtual Right Stick for stick-aim games.", 360.0)
         {
             if let Some(n) = Number::from_f64(sm as f64) { set.push(("stick_out_dps", Value::Number(n))); }
         }
@@ -190,7 +190,7 @@ pub(crate) fn show_rws_body(
         let mut gs = gyro_scale;
         let text = format!("{gs:.3}");
         if super::curve_rows::real_pill(ui, node_id, "rws_gsc", cal[2], "gyro|gyro scale", &mut gs, &text, 0.0..=1000.0, 0.005,
-            "Map output: the pad's own gyro, for a game that aims with it. Wire the pad into\nthe Device input and the Map output on to the virtual pad; its gyro axes are\nmultiplied by this (and by Real World Scale). Calibrate it and the game turns\nas far as the pad does.")
+            "Map output: the pad's own gyro, for a game that aims with it. Wire the pad into\nthe Device input and the Map output on to the virtual pad; its gyro axes are\nmultiplied by this (and by Real World Scale). Calibrate it and the game turns\nas far as the pad does.", 1.0)
         {
             if let Some(n) = Number::from_f64(gs as f64) { set.push(("gyro_scale", Value::Number(n))); }
         }
@@ -205,7 +205,7 @@ pub(crate) fn show_rws_body(
         let mut v = rws;
         let text = format!("{v:.2}");
         if super::curve_rows::real_pill(ui, node_id, "rws_rws", out[0], "rws|real world scale", &mut v, &text, 0.01..=50.0, 0.01,
-            "Real World Scale: the sensitivity, as a multiple of the calibrated 1:1 turn.\n1.0 = the camera turns as far as your hands do; 2.0 = twice as far.\nIt applies to every output, and isn't touched by calibrating.")
+            "Real World Scale: the sensitivity, as a multiple of the calibrated 1:1 turn.\n1.0 = the camera turns as far as your hands do; 2.0 = twice as far.\nIt applies to every output, and isn't touched by calibrating.", 1.0)
         {
             if let Some(n) = Number::from_f64(v as f64) { set.push(("rws", Value::Number(n))); }
         }
@@ -222,13 +222,13 @@ pub(crate) fn show_rws_body(
         // value cell said it again ("gy 1.00").
         let gt = format!("{g:.2}");
         if super::curve_rows::real_pill(ui, node_id, "rws_gy", gy, "gy v/h|gyro v/h", &mut g, &gt, 0.0..=8.0, 0.01,
-            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the gyro source.")
+            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the gyro source.", 1.0)
         {
             if let Some(n) = Number::from_f64(g as f64) { set.push(("gyro_vh_ratio", Value::Number(n))); }
         }
         let st2 = format!("{s:.2}");
         if super::curve_rows::real_pill(ui, node_id, "rws_st", st, "st v/h|stick v/h", &mut s, &st2, 0.0..=8.0, 0.01,
-            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the stick sources.")
+            "Vertical sensitivity relative to horizontal (1.0 = equal;\n>1 = look up/down faster). Horizontal is the calibrated\nreference — the stick sources.", 1.0)
         {
             if let Some(n) = Number::from_f64(s as f64) { set.push(("stick_vh_ratio", Value::Number(n))); }
         }
@@ -573,7 +573,7 @@ fn rws_body_settings(
         let mut k = 0;
         let mut a = bg_alpha;
         let bg_slot = slots[k];
-        if real_pill(ui, node_id, "rws_bg", slots[k], "bg|background", &mut a, &format!("{bg_alpha:.2}"), 0.0..=1.0, 0.01, "Viewport background opacity (0 = transparent).") {
+        if real_pill(ui, node_id, "rws_bg", slots[k], "bg|background", &mut a, &format!("{bg_alpha:.2}"), 0.0..=1.0, 0.01, "Viewport background opacity (0 = transparent).", 0.0) {
             if let Some(n) = num(a) { set.push(("field_bg_alpha", n)); }
         }
         k += 1;
@@ -583,7 +583,7 @@ fn rws_body_settings(
         if room {
             let mut fv = fov;
             if real_pill(ui, node_id, "rws_fov", slots[k], "fov|field of view", &mut fv, &format!("{fov:.0}°"), 30.0..=140.0, 0.5,
-                "Horizontal field of view — set this to match your in-game FOV so the turn rate reads 1:1.")
+                "Horizontal field of view — set this to match your in-game FOV so the turn rate reads 1:1.", 90.0)
             {
                 if let Some(n) = num(fv.round()) { set.push(("field_fov", n)); }
             }
@@ -591,7 +591,7 @@ fn rws_body_settings(
         }
         if ruler {
             let mut td = tick_deg;
-            if real_pill(ui, node_id, "rws_tick", slots[k], "tick|tick spacing", &mut td, &format!("{tick_deg:.0}°"), 5.0..=90.0, 0.5, "Minor tick spacing.") {
+            if real_pill(ui, node_id, "rws_tick", slots[k], "tick|tick spacing", &mut td, &format!("{tick_deg:.0}°"), 5.0..=90.0, 0.5, "Minor tick spacing.", 15.0) {
                 if let Some(n) = num(td.round()) { set.push(("field_tick_deg", n)); }
             }
             fields.push(slots[k]);
@@ -622,7 +622,7 @@ fn rws_body_settings(
                          flick circle. Push the stick out into it and the camera snaps to the stick's direction; \
                          turn the stick round and the camera turns with it. Once out, the flick follows the stick \
                          down to the dashed ring before it lets go. A flick is 1:1: Real World Scale doesn't \
-                         apply. The Flick On input turns it off for a mode shift.")
+                         apply. The Flick On input turns it off for a mode shift.", 0.85)
                     {
                         if let Some(n) = num(d) { set.push(("flick_deadzone", n)); }
                     }
@@ -632,7 +632,7 @@ fn rws_body_settings(
                     if real_pill(ui, node_id, &key("rws_fwd"), slot, "fwd±|forward, no snap", &mut f, &format!("{fwd:.0}°"), 0.0..=90.0, 0.5,
                         "The green wedge at the top of the flick circle: a flick that starts within this many \
                          degrees of straight up doesn't snap. It only takes hold of the camera, so turning the \
-                         stick from there turns it - a 360° with the stick, say. 0 = every flick snaps.")
+                         stick from there turns it - a 360° with the stick, say. 0 = every flick snaps.", 0.0)
                     {
                         if let Some(n) = num(f.round()) { set.push(("flick_fwd_dz_deg", n)); }
                     }
@@ -656,7 +656,7 @@ fn rws_body_settings(
                     }
                     if real_pill(&mut c, node_id, &key("rws_aimx"), slot, "×|aim ×", &mut x, &format!("{aim_x:.2}"), 0.01..=50.0, 0.01,
                         "Stick aim's own sensitivity, a multiple of the calibrated turn rate (independent of \
-                         Real World Scale).")
+                         Real World Scale).", 1.0)
                     {
                         if let Some(n) = num(x) { set.push(("stick_aim_rws", n)); }
                     }
@@ -667,7 +667,7 @@ fn rws_body_settings(
                         "How long a push out of the centre has to reach the flick zone to count as a flick - the \
                          yellow ring round the stick's dot counts it down. With the flick speed gate on, a slower \
                          push doesn't flick. Either way a push that flicks throws away the Stick aim it made on its \
-                         way out, and a slower one has its aim caught up. 0 = off: the zone alone decides.")
+                         way out, and a slower one has its aim caught up. 0 = off: the zone alone decides.", 0.0)
                     {
                         if let Some(n) = num(sp.round()) { set.push(("flick_speed_ms", n)); }
                     }
@@ -693,7 +693,7 @@ fn rws_body_settings(
                     if real_pill(ui, node_id, &key("rws_fsm"), slot, "snap|snap time", &mut sm, &format!("{smooth:.0} ms"), 0.0..=500.0, 1.0,
                         "How long the flick's snap takes: the turn to the stick's direction is spread over this \
                          time rather than made at once (0 = instant). The arc by the flick circle's arrow fills \
-                         as the outputs turn it.")
+                         as the outputs turn it.", 100.0)
                     {
                         if let Some(n) = num(sm.round()) { set.push(("flick_smooth_ms", n)); }
                     }
@@ -703,7 +703,7 @@ fn rws_body_settings(
                     if real_pill(ui, node_id, &key("rws_stab"), slot, "stab|stabilise", &mut st, &format!("{stab:.0} ms"), 0.0..=300.0, 1.0,
                         "Steadies the stick's direction while a flick is held out and turned: a thumb's tremor is \
                          held back, a deliberate sweep goes through. Whatever it still holds back when you let go \
-                         is turned then. 0 = off.")
+                         is turned then. 0 = off.", 0.0)
                     {
                         if let Some(n) = num(st.round()) { set.push(("flick_stabilise_ms", n)); }
                     }
@@ -2106,7 +2106,7 @@ pub(crate) fn render_rws_field(
         egui::pos2(rect.left() + 4.0, rect.bottom() - 3.0),
         egui::Align2::LEFT_BOTTOM,
         "live",
-        crate::settings::ui_font(9.0),
+        crate::settings::graph_font(9.0),
         crate::settings::tinted_gray(120),
     );
 
@@ -2172,7 +2172,7 @@ fn paint_rws_ruler(
 
     // Major ticks + labels at each 90° (independent of the minor spacing).
     let major_stroke = egui::Stroke::new(1.0_f32, crate::settings::tinted_gray(170));
-    let font = crate::settings::ui_font((rect.height() * 0.16).clamp(7.0, 11.0));
+    let font = crate::settings::graph_font((rect.height() * 0.16).clamp(7.0, 11.0));
     let mut d = ((phase - half) / 90.0).ceil() * 90.0;
     while d <= phase + half {
         let x = cx + (d - phase) * ppd;

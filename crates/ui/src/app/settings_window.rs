@@ -75,8 +75,7 @@ impl FlexInputApp {
         // shortcuts, and an on-press single would fire the instant it's touched.
         let is_single = combo_now.len() == 1;
         let skin = self.shortcut_display_skin();
-        ui.horizontal(|ui| {
-            ui.label(format!("{label}:"));
+        form_row(ui, label, "", |ui| {
             let resp = shortcut_chord_widget(ui, &combo_now, learning, skin);
             if resp.on_hover_text(
                 "Click, then hold a gamepad combo and release it to bind.\n\
@@ -777,11 +776,12 @@ impl FlexInputApp {
                                 .id_salt("settings_page")
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
+                                    form_page(ui.available_width());
                                     let view = ui.clip_rect();
                                     let mut at_top = sections[0];
                                     let mut last_top = view.top();
                                     for (i, &s) in sections.iter().enumerate() {
-                                        if i > 0 { ui.add_space(22.0); }
+                                        if i > 0 { ui.add_space(2.4 * FORM_GAP); }
                                         let top = ui.cursor().top();
                                         let header = settings_section_header(ui, s.label());
                                         if jump == Some(s) {
@@ -851,20 +851,19 @@ impl FlexInputApp {
 
     fn settings_display(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         let ctx = ui.ctx().clone();
-        settings_subheading(ui, "Appearance");
+        form_subheading(ui, "Appearance");
         // Theme switching is not yet plumbed through every custom-
         // painted UI element (canvas viewer overlays, calibration
         // scope backgrounds, response-curve grid, etc.), so the
         // app is dark-only for now. The contrast slider still
         // works on the dark theme.
-        ui.horizontal(|ui| {
-            ui.label("Contrast:");
+        form_row(ui, "Contrast", "", |ui| {
             let mut c = self.settings.contrast;
             let resp = ui.add(egui::Slider::new(&mut c, -1.0_f32..=1.0)
                 .show_value(false)
                 .clamping(egui::SliderClamping::Always));
             if slider_double_clicked(&resp) { c = settings::CONTRAST_DEFAULT; }
-            ui.add(egui::DragValue::new(&mut c)
+            form_value(ui, egui::DragValue::new(&mut c)
                 .speed(0.01)
                 .range(-1.0_f32..=1.0)
                 .fixed_decimals(2));
@@ -873,15 +872,10 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset to 0.50."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset to 0.50.");
 
         // The accent, and a tint the greys lean toward.
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Accent:")
-                .on_hover_text("The colour of what is selected, lit or on: switches, chosen segments, the pills' name cells.");
+        form_row(ui, "Accent", "The colour of what is selected, lit or on: switches, chosen segments, the pills' name cells.", |ui| {
             let [r, g, b] = self.settings.accent_color;
             let mut c = egui::Color32::from_rgb(r, g, b);
             if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
@@ -893,34 +887,31 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Grey tint:")
-                .on_hover_text("A colour the greys of panels and widgets lean toward, keeping their lightness.");
+        form_row(ui, "Grey tint", "A colour the greys of panels and widgets lean toward, keeping their lightness.", |ui| {
             let [r, g, b] = self.settings.gray_tint;
             let mut c = egui::Color32::from_rgb(r, g, b);
             if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
                 self.settings.gray_tint = [c.r(), c.g(), c.b()];
                 *dirty = true;
             }
+            // The slider gives the swatch its room, so the row ends where the others do.
+            let swatch = ui.spacing().interact_size.x + ui.spacing().item_spacing.x;
+            ui.spacing_mut().slider_width = (ui.spacing().slider_width - swatch).max(60.0);
             let mut amt = self.settings.gray_tint_amount * 100.0;
             let resp = ui.add(egui::Slider::new(&mut amt, 0.0_f32..=100.0).show_value(false).clamping(egui::SliderClamping::Always));
             if slider_double_clicked(&resp) { amt = 0.0; }
-            ui.add(egui::DragValue::new(&mut amt).speed(0.5).range(0.0_f32..=100.0).suffix("%").fixed_decimals(0));
+            form_value(ui, egui::DragValue::new(&mut amt).speed(0.5).range(0.0_f32..=100.0).suffix("%").fixed_decimals(0));
             if (amt / 100.0 - self.settings.gray_tint_amount).abs() > f32::EPSILON {
                 self.settings.gray_tint_amount = (amt / 100.0).clamp(0.0, 1.0);
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "How strongly the greys take the tint: 0% = plain grey. Double-click the slider to turn it off."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "How strongly the greys take the tint: 0% = plain grey. Double-click the slider to turn it off.");
 
+        form_subheading(ui, "Text and scale");
         // The controls' font: one for every pill, switch, segment and the buttons and
         // dropdowns beside them.
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Control font:")
-                .on_hover_text("The font of the controls modules draw: value pills, switches, segments, and the buttons and dropdowns beside them.");
+        form_row(ui, "Control font", "The font of the controls modules draw: value pills, switches, segments, and the buttons and dropdowns beside them.", |ui| {
             let mut mono = self.settings.control_font_mono;
             ui.selectable_value(&mut mono, true, "Console");
             ui.selectable_value(&mut mono, false, "Normal");
@@ -934,8 +925,7 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Control font size:");
+        form_row(ui, "Control font size", "", |ui| {
             // Applied when the drag ends (or the typing does): applied as it moved, every
             // step resized the text beside the slider and moved the slider under the pointer.
             let pending_id = egui::Id::new("control_font_size_pending");
@@ -943,7 +933,7 @@ impl FlexInputApp {
             let range = settings::CONTROL_FONT_SIZE_MIN..=settings::CONTROL_FONT_SIZE_MAX;
             let resp = ui.add(egui::Slider::new(&mut size, range.clone()).step_by(0.5).show_value(false).clamping(egui::SliderClamping::Always));
             if slider_double_clicked(&resp) { size = settings::CONTROL_FONT_SIZE_DEFAULT; }
-            let dv = ui.add(egui::DragValue::new(&mut size).speed(0.1).range(range).suffix(" pt").fixed_decimals(1));
+            let dv = form_value(ui, egui::DragValue::new(&mut size).speed(0.1).range(range).suffix(" pt").fixed_decimals(1));
             if resp.dragged() || dv.dragged() || dv.has_focus() {
                 ui.ctx().data_mut(|d| d.insert_temp(pending_id, size));
             } else {
@@ -954,14 +944,8 @@ impl FlexInputApp {
                 }
             }
         });
-        ui.label(egui::RichText::new(
-            "Every button, dropdown, pill and switch. The size is the normal font's: console and bold are drawn as wide as normal text at that size, so the controls keep their room. It applies when you let go of the slider. Double-click the slider to return to 15 pt."
-        ).small().color(crate::settings::tinted_gray(140)));
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("UI scale:")
-                .on_hover_text("Scales the whole interface, on top of the Windows display scale. Text is re-rendered at the new size, so it stays sharp.");
+        form_note(ui, "Every button, dropdown, pill and switch, and a module's words beside them - section titles, captions, labels. The size is the normal font's: console and bold are drawn as wide as normal text at that size, so the controls keep their room. A pinned widget can keep its text from growing past a size, and size its graph's labels, in the Inspector (Text). It applies when you let go of the slider. Double-click the slider to return to 15 pt.");
+        form_row(ui, "UI scale", "Scales the whole interface, on top of the Windows display scale. Text is re-rendered at the new size, so it stays sharp.", |ui| {
             // Stepped like the polling-rate slider: the slider drives an
             // index into UI_SCALE_STEPS, so the handle snaps while
             // dragging. The pick stays PENDING until Apply — rescaling
@@ -979,8 +963,8 @@ impl FlexInputApp {
                 settings::ui_scale_from_index(idx as usize)
             };
             self.ui_scale_pending = (picked != applied).then_some(picked);
-            // Fixed width so Apply doesn't shift as the digits change.
-            ui.add_sized([40.0, ui.spacing().interact_size.y],
+            // As wide as a value box, so Apply doesn't shift as the digits change.
+            ui.add_sized([FORM_VALUE_W, ui.spacing().interact_size.y],
                 egui::Label::new(format!("{:.0}%", picked * 100.0)));
             if ui.add_enabled(picked != applied, egui::Button::new("Apply")).clicked() {
                 self.settings.ui_scale = picked;
@@ -989,48 +973,48 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "50%–300%. Takes effect when you press Apply. Double-click the slider to return to 100%."
-        ).small().color(crate::settings::tinted_gray(140)));
-        settings_subheading(ui, "Renderer");
+        form_note(ui, "50%–300%. Takes effect when you press Apply. Double-click the slider to return to 100%.");
+
+        form_subheading(ui, "Renderer");
         // Backend is fixed at startup (the wgpu instance/surface can't
         // be swapped live), so changes here take effect on restart.
         // Auto leads with DirectX 12 on Windows (see `auto_cascade` in
         // app/src/main.rs).
-        let mut choice = self.settings.renderer;
-        egui::ComboBox::from_id_salt("renderer_choice")
-            .selected_text(choice.label())
-            .show_ui(ui, |ui| {
-                let mut choices = vec![
-                    settings::RendererChoice::Auto,
-                    settings::RendererChoice::Vulkan,
-                    settings::RendererChoice::OpenGl,
-                ];
-                if cfg!(windows) {
-                    choices.push(settings::RendererChoice::Dx12);
-                }
-                for c in choices {
-                    ui.selectable_value(&mut choice, c, c.label());
-                }
-            });
-        if choice != self.settings.renderer {
-            self.settings.renderer = choice;
-            *dirty = true;
-        }
-        ui.label(egui::RichText::new(
+        form_row(ui, "Graphics API", "", |ui| {
+            let mut choice = self.settings.renderer;
+            egui::ComboBox::from_id_salt("renderer_choice")
+                .selected_text(choice.label())
+                .show_ui(ui, |ui| {
+                    let mut choices = vec![
+                        settings::RendererChoice::Auto,
+                        settings::RendererChoice::Vulkan,
+                        settings::RendererChoice::OpenGl,
+                    ];
+                    if cfg!(windows) {
+                        choices.push(settings::RendererChoice::Dx12);
+                    }
+                    for c in choices {
+                        ui.selectable_value(&mut choice, c, c.label());
+                    }
+                });
+            if choice != self.settings.renderer {
+                self.settings.renderer = choice;
+                *dirty = true;
+            }
+        });
+        form_note(ui,
             "Takes effect after restarting FlexInput. On Windows, Auto \
              uses DirectX 12, falling back to Vulkan and then OpenGL only \
              if it fails to start — Vulkan drivers on Windows have proved \
              unreliable across versions and devices. On AMD, see-through \
              mode needs DirectX 12 — the AMD Vulkan driver doesn't support \
              transparent windows and its OpenGL path crashes on wake from \
-             sleep."
-        ).small().weak());
+             sleep.");
     }
 
     fn settings_workspace(&mut self, ui: &mut egui::Ui, dirty: &mut bool, save_workspace: &mut bool) {
-        let resp = ui.checkbox(&mut self.settings.keep_workspace,
-            "Keep open tabs on next launch");
+        let resp = form_check(ui, "On launch", true, &mut self.settings.keep_workspace,
+            "Keep open tabs", "");
         if resp.changed() {
             *dirty = true;
             if self.settings.keep_workspace {
@@ -1039,22 +1023,15 @@ impl FlexInputApp {
                 settings::delete_workspace();
             }
         }
-        ui.label(egui::RichText::new(
-            "When enabled, the current tabs (including unsaved patches) are restored on the next launch."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "When enabled, the current tabs (including unsaved patches) are restored on the next launch.");
 
-        ui.add_space(6.0);
-        if ui.checkbox(&mut self.settings.device_nodes_default_collapsed,
-            "Collapse new device nodes by default").changed()
+        if form_check(ui, "New device nodes", true, &mut self.settings.device_nodes_default_collapsed,
+            "Start collapsed", "").changed()
         {
             *dirty = true;
         }
-        ui.label(egui::RichText::new(
-            "New physical / virtual device nodes spawn collapsed. The header (icon, status, Auto-Map) stays visible."
-        ).small().color(crate::settings::tinted_gray(140)));
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("On patch load:");
+        form_note(ui, "New physical / virtual device nodes spawn collapsed. The header (icon, status, Auto-Map) stays visible.");
+        form_row(ui, "On patch load", "", |ui| {
             let cur = self.settings.on_patch_load;
             let label = match cur {
                 settings::OnPatchLoad::Off         => "Do nothing",
@@ -1077,102 +1054,82 @@ impl FlexInputApp {
                     }
                 });
         });
-        ui.label(egui::RichText::new(
-            "Behavior when a .fxp is loaded into a tab. 'Off' preserves the current view."
-        ).small().color(crate::settings::tinted_gray(140)));
-
+        form_note(ui, "What the view does when a .fxp is loaded into a tab. Do nothing keeps the current view.");
     }
 
     fn settings_gamepad_nav(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        if ui.checkbox(&mut self.settings.gamepad_ui_nav_default,
-            "Enable gamepad UI navigation by default")
-            .on_hover_text(
-                "When on, newly-seen gamepads start in UI-navigation mode: while \
-                 FlexInput holds focus the controller drives FlexInput's own UI and \
-                 its mapped output is suppressed. Alt-tab away and mappings resume \
-                 automatically. Toggle per-device on each gamepad card."
-            )
+        if form_check(ui, "New gamepads", true, &mut self.settings.gamepad_ui_nav_default,
+            "Start in UI navigation",
+            "When on, newly-seen gamepads start in UI-navigation mode: while \
+             FlexInput holds focus the controller drives FlexInput's own UI and \
+             its mapped output is suppressed. Alt-tab away and mappings resume \
+             automatically. Toggle per-device on each gamepad card.")
             .changed()
         {
             *dirty = true;
         }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Cursor max speed")
-                .on_hover_text("Top speed of the right-stick/gyro nav cursor at full deflection (px/s). The actual speed follows the acceleration curve below up to this cap.");
+        form_row(ui, "Cursor max speed", "Top speed of the right-stick/gyro nav cursor at full deflection (px/s). The actual speed follows the acceleration curve below up to this cap.", |ui| {
             let resp = ui.add(egui::Slider::new(
                 &mut self.settings.cursor_max_speed, 1000.0..=30000.0)
                 .suffix(" px/s"));
             if resp.changed() { *dirty = true; }
         });
-        ui.horizontal(|ui| {
-            ui.label("Cursor acceleration")
-                .on_hover_text("How the cursor speed ramps with stick deflection. 1.0 = linear; higher = slower start and a faster top end (deflection raised to this power).");
+        form_row(ui, "Cursor acceleration", "How the cursor speed ramps with stick deflection. 1.0 = linear; higher = slower start and a faster top end (deflection raised to this power).", |ui| {
             let mut a = self.settings.cursor_accel;
             let resp = ui.add(egui::Slider::new(&mut a, 1.0..=4.0)
                 .fixed_decimals(2));
-            if resp.double_clicked() { a = 2.0; }
+            if slider_double_clicked(&resp) { a = 2.0; }
             if (a - self.settings.cursor_accel).abs() > f32::EPSILON {
                 self.settings.cursor_accel = a.clamp(1.0, 4.0);
                 *dirty = true;
             }
         });
+        form_note(ui, "Double-click the slider to return to 2.00.");
     }
 
     fn settings_gamepad_shortcuts(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         // ── Gamepad shortcuts ───────────────────────────────────
         // Assign a gamepad button combo to toggle see-through / panic.
         // Learned by clicking Learn then pressing+releasing a combo.
-        if self.gamepad_shortcut_row(ui, "See-through", crate::gamepad_nav::ChordTarget::SeeThrough) {
-            *dirty = true;
+        use crate::gamepad_nav::ChordTarget as T;
+        for (name, target) in [
+            ("See-through", T::SeeThrough),
+            ("Panic mode", T::Panic),
+            ("Overlay", T::Overlay),
+            ("Config overlay", T::ConfigOverlay),
+            ("Pin (always-on-top)", T::Pin),
+            ("Previous patch tab", T::PrevTab),
+            ("Next patch tab", T::NextTab),
+        ] {
+            if self.gamepad_shortcut_row(ui, name, target) {
+                *dirty = true;
+            }
         }
-        if self.gamepad_shortcut_row(ui, "Panic mode", crate::gamepad_nav::ChordTarget::Panic) {
-            *dirty = true;
+        form_subheading(ui, "Layout tabs");
+        form_group_note(ui,
+            "Read by FlexInput's own gamepad navigation, on press, in the patch shown: a layout \
+             without tabs leaves them alone.");
+        for (name, target) in [("Previous layout tab", T::LayoutTabPrev), ("Next layout tab", T::LayoutTabNext)] {
+            if self.gamepad_shortcut_row(ui, name, target) {
+                *dirty = true;
+            }
         }
-        if self.gamepad_shortcut_row(ui, "Overlay", crate::gamepad_nav::ChordTarget::Overlay) {
-            *dirty = true;
-        }
-        if self.gamepad_shortcut_row(ui, "Config overlay", crate::gamepad_nav::ChordTarget::ConfigOverlay) {
-            *dirty = true;
-        }
-        if self.gamepad_shortcut_row(ui, "Pin (always-on-top)", crate::gamepad_nav::ChordTarget::Pin) {
-            *dirty = true;
-        }
-        if self.gamepad_shortcut_row(ui, "Previous patch tab", crate::gamepad_nav::ChordTarget::PrevTab) {
-            *dirty = true;
-        }
-        if self.gamepad_shortcut_row(ui, "Next patch tab", crate::gamepad_nav::ChordTarget::NextTab) {
-            *dirty = true;
-        }
-        settings_subheading(ui, "Layout tabs");
-        ui.label(egui::RichText::new(
-            "Read by FlexInput's own gamepad navigation, on press. In a layout without tabs they \
-             switch the patch tabs.").small().weak());
-        if self.gamepad_shortcut_row(ui, "Previous layout tab", crate::gamepad_nav::ChordTarget::LayoutTabPrev) {
-            *dirty = true;
-        }
-        if self.gamepad_shortcut_row(ui, "Next layout tab", crate::gamepad_nav::ChordTarget::LayoutTabNext) {
-            *dirty = true;
-        }
-        settings_subheading(ui, "Behavior");
-        if ui.checkbox(&mut self.settings.gamepad_chords_nav_only,
-            "Only when in gamepad navigation mode")
-            .on_hover_text(
-                "On: these combos fire only while the driving gamepad is in UI-navigation mode \
-                 (so the same buttons stay free for in-game mappings otherwise).\n\
-                 Off: they fire from any connected gamepad whenever FlexInput is focused.")
+        form_subheading(ui, "Behavior");
+        if form_check(ui, "When", true, &mut self.settings.gamepad_chords_nav_only,
+            "Only in gamepad navigation mode",
+            "On: these combos fire only while the driving gamepad is in UI-navigation mode \
+             (so the same buttons stay free for in-game mappings otherwise).\n\
+             Off: they fire from any connected gamepad whenever FlexInput is focused.")
             .changed()
         {
             *dirty = true;
         }
-        if ui.checkbox(&mut self.settings.gamepad_home_exclusive,
-            "Home button is FlexInput's only")
-            .on_hover_text(
-                "Applies when Home/Guide/PS is part of a shortcut.\n\
-                 On: the game never sees Home.\n\
-                 Off: Home is held back while it might still become a shortcut; \
-                 if no shortcut used it, the game gets a Home tap when you let go.")
+        if form_check(ui, "Home button", true, &mut self.settings.gamepad_home_exclusive,
+            "FlexInput's only",
+            "Applies when Home/Guide/PS is part of a shortcut.\n\
+             On: the game never sees Home.\n\
+             Off: Home is held back while it might still become a shortcut; \
+             if no shortcut used it, the game gets a Home tap when you let go.")
             .changed()
         {
             *dirty = true;
@@ -1180,226 +1137,45 @@ impl FlexInputApp {
     }
 
     fn settings_keyboard_shortcuts(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        let ctx = ui.ctx().clone();
-        settings_note(ui, "System-wide hotkeys: they work even while another app (a game) has focus. Click one, then press the new modifier + key.");
-        ui.horizontal(|ui| {
-            ui.label("Pin shortcut:");
-            let btn_text = if self.pin_learning {
-                "Press chord…".to_string()
-            } else {
-                self.settings.pin_shortcut.label()
-            };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
-            if self.pin_learning {
-                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
-            }
-            let resp = ui.add(btn).on_hover_text(
-                if self.pin_learning {
-                    "Press the new shortcut (modifier + key).\nClick again to cancel."
-                } else {
-                    "Click to re-bind. Press the shortcut anywhere on the system to toggle the pin."
-                }
-            );
-            if resp.clicked() {
-                self.pin_learning = !self.pin_learning;
-            }
-        });
-        if self.pin_learning {
-            let pressed: Option<egui::Key> = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
-                    _ => None,
-                })
-            });
-            if let Some(key) = pressed {
-                let m = ctx.input(|i| i.modifiers);
-                let key_name = format!("{:?}", key);
-                self.settings.pin_shortcut = settings::PinShortcut {
-                    ctrl:  m.ctrl,
-                    shift: m.shift,
-                    alt:   m.alt,
-                    win:   m.command && !m.ctrl,
-                    key:   Some(key_name),
-                };
-                if let Ok(mut s) = self.pin_shortcut_shared.write() {
-                    *s = self.settings.pin_shortcut.clone();
-                }
-                self.pin_learning = false;
-                *dirty = true;
-            }
+        form_group_note(ui, "System-wide hotkeys: they work even while another app (a game) has focus. Click one, then press the new modifier + key.");
+        if key_shortcut_row(ui, "Pin (always-on-top)", "toggle the pin",
+            &mut self.pin_learning, &mut self.settings.pin_shortcut, &self.pin_shortcut_shared)
+        {
+            *dirty = true;
         }
-        ui.add_space(4.0);
         // Show info-overlay shortcut (mirrors the pin binder above).
-        ui.horizontal(|ui| {
-            ui.label("Show info overlay:");
-            let btn_text = if self.overlay_learning {
-                "Press chord…".to_string()
-            } else {
-                self.settings.overlay_shortcut.label()
-            };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
-            if self.overlay_learning {
-                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
-            }
-            let resp = ui.add(btn).on_hover_text(
-                if self.overlay_learning {
-                    "Press the new shortcut (modifier + key).\nClick again to cancel."
-                } else {
-                    "Click to re-bind. Press the shortcut anywhere on the system to show/hide the overlay."
-                }
-            );
-            if resp.clicked() {
-                self.overlay_learning = !self.overlay_learning;
-            }
-        });
-        if self.overlay_learning {
-            let pressed: Option<egui::Key> = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
-                    _ => None,
-                })
-            });
-            if let Some(key) = pressed {
-                let m = ctx.input(|i| i.modifiers);
-                let key_name = format!("{:?}", key);
-                self.settings.overlay_shortcut = settings::PinShortcut {
-                    ctrl:  m.ctrl,
-                    shift: m.shift,
-                    alt:   m.alt,
-                    win:   m.command && !m.ctrl,
-                    key:   Some(key_name),
-                };
-                if let Ok(mut s) = self.overlay_shortcut_shared.write() {
-                    *s = self.settings.overlay_shortcut.clone();
-                }
-                self.overlay_learning = false;
-                *dirty = true;
-            }
+        if key_shortcut_row(ui, "Show info overlay", "show/hide the overlay",
+            &mut self.overlay_learning, &mut self.settings.overlay_shortcut, &self.overlay_shortcut_shared)
+        {
+            *dirty = true;
         }
-
-        ui.add_space(4.0);
-
         // Edit info-overlay shortcut (mirrors the show binder; toggles
         // the overlay's layout-edit mode and shows it).
-        ui.horizontal(|ui| {
-            ui.label("Edit info overlay:");
-            let btn_text = if self.edit_overlay_learning {
-                "Press chord…".to_string()
-            } else {
-                self.settings.edit_overlay_shortcut.label()
-            };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
-            if self.edit_overlay_learning {
-                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
-            }
-            let resp = ui.add(btn).on_hover_text(
-                if self.edit_overlay_learning {
-                    "Press the new shortcut (modifier + key).\nClick again to cancel."
-                } else {
-                    "Click to re-bind. Press the shortcut anywhere on the system to enter/exit the overlay's edit mode."
-                }
-            );
-            if resp.clicked() {
-                self.edit_overlay_learning = !self.edit_overlay_learning;
-            }
-        });
-        if self.edit_overlay_learning {
-            let pressed: Option<egui::Key> = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
-                    _ => None,
-                })
-            });
-            if let Some(key) = pressed {
-                let m = ctx.input(|i| i.modifiers);
-                let key_name = format!("{:?}", key);
-                self.settings.edit_overlay_shortcut = settings::PinShortcut {
-                    ctrl:  m.ctrl,
-                    shift: m.shift,
-                    alt:   m.alt,
-                    win:   m.command && !m.ctrl,
-                    key:   Some(key_name),
-                };
-                if let Ok(mut s) = self.edit_overlay_shortcut_shared.write() {
-                    *s = self.settings.edit_overlay_shortcut.clone();
-                }
-                self.edit_overlay_learning = false;
-                *dirty = true;
-            }
+        if key_shortcut_row(ui, "Edit info overlay", "enter/exit the overlay's edit mode",
+            &mut self.edit_overlay_learning, &mut self.settings.edit_overlay_shortcut, &self.edit_overlay_shortcut_shared)
+        {
+            *dirty = true;
         }
-
-        ui.add_space(4.0);
-
         // Config-overlay toggle shortcut (M3; mirrors the overlay binder).
-        ui.horizontal(|ui| {
-            ui.label("Show config overlay:");
-            let btn_text = if self.config_overlay_learning {
-                "Press chord…".to_string()
-            } else {
-                self.settings.config_overlay_shortcut.label()
-            };
-            let mut btn = egui::Button::new(egui::RichText::new(btn_text).size(crate::settings::ui_size(12.0)));
-            if self.config_overlay_learning {
-                btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
-                         .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
-            }
-            let resp = ui.add(btn).on_hover_text(
-                if self.config_overlay_learning {
-                    "Press the new shortcut (modifier + key).\nClick again to cancel."
-                } else {
-                    "Click to re-bind. Press the shortcut anywhere on the system to show/hide the config overlay."
-                }
-            );
-            if resp.clicked() {
-                self.config_overlay_learning = !self.config_overlay_learning;
-            }
-        });
-        if self.config_overlay_learning {
-            let pressed: Option<egui::Key> = ctx.input(|i| {
-                i.events.iter().find_map(|e| match e {
-                    egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
-                    _ => None,
-                })
-            });
-            if let Some(key) = pressed {
-                let m = ctx.input(|i| i.modifiers);
-                let key_name = format!("{:?}", key);
-                self.settings.config_overlay_shortcut = settings::PinShortcut {
-                    ctrl:  m.ctrl,
-                    shift: m.shift,
-                    alt:   m.alt,
-                    win:   m.command && !m.ctrl,
-                    key:   Some(key_name),
-                };
-                if let Ok(mut s) = self.config_overlay_shortcut_shared.write() {
-                    *s = self.settings.config_overlay_shortcut.clone();
-                }
-                self.config_overlay_learning = false;
-                *dirty = true;
-            }
+        if key_shortcut_row(ui, "Show config overlay", "show/hide the config overlay",
+            &mut self.config_overlay_learning, &mut self.settings.config_overlay_shortcut, &self.config_overlay_shortcut_shared)
+        {
+            *dirty = true;
         }
     }
 
     fn settings_pin_overlays(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        if ui.checkbox(&mut self.settings.focus_flip_flop,
-            "Flip-flop focus on pin toggle")
-            .on_hover_text(
-                "Pin ON: remember the previously-focused window.\n\
-                 Pin OFF: return focus to it.\n\
-                 Lets you press the shortcut, tweak, press again, and instantly \
-                 resume testing the target app."
-            )
+        if form_check(ui, "Pin toggle", true, &mut self.settings.focus_flip_flop,
+            "Flip-flop focus",
+            "Pin ON: remember the previously-focused window.\n\
+             Pin OFF: return focus to it.\n\
+             Lets you press the shortcut, tweak, press again, and instantly \
+             resume testing the target app.")
             .changed()
         {
             *dirty = true;
         }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Overlay frame rate")
-                .on_hover_text("Repaint rate of the overlay while it's visible. Separate from the background repaint rate — the overlay animates on top of your game.");
+        form_row(ui, "Overlay frame rate", "Repaint rate of the overlay while it's visible. Separate from the background repaint rate — the overlay animates on top of your game.", |ui| {
             let resp = ui.add(egui::Slider::new(
                 &mut self.settings.overlay_fps,
                 settings::OVERLAY_FPS_MIN..=settings::OVERLAY_FPS_MAX,
@@ -1408,36 +1184,31 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "How smoothly pinned elements animate on the overlay. Higher = smoother glow, a bit more CPU/GPU while the overlay is shown."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "How smoothly pinned elements animate on the overlay. Higher = smoother glow, a bit more CPU/GPU while the overlay is shown.");
     }
 
     fn settings_controllers(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        if ui.checkbox(&mut self.settings.sdl_all_pads, "Route all pads through SDL")
-            .on_hover_text("Diagnostic: read EVERY controller through SDL instead of the native gilrs/HID paths. Lets a pad with a native parser be compared against SDL, and surfaces SDL-only devices. Changes device IDs, so re-wire after toggling. Off = normal native handling. A Steam Controller keeps its own reader either way — SDL's driver for it stalls the pad — and that reader names its controls; only a pad read through SDL is named by SDL's Misc slots.")
+        if form_check(ui, "Reading", true, &mut self.settings.sdl_all_pads, "Route all pads through SDL",
+            "Diagnostic: read EVERY controller through SDL instead of the native gilrs/HID paths. Lets a pad with a native parser be compared against SDL, and surfaces SDL-only devices. Changes device IDs, so re-wire after toggling. Off = normal native handling. A Steam Controller keeps its own reader either way — SDL's driver for it stalls the pad — and that reader names its controls; only a pad read through SDL is named by SDL's Misc slots.")
             .changed()
         {
             self.sdl_all_pads.store(self.settings.sdl_all_pads, Ordering::Relaxed);
             *dirty = true;
         }
-        ui.add_space(6.0);
-        if ui.checkbox(
-            &mut self.settings.show_own_virtuals_as_physical,
-            "Show FlexInput's own virtual controllers in the physical-devices panel",
-        ).changed() {
+        form_note(ui, "A diagnostic: it changes device IDs, so re-wire after turning it on or off.");
+        if form_check(ui, "Physical devices", true, &mut self.settings.show_own_virtuals_as_physical,
+            "List FlexInput's own virtual controllers too", "").changed()
+        {
             *dirty = true;
         }
-        ui.label(egui::RichText::new(
-            "Off by default. Turn on to test patches against your own virtual output (loopback).",
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "Off by default. Turn on to test patches against your own virtual output (loopback).");
     }
 
     /// Warning box at the top of "Hide controllers" while the HidHide driver
     /// is missing: what that costs, where to get it, and a re-probe so a fresh
     /// install is picked up without restarting FlexInput.
     fn hidhide_missing_banner(&mut self, ui: &mut egui::Ui) {
-        let amber = egui::Color32::from_rgb(230, 170, 80);
+        let amber = FORM_WARN;
         egui::Frame::new()
             .fill(egui::Color32::from_rgba_unmultiplied(230, 170, 80, 28))
             .stroke(egui::Stroke::new(1.0_f32, amber))
@@ -1450,7 +1221,7 @@ impl FlexInputApp {
                     "Without it FlexInput can't hide the physical controller you remap, so \
                      games may see both it and the virtual one and read double input. The \
                      options below stay unavailable until it's installed.",
-                ).small());
+                ).size(crate::settings::ui_size(FORM_NOTE_PT)));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.hyperlink_to("Download HidHide",
@@ -1469,6 +1240,7 @@ impl FlexInputApp {
                     }
                 });
             });
+        form_gap(ui);
     }
 
     fn settings_hidhide(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
@@ -1476,27 +1248,22 @@ impl FlexInputApp {
             if cfg!(windows) {
                 self.hidhide_missing_banner(ui);
             } else {
-                ui.label(egui::RichText::new(
+                form_group_line(ui, egui::RichText::new(
                     "Hiding controllers needs pkexec (polkit), which this system doesn't have.",
-                ).color(egui::Color32::from_rgb(230, 170, 80)));
+                ).color(FORM_WARN));
             }
-            ui.add_space(6.0);
         }
         let hidhide_installed = self.hidhide_installed;
         // Effective value: explicit user choice, else default ON when the
         // HidHide driver is installed (the requested default), OFF otherwise.
         let mut hide_effective = self.settings.hide_originals.unwrap_or(hidhide_installed);
-        let resp = ui.add_enabled(
-            hidhide_installed,
-            egui::Checkbox::new(
-                &mut hide_effective,
-                if cfg!(windows) {
-                    "Hide original controllers from games (HidHide)"
-                } else {
-                    "Hide original controllers from games"
-                },
-            ),
-        );
+        let resp = form_check(ui, "Remapped controllers", hidhide_installed, &mut hide_effective,
+            if cfg!(windows) {
+                "Hide them from games (HidHide)"
+            } else {
+                "Hide them from games"
+            },
+            "");
         if resp.changed() {
             self.settings.hide_originals = Some(hide_effective);
             *dirty = true;
@@ -1504,42 +1271,34 @@ impl FlexInputApp {
             self.allow_hide_prompt();
         }
         if hidhide_installed && !cfg!(windows) {
-            ui.label(egui::RichText::new(
+            form_note(ui,
                 "On by default. When on, any physical controller you remap to a virtual \
                  output is hidden from games, so the game sees only the virtual pad, while \
                  FlexInput keeps reading the original. Hiding asks for your password once \
                  per session. Start FlexInput before the game: a game that already has the \
                  controller open keeps it. The eye button on a device card overrides this per \
                  controller (right-click it to go back to automatic). Joy-Con 2 can't be \
-                 hidden.",
-            ).small().color(crate::settings::tinted_gray(140)));
+                 hidden.");
         }
         if hidhide_installed && cfg!(windows) {
-            ui.label(egui::RichText::new(
+            form_note(ui,
                 "Defaults ON because HidHide is installed. When on, any physical controller \
                  you remap to a virtual output is hidden from games, so the game sees only \
                  the virtual pad. FlexInput stays whitelisted so it still reads the original. \
                  The eye button on a device card overrides this per controller (right-click \
                  it to go back to automatic). \u{2014} Note: only HID controllers \
                  (DualShock 4 / DualSense / Switch) can be hidden; the XInput/XUSB face of \
-                 Xbox controllers cannot.",
-            ).small().color(crate::settings::tinted_gray(140)));
+                 Xbox controllers cannot.");
         }
 
         // ── Sticky masking (rides on the toggle above) ───────────────
-        ui.add_space(4.0);
-        let resp = ui.add_enabled(
-            hidhide_installed && hide_effective,
-            egui::Checkbox::new(
-                &mut self.settings.hidhide_sticky,
-                "Keep hiding through disconnects",
-            ),
-        );
+        let resp = form_check(ui, "Disconnects", hidhide_installed && hide_effective,
+            &mut self.settings.hidhide_sticky, "Keep hiding through them", "");
         if resp.changed() {
             *dirty = true;
             self.hidhide_dirty = true; // re-apply with the new policy
         }
-        ui.label(egui::RichText::new(
+        form_note(ui,
             "On (default): a controller still mapped in your patch stays hidden across the gap, \
              and is masked the instant it reconnects. Unmapping it, turning the option above \
              off, or closing FlexInput still unhides it.\n\
@@ -1547,21 +1306,18 @@ impl FlexInputApp {
              briefly drops out \u{2014} a Bluetooth gap, or a reconnect that arrives already \
              hidden \u{2014} is UNHIDDEN for every app until it comes back. With a game running \
              that hands it the physical pad alongside the virtual one, which shows up as button \
-             glyphs flickering between controller and keyboard.",
-        ).small().color(crate::settings::tinted_gray(140)));
+             glyphs flickering between controller and keyboard.");
 
         // ── What stays hidden after FlexInput exits ──────────────────
-        ui.add_space(4.0);
         // Linux's helper gives everything back when FlexInput closes.
         if !cfg!(windows) {
-            ui.label(egui::RichText::new(
-                "Everything FlexInput hid is shown again when it closes.",
-            ).small().color(crate::settings::tinted_gray(140)));
+            form_row(ui, "After FlexInput exits", "", |ui| {
+                ui.label("Everything it hid is shown again.");
+            });
             return;
         }
         ui.add_enabled_ui(hidhide_installed, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Keep controllers hidden after FlexInput exits:");
+            form_row(ui, "After FlexInput exits", "Which controllers stay hidden once FlexInput has closed", |ui| {
                 let cur = self.settings.hidhide_keep_on_exit;
                 egui::ComboBox::from_id_salt("hidhide_keep_on_exit")
                     .selected_text(cur.label())
@@ -1578,28 +1334,26 @@ impl FlexInputApp {
                     });
             });
         });
-        ui.label(egui::RichText::new(
-            "Never: everything FlexInput hid is unhidden when it closes.\n\
+        form_note(ui,
+            "Which controllers stay hidden once FlexInput has closed.\n\
+             Never: everything FlexInput hid is unhidden when it closes.\n\
              Only manually hidden (default): controllers you hid with the eye button on \
              their device card stay hidden; the automatically hidden ones are unhidden.\n\
              Always: every controller FlexInput hid stays hidden.\n\
              A kept controller is unhidden on FlexInput's next launch if it's no longer \
-             wanted hidden then.",
-        ).small().color(crate::settings::tinted_gray(140)));
+             wanted hidden then.");
     }
 
     fn settings_virtual_output(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        settings_subheading(ui, "HIDMaestro virtual controllers");
-        ui.add_space(6.0);
-        if ui.checkbox(
-            &mut self.settings.persist_virtual_devices,
-            "Keep HIDMaestro virtual controllers alive after FlexInput closes",
-        ).changed() {
+        form_subheading(ui, "HIDMaestro virtual controllers");
+        if form_check(ui, "After FlexInput closes", true, &mut self.settings.persist_virtual_devices,
+            "Keep them alive", "").changed()
+        {
             *dirty = true;
             #[cfg(windows)]
             flexinput_hidmaestro::helper::set_persist(self.settings.persist_virtual_devices);
         }
-        ui.label(egui::RichText::new(
+        form_note(ui,
             "Off by default: virtual pads are removed when the app closes or crashes. \
              Turn on to keep a HIDMaestro controller (DualShock 4 / DualSense) registered \
              across an app restart or update, so a game doesn't lose the device \u{2014} \
@@ -1607,47 +1361,42 @@ impl FlexInputApp {
              no input (it resumes when the app reopens).\n\
              Does not apply to ViGEm devices (Virtual Xbox / DualShock 4 (ViGEmBus)): \
              ViGEmBus removes those automatically when FlexInput exits and they can't be \
-             reclaimed — they're re-created fresh on next launch.",
-        ).small().color(crate::settings::tinted_gray(140)));
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            if ui.button("Reinstall HIDMaestro drivers").clicked() {
+             reclaimed — they're re-created fresh on next launch.");
+        form_row(ui, "Drivers", "", |ui| {
+            if ui.button("Reinstall…").on_hover_text("Reinstall the HIDMaestro drivers").clicked() {
                 self.reinstall_confirm_open = true;
             }
-            if ui.button("Uninstall HIDMaestro drivers").clicked() {
+            if ui.button("Uninstall…").on_hover_text("Uninstall the HIDMaestro drivers").clicked() {
                 self.uninstall_confirm_open = true;
             }
         });
-        ui.label(egui::RichText::new(
+        if let Some(err) = &self.last_device_op_error {
+            form_line(ui, egui::RichText::new(format!("Last device error: {err}"))
+                .size(crate::settings::ui_size(FORM_NOTE_PT)).color(FORM_ERROR));
+        }
+        form_note(ui,
             "Reinstall: removes and reinstalls the driver, then re-deploys the virtual \
              controllers on your canvas — use this if virtual DS4/DualSense stop working \
              after a Windows or app update. Uninstall: removes the HIDMaestro driver and \
              all its virtual controllers (gamepads will need a reinstall to work again). \
-             Both prompt for admin once.",
-        ).small().color(crate::settings::tinted_gray(140)));
-        if let Some(err) = &self.last_device_op_error {
-            ui.label(egui::RichText::new(format!("Last device error: {err}"))
-                .small().color(egui::Color32::from_rgb(220, 120, 120)));
-        }
-        settings_subheading(ui, "Virtual keyboard & mouse");
-        ui.add_space(8.0);
-        if ui.checkbox(&mut self.settings.mouse_suppression_enabled,
-            "Pause virtual mouse when you move a physical mouse")
-            .on_hover_text(
-                "When on, the virtual mouse's pointer briefly yields whenever another \
-                 mouse is used — a physical mouse, a touchpad, or another program's \
-                 mouse input — so a stick-driven cursor doesn't fight it on the \
-                 desktop. Only motion pauses: virtual clicks and scrolling go through. \
-                 The cursor being moved by a game doesn't count. Automatically \
-                 disabled while a virtual gamepad is also active (mixed mode).")
+             Both prompt for admin once.");
+
+        form_subheading(ui, "Virtual keyboard & mouse");
+        if form_check(ui, "Physical mouse", true, &mut self.settings.mouse_suppression_enabled,
+            "Pause the virtual mouse when it moves",
+            "When on, the virtual mouse's pointer briefly yields whenever another \
+             mouse is used — a physical mouse, a touchpad, or another program's \
+             mouse input — so a stick-driven cursor doesn't fight it on the \
+             desktop. Only motion pauses: virtual clicks and scrolling go through. \
+             The cursor being moved by a game doesn't count. Automatically \
+             disabled while a virtual gamepad is also active (mixed mode).")
             .changed()
         {
             flexinput_virtual::set_mouse_suppression_enabled(self.settings.mouse_suppression_enabled);
             *dirty = true;
         }
         ui.add_enabled_ui(self.settings.mouse_suppression_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Release after");
+            form_row(ui, "Release after", "", |ui| {
                 let resp = ui.add(egui::Slider::new(
                     &mut self.settings.mouse_suppress_release_ms,
                     settings::MOUSE_SUPPRESS_RELEASE_MS_MIN..=settings::MOUSE_SUPPRESS_RELEASE_MS_MAX,
@@ -1658,27 +1407,22 @@ impl FlexInputApp {
                 }
             });
         });
-        ui.label(egui::RichText::new(
-            "How long the virtual mouse stays paused after a physical-mouse move. Lower = recovers faster."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "How long the virtual mouse stays paused after a physical-mouse move. Lower = recovers faster.");
 
-        ui.add_space(8.0);
-        if ui.checkbox(&mut self.settings.mixed_braid_enabled,
-            "Braid mixed output (experimental)")
-            .on_hover_text(
-                "Phase-offset WHEN the virtual gamepad and keyboard/mouse packets \
-                 land, so they interleave instead of co-occurring — without muting \
-                 either stream (an idle mouse won't chop the pad). For probing games \
-                 whose input arbiter behaves differently under simultaneous mixed \
-                 output. Effect is game-specific; leave off unless experimenting.")
+        if form_check(ui, "Mixed output", true, &mut self.settings.mixed_braid_enabled,
+            "Braid it (experimental)",
+            "Phase-offset WHEN the virtual gamepad and keyboard/mouse packets \
+             land, so they interleave instead of co-occurring — without muting \
+             either stream (an idle mouse won't chop the pad). For probing games \
+             whose input arbiter behaves differently under simultaneous mixed \
+             output. Effect is game-specific; leave off unless experimenting.")
             .changed()
         {
             flexinput_virtual::set_braid_enabled(self.settings.mixed_braid_enabled);
             *dirty = true;
         }
         ui.add_enabled_ui(self.settings.mixed_braid_enabled, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Braid pacing");
+            form_row(ui, "Braid pacing", "", |ui| {
                 // Stepped slider over BRAID_RATE_STEPS (left = Real-time /
                 // fastest, right = 125 Hz / slowest). The slider drives an
                 // index; the formatter shows the step label.
@@ -1698,127 +1442,101 @@ impl FlexInputApp {
                 }
             });
         });
-        ui.label(egui::RichText::new(
-            "Gamepad and mouse packets strictly alternate (never coincident). Real-time = fastest/lowest latency; lower rates pace the alternation. Sweep to probe the game."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "Gamepad and mouse packets strictly alternate (never coincident). Real-time = fastest/lowest latency; lower rates pace the alternation. Sweep to probe the game.");
     }
 
     fn settings_device_defaults(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         // Per-device sliders in the node header are seeded from these
         // when a node is first added. Editing them later updates only
         // the affected node, not these defaults.
-        ui.label(egui::RichText::new(
-            "Applied to newly-added device nodes. Existing nodes keep their own values."
-        ).small().color(crate::settings::tinted_gray(140)));
-        ui.add_space(4.0);
-
-        ui.label(egui::RichText::new("Double-click the slider track to reset to factory default. Double-click the value to type a number.")
-            .small().italics().color(crate::settings::tinted_gray(120)));
-        ui.add_space(4.0);
-
-        // egui Slider widgets only sense drag, so Response::double_clicked()
-        // never fires on the track. Overlay a click-sense interact on the
-        // same rect with a derived id and read the double-click from there.
-        fn track_dbl(ui: &egui::Ui, r: &egui::Response) -> bool {
-            let id = r.id.with("__dblclick_overlay");
-            ui.interact(r.rect, id, egui::Sense::click()).double_clicked()
-        }
-
-        egui::Grid::new("device-defaults-grid")
-            .num_columns(3)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Default Stick deadzone");
-                let r = ui.add(egui::Slider::new(&mut self.settings.default_stick_deadzone, 0.0_f32..=0.5)
-                    .show_value(false)
-                    .clamping(egui::SliderClamping::Always));
-                if r.changed() { *dirty = true; }
-                if track_dbl(ui, &r) {
-                    self.settings.default_stick_deadzone = 0.1;
-                    *dirty = true;
-                }
-                if ui.add(egui::DragValue::new(&mut self.settings.default_stick_deadzone)
-                    .speed(0.005)
-                    .range(0.0_f32..=0.5)
-                    .fixed_decimals(2))
-                    .changed() { *dirty = true; }
-                ui.end_row();
-
-                ui.label("Default Gyro ×");
-                let r = ui.add(egui::Slider::new(&mut self.settings.default_gyro_mult, 0.1_f32..=50.0)
-                    .logarithmic(true)
-                    .show_value(false)
-                    .clamping(egui::SliderClamping::Always));
-                if r.changed() { *dirty = true; }
-                if track_dbl(ui, &r) {
-                    self.settings.default_gyro_mult = 1.0;
-                    *dirty = true;
-                }
-                if ui.add(egui::DragValue::new(&mut self.settings.default_gyro_mult)
-                    .speed(0.05)
-                    .range(0.1_f32..=50.0)
-                    .fixed_decimals(2))
-                    .changed() { *dirty = true; }
-                ui.end_row();
-
-                ui.label("Default Mouse ×");
-                let r = ui.add(egui::Slider::new(&mut self.settings.default_mouse_sensitivity, 0.0_f32..=3000.0)
-                    .logarithmic(true)
-                    .smallest_positive(0.01)
-                    .show_value(false)
-                    .clamping(egui::SliderClamping::Always));
-                if r.changed() { *dirty = true; }
-                if track_dbl(ui, &r) {
-                    self.settings.default_mouse_sensitivity = 100.0;
-                    *dirty = true;
-                }
-                if ui.add(egui::DragValue::new(&mut self.settings.default_mouse_sensitivity)
-                    .speed(0.5)
-                    .range(0.0_f32..=3000.0)
-                    .fixed_decimals(2))
-                    .changed() { *dirty = true; }
-                ui.end_row();
-
-                // Default rumble-forwarding shape for virtual pads whose
-                // Rumble control hasn't been touched. Same widgets as the
-                // node control; double-click resets to neutral.
-                ui.label("Default Rumble");
-                {
-                    use crate::canvas::header_controls::{
-                        curve_box, range_slider,
-                        RUMBLE_DEF_EXP, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
-                    };
-                    let (f0, m0, e0) = (
-                        self.settings.default_rumble_floor,
-                        self.settings.default_rumble_max,
-                        self.settings.default_rumble_exp,
-                    );
-                    let mut floor = f0.clamp(0.0, 1.0);
-                    let mut max = m0.clamp(0.0, 1.0);
-                    let mut exp = e0.clamp(0.2, 3.0);
-                    range_slider(ui, &mut floor, &mut max,
-                        RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
-                        ui.spacing().slider_width)
-                        .on_hover_text(
-                            "Default band for game rumble forwarded by virtual \
-                             pads: left handle = floor (lifts faint rumble), \
-                             right = ceiling. Applies to pads whose own Rumble \
-                             control hasn't been changed. Double-click resets \
-                             to neutral (full range).");
-                    curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
-                    if max < floor { max = floor; }
-                    if (floor - f0).abs() > f32::EPSILON
-                        || (max - m0).abs() > f32::EPSILON
-                        || (exp - e0).abs() > f32::EPSILON
-                    {
-                        self.settings.default_rumble_floor = floor;
-                        self.settings.default_rumble_max = max;
-                        self.settings.default_rumble_exp = exp;
-                        *dirty = true;
-                    }
-                }
-                ui.end_row();
-            });
+        form_group_note(ui,
+            "Applied to newly-added device nodes. Existing nodes keep their own values. \
+             Double-click a slider to put it back to the factory default, or its value to type a number.");
+        form_row(ui, "Stick deadzone", "", |ui| {
+            let r = ui.add(egui::Slider::new(&mut self.settings.default_stick_deadzone, 0.0_f32..=0.5)
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always));
+            if r.changed() { *dirty = true; }
+            if slider_double_clicked(&r) {
+                self.settings.default_stick_deadzone = 0.1;
+                *dirty = true;
+            }
+            if form_value(ui, egui::DragValue::new(&mut self.settings.default_stick_deadzone)
+                .speed(0.005)
+                .range(0.0_f32..=0.5)
+                .fixed_decimals(2))
+                .changed() { *dirty = true; }
+        });
+        form_row(ui, "Gyro ×", "", |ui| {
+            let r = ui.add(egui::Slider::new(&mut self.settings.default_gyro_mult, 0.1_f32..=50.0)
+                .logarithmic(true)
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always));
+            if r.changed() { *dirty = true; }
+            if slider_double_clicked(&r) {
+                self.settings.default_gyro_mult = 1.0;
+                *dirty = true;
+            }
+            if form_value(ui, egui::DragValue::new(&mut self.settings.default_gyro_mult)
+                .speed(0.05)
+                .range(0.1_f32..=50.0)
+                .fixed_decimals(2))
+                .changed() { *dirty = true; }
+        });
+        form_row(ui, "Mouse ×", "", |ui| {
+            let r = ui.add(egui::Slider::new(&mut self.settings.default_mouse_sensitivity, 0.0_f32..=3000.0)
+                .logarithmic(true)
+                .smallest_positive(0.01)
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always));
+            if r.changed() { *dirty = true; }
+            if slider_double_clicked(&r) {
+                self.settings.default_mouse_sensitivity = 100.0;
+                *dirty = true;
+            }
+            if form_value(ui, egui::DragValue::new(&mut self.settings.default_mouse_sensitivity)
+                .speed(0.5)
+                .range(0.0_f32..=3000.0)
+                .fixed_decimals(2))
+                .changed() { *dirty = true; }
+        });
+        // Default rumble-forwarding shape for virtual pads whose
+        // Rumble control hasn't been touched. Same widgets as the
+        // node control; double-click resets to neutral.
+        form_row(ui, "Rumble", "", |ui| {
+            use crate::canvas::header_controls::{
+                curve_box, range_slider,
+                RUMBLE_DEF_EXP, RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
+            };
+            let (f0, m0, e0) = (
+                self.settings.default_rumble_floor,
+                self.settings.default_rumble_max,
+                self.settings.default_rumble_exp,
+            );
+            let mut floor = f0.clamp(0.0, 1.0);
+            let mut max = m0.clamp(0.0, 1.0);
+            let mut exp = e0.clamp(0.2, 3.0);
+            range_slider(ui, &mut floor, &mut max,
+                RUMBLE_DEF_FLOOR, RUMBLE_DEF_MAX,
+                ui.spacing().slider_width)
+                .on_hover_text(
+                    "Default band for game rumble forwarded by virtual \
+                     pads: left handle = floor (lifts faint rumble), \
+                     right = ceiling. Applies to pads whose own Rumble \
+                     control hasn't been changed. Double-click resets \
+                     to neutral (full range).");
+            curve_box(ui, &mut exp, RUMBLE_DEF_EXP);
+            if max < floor { max = floor; }
+            if (floor - f0).abs() > f32::EPSILON
+                || (max - m0).abs() > f32::EPSILON
+                || (exp - e0).abs() > f32::EPSILON
+            {
+                self.settings.default_rumble_floor = floor;
+                self.settings.default_rumble_max = max;
+                self.settings.default_rumble_exp = exp;
+                *dirty = true;
+            }
+        });
     }
 
     /// Display-synced output: reports on a grid locked to the display's frames
@@ -1826,10 +1544,9 @@ impl FlexInputApp {
     fn settings_output_sync(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
         use flexinput_virtual::display_clock;
         let supported = display_clock::SUPPORTED;
-        ui.add_space(4.0);
         let mut on = self.settings.output_display_sync && supported;
-        if ui.add_enabled(supported, egui::Checkbox::new(&mut on, "Sync to the display"))
-            .on_hover_text("Report on the display's frames instead of at a fixed rate: a few reports a frame, evenly spaced and locked to the frames, so each frame gets the same number. A game reads the mouse once a frame, and at a fixed rate the number of reports that land in each frame changes from frame to frame, so a mouse moved by a held stick or gyro judders, which only a very high output rate hides. Follows the display the foreground window is on; on Linux, which can't tell, the fastest display that's on.")
+        if form_check(ui, "Display sync", supported, &mut on, "Sync output to the display",
+            "Report on the display's frames instead of at a fixed rate: a few reports a frame, evenly spaced and locked to the frames, so each frame gets the same number. A game reads the mouse once a frame, and at a fixed rate the number of reports that land in each frame changes from frame to frame, so a mouse moved by a held stick or gyro judders, which only a very high output rate hides. Follows the display the foreground window is on; on Linux, which can't tell, the fastest display that's on.")
             .on_disabled_hover_text("Windows and Linux only.")
             .changed()
         {
@@ -1839,51 +1556,41 @@ impl FlexInputApp {
         if !on {
             return;
         }
-        ui.indent("output_sync", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Reports per frame")
-                    .on_hover_text("How many times the virtual devices report in each frame. More is more forgiving: if a report lands just past the moment the game reads its input, it moves a smaller share of the frame's motion to the next frame. The output rate is this many times the display's refresh rate.");
-                for n in settings::OUTPUT_SYNC_PER_FRAME {
-                    if ui.selectable_label(self.settings.output_sync_per_frame == n, n.to_string()).clicked() {
-                        self.settings.output_sync_per_frame = n;
-                        *dirty = true;
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Phase in frame")
-                    .on_hover_text("Where in the frame the reports sit: the first this far into the frame after the display's refresh, the rest evenly after it. The game reads its input at a moment of its own in the frame; if motion still judders, move the reports away from it.");
-                let max = (settings::OUTPUT_SYNC_PHASE_MAX * 100.0).round() as i32;
-                let mut pct = (self.settings.output_sync_phase * 100.0).round() as i32;
-                if ui.add(egui::Slider::new(&mut pct, 0..=max).suffix("%")).changed() {
-                    self.settings.output_sync_phase = pct as f32 / 100.0;
+        form_row(ui, "Reports per frame", "How many times the virtual devices report in each frame. More is more forgiving: if a report lands just past the moment the game reads its input, it moves a smaller share of the frame's motion to the next frame. The output rate is this many times the display's refresh rate.", |ui| {
+            for n in settings::OUTPUT_SYNC_PER_FRAME {
+                if ui.selectable_label(self.settings.output_sync_per_frame == n, n.to_string()).clicked() {
+                    self.settings.output_sync_per_frame = n;
                     *dirty = true;
                 }
-            });
-            // Tuned by eye in the game: a slider over it, on a gamepad shortcut.
-            if self.gamepad_shortcut_row(ui, "Tune over the game", crate::gamepad_nav::ChordTarget::PhaseOverlay) {
-                *dirty = true;
             }
-            ui.label(egui::RichText::new(
-                "Opens the phase over the game: left stick or D-pad moves it, East closes it. The game keeps everything else, so aim while you tune."
-            ).small().color(crate::settings::tinted_gray(140)));
-            let mut follow = self.settings.output_sync_follow_vrr;
-            if ui.checkbox(&mut follow, "Follow variable refresh (VRR)")
-                .on_hover_text("With G-SYNC or FreeSync the display refreshes when the game shows a frame, so the reports follow the frames as they come. Off, they go out at the display's maximum rate as if it were fixed.")
-                .changed()
-            {
-                self.settings.output_sync_follow_vrr = follow;
-                *dirty = true;
-            }
-            ui.label(egui::RichText::new(crate::phase_overlay::sync_status(&self.settings))
-                .small().color(crate::settings::tinted_gray(170)));
         });
+        form_row(ui, "Phase in frame", "Where in the frame the reports sit: the first this far into the frame after the display's refresh, the rest evenly after it. The game reads its input at a moment of its own in the frame; if motion still judders, move the reports away from it.", |ui| {
+            let max = (settings::OUTPUT_SYNC_PHASE_MAX * 100.0).round() as i32;
+            let mut pct = (self.settings.output_sync_phase * 100.0).round() as i32;
+            if ui.add(egui::Slider::new(&mut pct, 0..=max).suffix("%")).changed() {
+                self.settings.output_sync_phase = pct as f32 / 100.0;
+                *dirty = true;
+            }
+        });
+        // Tuned by eye in the game: a slider over it, on a gamepad shortcut.
+        if self.gamepad_shortcut_row(ui, "Tune over the game", crate::gamepad_nav::ChordTarget::PhaseOverlay) {
+            *dirty = true;
+        }
+        form_note(ui, "Opens the phase over the game: left stick or D-pad moves it, East closes it. The game keeps everything else, so aim while you tune.");
+        let mut follow = self.settings.output_sync_follow_vrr;
+        if form_check(ui, "Variable refresh", true, &mut follow, "Follow it (VRR)",
+            "With G-SYNC or FreeSync the display refreshes when the game shows a frame, so the reports follow the frames as they come. Off, they go out at the display's maximum rate as if it were fixed.")
+            .changed()
+        {
+            self.settings.output_sync_follow_vrr = follow;
+            *dirty = true;
+        }
+        form_status(ui, &crate::phase_overlay::sync_status(&self.settings), crate::settings::tinted_gray(170));
     }
 
     fn settings_performance(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        ui.horizontal(|ui| {
-            ui.label("Max polling rate")
-                .on_hover_text("How often controllers and MIDI devices are read. Unless Output rate is set, also how fast the virtual devices report to games. Steps are whole periods: 2000 = 0.5 ms, 1000 = 1 ms … 125 = 8 ms. A controller's own input rate depends on the controller — see the live Hz on each device header.");
+        form_subheading(ui, "Input and output");
+        form_row(ui, "Max polling rate", "How often controllers and MIDI devices are read. Unless Output rate is set, also how fast the virtual devices report to games. Steps are whole periods: 2000 = 0.5 ms, 1000 = 1 ms … 125 = 8 ms. A controller's own input rate depends on the controller — see the live Hz on each device header.", |ui| {
             // The slider drives the STEP INDEX, not the raw Hz, so the handle
             // is evenly spaced and snaps to a valid period *while* dragging.
             // The custom formatter shows the Hz for the current step instead
@@ -1909,154 +1616,70 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "How often the I/O thread reads gamepads and MIDI devices."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "How often the I/O thread reads gamepads and MIDI devices.");
 
-        ui.add_space(8.0);
         let synced = self.settings.output_sync().is_some();
-        ui.horizontal(|ui| {
-            ui.add_enabled(!synced, egui::Label::new("Output rate"))
-                .on_hover_text("How fast the virtual gamepads and the virtual mouse report to games, separately from the polling rate. Lower than polling saves work (or suits an old game that misbehaves with fast mice); higher gives virtual output finer steps than your controllers' own rate — mouse motion from a held gyro or stick moves in smaller, more frequent steps. Output can't change faster than the processing sample rate. \"Same as polling\" reports once per poll, as before, with the SendInput virtual mouse at its own 1000 Hz.")
-                .on_disabled_hover_text("Set by the display while output is synced to it.");
-            // Position 0 = "Same as polling", then the polling steps low→high.
-            let steps = settings::POLLING_HZ_STEPS.len();
-            let mut pos = if self.settings.output_hz == settings::OUTPUT_HZ_SAME_AS_POLLING {
-                0i64
-            } else {
-                (steps - settings::polling_hz_to_index(self.settings.output_hz)) as i64
-            };
-            let hz_at = move |pos: usize| -> u32 {
-                if pos == 0 {
-                    settings::OUTPUT_HZ_SAME_AS_POLLING
+        ui.add_enabled_ui(!synced, |ui| {
+            form_row(ui, "Output rate", "How fast the virtual gamepads and the virtual mouse report to games, separately from the polling rate. Lower than polling saves work (or suits an old game that misbehaves with fast mice); higher gives virtual output finer steps than your controllers' own rate — mouse motion from a held gyro or stick moves in smaller, more frequent steps. Output can't change faster than the processing sample rate. \"Same as polling\" reports once per poll, as before, with the SendInput virtual mouse at its own 1000 Hz.", |ui| {
+                // Position 0 = "Same as polling", then the polling steps low→high.
+                let steps = settings::POLLING_HZ_STEPS.len();
+                let mut pos = if self.settings.output_hz == settings::OUTPUT_HZ_SAME_AS_POLLING {
+                    0i64
                 } else {
-                    settings::polling_hz_from_index(steps - pos.min(steps))
+                    (steps - settings::polling_hz_to_index(self.settings.output_hz)) as i64
+                };
+                let hz_at = move |pos: usize| -> u32 {
+                    if pos == 0 {
+                        settings::OUTPUT_HZ_SAME_AS_POLLING
+                    } else {
+                        settings::polling_hz_from_index(steps - pos.min(steps))
+                    }
+                };
+                let resp = ui.add(egui::Slider::new(&mut pos, 0..=steps as i64)
+                    .integer()
+                    .custom_formatter(move |n, _| match hz_at(n as usize) {
+                        settings::OUTPUT_HZ_SAME_AS_POLLING => "Same as polling".to_string(),
+                        hz => format!("{hz} Hz"),
+                    }))
+                    .on_disabled_hover_text("Set by the display while output is synced to it.");
+                if resp.changed() {
+                    self.settings.output_hz = hz_at(pos.max(0) as usize);
+                    self.output_hz.store(self.settings.output_hz, Ordering::Relaxed);
+                    *dirty = true;
                 }
-            };
-            let resp = ui.add_enabled(!synced, egui::Slider::new(&mut pos, 0..=steps as i64)
-                .integer()
-                .custom_formatter(move |n, _| match hz_at(n as usize) {
-                    settings::OUTPUT_HZ_SAME_AS_POLLING => "Same as polling".to_string(),
-                    hz => format!("{hz} Hz"),
-                }));
-            if resp.changed() {
-                self.settings.output_hz = hz_at(pos.max(0) as usize);
-                self.output_hz.store(self.settings.output_hz, Ordering::Relaxed);
-                *dirty = true;
-            }
+            });
         });
-        ui.label(egui::RichText::new(
-            "How fast the virtual gamepads and virtual mouse report to games."
-        ).small().color(crate::settings::tinted_gray(140)));
+        form_note(ui, "How fast the virtual gamepads and virtual mouse report to games.");
         self.settings_output_sync(ui, dirty);
         if self.settings.effective_output_hz() > self.settings.effective_sample_rate_hz() {
-            ui.label(egui::RichText::new(format!(
+            form_status(ui, &format!(
                 "Above the processing sample rate ({} Hz): outputs from the patch only change that often.",
                 self.settings.effective_sample_rate_hz(),
-            )).small().color(egui::Color32::from_rgb(230, 170, 80)));
+            ), FORM_WARN);
         }
-
         let live = live_rates(ui.ctx());
         let mouse = match live.mouse_hz {
             Some(0) | None => "idle".to_string(),
             Some(hz) => format!("{hz} reports/s"),
         };
         let output = live.output_hz.map_or_else(|| "…".to_string(), |hz| format!("{hz} Hz"));
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(format!(
+        form_status(ui, &format!(
             "Now: polling {} Hz · output {output} · virtual mouse {mouse}",
             flexinput_engine::current_io_rate(),
-        )).small().color(crate::settings::tinted_gray(170)))
+        ), crate::settings::tinted_gray(170))
             .on_hover_text("Measured live. The virtual mouse sends a report only when the pointer moves at least one whole count, so slow motion sends fewer than the output rate.");
-        // Inline rather than a tooltip: it's read while a controller moves the
-        // pointer, which a hover can't survive.
-        egui::CollapsingHeader::new(egui::RichText::new("Where the I/O loop's time goes").small())
-            .id_salt("io_timings_details")
-            .show(ui, |ui| {
-                let rows = super::threads::IO_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
-                egui::Grid::new("io_timings").num_columns(3).striped(true).show(ui, |ui| {
-                    let head = |s: &str| egui::RichText::new(s).small().strong();
-                    ui.label(head("per loop pass, last second"));
-                    ui.label(head("avg ms"));
-                    ui.label(head("worst ms"));
-                    ui.end_row();
-                    for (name, avg, worst) in rows.iter().take(20) {
-                        ui.label(egui::RichText::new(name.as_str()).small());
-                        ui.label(egui::RichText::new(format!("{avg:.3}")).small());
-                        ui.label(egui::RichText::new(format!("{worst:.2}")).small());
-                        ui.end_row();
-                    }
-                });
-            });
-        // Whether the engine is computing, blocked, or short of ticks.
-        egui::CollapsingHeader::new(egui::RichText::new("Where the engine's time goes").small())
-            .id_salt("engine_timings_details")
-            .show(ui, |ui| {
-                let rows = flexinput_engine::ENGINE_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
-                egui::Grid::new("engine_timings").num_columns(3).striped(true).show(ui, |ui| {
-                    let head = |s: &str| egui::RichText::new(s).small().strong();
-                    ui.label(head("per engine pass, last second"));
-                    ui.label(head("avg ms"));
-                    ui.label(head("worst ms"));
-                    ui.end_row();
-                    for (name, avg, worst) in &rows {
-                        ui.label(egui::RichText::new(name.as_str()).small());
-                        ui.label(egui::RichText::new(format!("{avg:.3}")).small());
-                        ui.label(egui::RichText::new(format!("{worst:.2}")).small());
-                        ui.end_row();
-                    }
-                });
-            });
-        // The main window's passes, before it paints. The second line keeps the
-        // last figures from without focus, when the window can't show them live.
-        egui::CollapsingHeader::new(egui::RichText::new("Where the window's time goes").small())
-            .id_salt("ui_pass_details")
-            .show(ui, |ui| {
-                let (now, away) = super::main_window::UI_PASSES.lock().map(|t| *t).unwrap_or_default();
-                let line = |r: super::main_window::UiPassRow| format!(
-                    "{} passes/s, {} drawn, {} let go, {:.2} ms each",
-                    r.passes, r.drawn, r.waited, r.avg_ms,
-                );
-                ui.label(egui::RichText::new(format!("Now: {}", line(now))).small());
-                ui.label(egui::RichText::new(format!("Last time without focus: {}", line(away))).small());
-            });
-        // Which thread the process's CPU time goes to; nice shows whether the
-        // input threads got their raised priority (thread_priority).
-        #[cfg(target_os = "linux")]
-        egui::CollapsingHeader::new(egui::RichText::new("Where the CPU goes, by thread").small())
-            .id_salt("thread_cpu_details")
-            .show(ui, |ui| {
-                let rows = crate::thread_cpu::snapshot();
-                let total: f32 = rows.iter().map(|r| r.percent).sum();
-                ui.label(egui::RichText::new(format!(
-                    "FlexInput: {total:.0}% of one core ({} cores here)",
-                    std::thread::available_parallelism().map_or(1, |n| n.get()),
-                )).small());
-                egui::Grid::new("thread_cpu").num_columns(3).striped(true).show(ui, |ui| {
-                    let head = |s: &str| egui::RichText::new(s).small().strong();
-                    ui.label(head("thread, last second"));
-                    ui.label(head("% of a core"));
-                    ui.label(head("nice"));
-                    ui.end_row();
-                    for r in rows.iter().take(14) {
-                        let name = if r.count > 1 { format!("{} ×{}", r.name, r.count) } else { r.name.clone() };
-                        ui.label(egui::RichText::new(name).small());
-                        ui.label(egui::RichText::new(format!("{:.1}", r.percent)).small());
-                        ui.label(egui::RichText::new(r.nice.to_string()).small());
-                        ui.end_row();
-                    }
-                });
-            });
-        ui.add_space(8.0);
+        form_gap(ui);
 
-        ui.horizontal(|ui| {
-            ui.label("Processing sample rate");
+        form_subheading(ui, "Processing");
+        form_row(ui, "Sample rate", "", |ui| {
             use settings::SampleRateMode as Mode;
             let label = |m: Mode| match m {
                 Mode::Manual => "Set by hand",
                 Mode::SameAsOutput => "Same as output",
                 Mode::TwiceOutput => "2x output",
             };
+            // Narrow, with the rate beside it.
+            ui.spacing_mut().combo_width = ui.spacing().combo_width.min(130.0);
             egui::ComboBox::from_id_salt("sample_rate_mode")
                 .selected_text(label(self.settings.sample_rate_mode))
                 .show_ui(ui, |ui| {
@@ -2086,9 +1709,6 @@ impl FlexInputApp {
                 ui.label(format!("{} Hz", self.settings.effective_sample_rate_hz()));
             }
         });
-        ui.label(egui::RichText::new(
-            "Engine tick rate. Higher = finer timing, more CPU."
-        ).small().color(crate::settings::tinted_gray(140)));
         if let (Some(passes), Some(ticks)) = (live.passes_hz, live.ticks_hz) {
             // Below ~90% of the setting, catch-up ticks are being dropped: the
             // patch costs more per tick than this machine has at this rate.
@@ -2097,7 +1717,7 @@ impl FlexInputApp {
             // A rate it would sustain: under what it manages now, with room.
             let suggest = (ticks * 4 / 5 / 100 * 100)
                 .clamp(self.settings.sample_rate_floor_hz().min(rate), rate);
-            let text = egui::RichText::new(format!(
+            let text = format!(
                 "Now: engine {ticks} ticks/s in {passes} passes/s{}",
                 if !behind {
                     String::new()
@@ -2106,19 +1726,14 @@ impl FlexInputApp {
                 } else {
                     " — can't keep up at this rate".to_string()
                 },
-            )).small();
-            ui.label(if behind {
-                text.color(egui::Color32::from_rgb(230, 170, 80))
-            } else {
-                text.color(crate::settings::tinted_gray(170))
-            })
-            .on_hover_text("The engine publishes its outputs once per pass, so passes/s is how often outputs can change.");
+            );
+            form_status(ui, &text, if behind { FORM_WARN } else { crate::settings::tinted_gray(170) })
+                .on_hover_text("The engine publishes its outputs once per pass, so passes/s is how often outputs can change.");
         }
+        form_note(ui, "The engine's tick rate. Higher = finer timing, more CPU.");
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label("Background repaint rate")
-                .on_hover_text("Repaint rate applied when the window is minimized or another app has focus. The focused window always paints at vsync regardless.");
+        form_subheading(ui, "Window");
+        form_row(ui, "Background repaint rate", "Repaint rate applied when the window is minimized or another app has focus. The focused window always paints at vsync regardless.", |ui| {
             let resp = ui.add(egui::Slider::new(
                 &mut self.settings.bg_repaint_hz,
                 settings::BG_REPAINT_HZ_MIN..=settings::BG_REPAINT_HZ_MAX,
@@ -2127,33 +1742,109 @@ impl FlexInputApp {
                 *dirty = true;
             }
         });
-        ui.label(egui::RichText::new(
-            "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused."
-        ).small().color(crate::settings::tinted_gray(140)));
-
-        ui.add_space(8.0);
-        if ui.checkbox(&mut self.settings.freeze_background, "Freeze and dim unused windows")
-            .on_hover_text("Windows without focus stop drawing and stay dimmed on their last frame until you click them. A sub-patch editor also wakes when the pointer moves over it. Mappings and overlays keep running. A pinned or see-through window stays live.")
+        form_note(ui, "How often the UI repaints while FlexInput sits in the background. Lower = less CPU while you play a game, higher = smoother glanceable visuals. Has no effect when the window is focused.");
+        if form_check(ui, "Unused windows", true, &mut self.settings.freeze_background, "Freeze and dim them",
+            "Windows without focus stop drawing and stay dimmed on their last frame until you click them. A sub-patch editor also wakes when the pointer moves over it. Mappings and overlays keep running. A pinned or see-through window stays live.")
             .changed()
         {
             *dirty = true;
         }
+
+        form_subheading(ui, "Where the time goes");
+        // Inline rather than a tooltip: it's read while a controller moves the
+        // pointer, which a hover can't survive.
+        let small = |s: &str| egui::RichText::new(s).size(crate::settings::ui_size(FORM_NOTE_PT));
+        egui::CollapsingHeader::new(small("The I/O loop"))
+            .id_salt("io_timings_details")
+            .show(ui, |ui| {
+                let rows = super::threads::IO_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
+                egui::Grid::new("io_timings").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| small(s).strong();
+                    ui.label(head("per loop pass, last second"));
+                    ui.label(head("avg ms"));
+                    ui.label(head("worst ms"));
+                    ui.end_row();
+                    for (name, avg, worst) in rows.iter().take(20) {
+                        ui.label(small(name.as_str()));
+                        ui.label(small(&format!("{avg:.3}")));
+                        ui.label(small(&format!("{worst:.2}")));
+                        ui.end_row();
+                    }
+                });
+            });
+        // Whether the engine is computing, blocked, or short of ticks.
+        egui::CollapsingHeader::new(small("The engine"))
+            .id_salt("engine_timings_details")
+            .show(ui, |ui| {
+                let rows = flexinput_engine::ENGINE_TIMINGS.lock().map(|t| t.clone()).unwrap_or_default();
+                egui::Grid::new("engine_timings").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| small(s).strong();
+                    ui.label(head("per engine pass, last second"));
+                    ui.label(head("avg ms"));
+                    ui.label(head("worst ms"));
+                    ui.end_row();
+                    for (name, avg, worst) in &rows {
+                        ui.label(small(name.as_str()));
+                        ui.label(small(&format!("{avg:.3}")));
+                        ui.label(small(&format!("{worst:.2}")));
+                        ui.end_row();
+                    }
+                });
+            });
+        // The main window's passes, before it paints. The second line keeps the
+        // last figures from without focus, when the window can't show them live.
+        egui::CollapsingHeader::new(small("The window"))
+            .id_salt("ui_pass_details")
+            .show(ui, |ui| {
+                let (now, away) = super::main_window::UI_PASSES.lock().map(|t| *t).unwrap_or_default();
+                let line = |r: super::main_window::UiPassRow| format!(
+                    "{} passes/s, {} drawn, {} let go, {:.2} ms each",
+                    r.passes, r.drawn, r.waited, r.avg_ms,
+                );
+                ui.label(small(&format!("Now: {}", line(now))));
+                ui.label(small(&format!("Last time without focus: {}", line(away))));
+            });
+        // Which thread the process's CPU time goes to; nice shows whether the
+        // input threads got their raised priority (thread_priority).
+        #[cfg(target_os = "linux")]
+        egui::CollapsingHeader::new(small("The CPU, by thread"))
+            .id_salt("thread_cpu_details")
+            .show(ui, |ui| {
+                let rows = crate::thread_cpu::snapshot();
+                let total: f32 = rows.iter().map(|r| r.percent).sum();
+                ui.label(small(&format!(
+                    "FlexInput: {total:.0}% of one core ({} cores here)",
+                    std::thread::available_parallelism().map_or(1, |n| n.get()),
+                )));
+                egui::Grid::new("thread_cpu").num_columns(3).striped(true).show(ui, |ui| {
+                    let head = |s: &str| small(s).strong();
+                    ui.label(head("thread, last second"));
+                    ui.label(head("% of a core"));
+                    ui.label(head("nice"));
+                    ui.end_row();
+                    for r in rows.iter().take(14) {
+                        let name = if r.count > 1 { format!("{} ×{}", r.name, r.count) } else { r.name.clone() };
+                        ui.label(small(&name));
+                        ui.label(small(&format!("{:.1}", r.percent)));
+                        ui.label(small(&r.nice.to_string()));
+                        ui.end_row();
+                    }
+                });
+            });
     }
 
     fn settings_midi(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("MIDI devices");
-            if ui.button("Refresh MIDI").clicked() {
+        form_row(ui, "MIDI devices", "", |ui| {
+            if ui.button("Refresh").on_hover_text("Scan for MIDI ports again").clicked() {
                 self.midi_refresh_requested.store(true, Ordering::Release);
             }
         });
-        ui.label(egui::RichText::new(
+        form_note(ui,
             "MIDI ports are scanned once at startup and on demand. \
              Auto-scanning is disabled because the Windows MIDI API periodically \
              disrupts the audio stack (stream skips, Bluetooth noise). \
-             Click after plugging in or creating a MIDI/loopMIDI port."
-        ).small().color(crate::settings::tinted_gray(140)));
-        settings_subheading(ui, "Loop guard");
+             Click after plugging in or creating a MIDI/loopMIDI port.");
+        form_subheading(ui, "Loop guard");
         // What the loop guard knows: which In/Out ports it treats as one
         // port coming back round, and which Out ports its breaker muted.
         {
@@ -2164,10 +1855,9 @@ impl FlexInputApp {
                 .map(|d| d.display_name.clone())
                 .unwrap_or_else(|| id.to_string());
             if guard.pairs.is_empty() && guard.muted.is_empty() {
-                ui.label(egui::RichText::new(
+                form_group_note(ui,
                     "No MIDI ports in use are paired. A pair forms when a patch uses a MIDI In \
-                     and a MIDI Out that are the same port (same name, or echoes seen coming back).",
-                ).small().color(crate::settings::tinted_gray(140)));
+                     and a MIDI Out that are the same port (same name, or echoes seen coming back).");
             }
             for (out_id, in_id, status) in &guard.pairs {
                 let (what, tip) = match status {
@@ -2178,17 +1868,15 @@ impl FlexInputApp {
                     PairStatus::Demoted => ("no echoes — nothing cancelled",
                         "Plenty sent and nothing came back, so this is two separate ports."),
                 };
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{} → {}", name(out_id), name(in_id))).small());
-                    ui.label(egui::RichText::new(what).small().color(crate::settings::tinted_gray(150)))
+                form_data_row(ui, &format!("{} → {}", name(out_id), name(in_id)), "", |ui| {
+                    ui.label(egui::RichText::new(what).color(crate::settings::tinted_gray(170)))
                         .on_hover_text(tip);
                 });
             }
             for out_id in &guard.muted {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("⛔ {} muted by the loop breaker", name(out_id)))
-                        .small().color(egui::Color32::from_rgb(226, 104, 92)));
-                    if ui.small_button("Unmute").clicked() {
+                form_data_row(ui, &name(out_id), "", |ui| {
+                    ui.label(egui::RichText::new("⛔ muted by the loop breaker").color(egui::Color32::from_rgb(226, 104, 92)));
+                    if ui.button("Unmute").clicked() {
                         crate::canvas::viewer::request_midi_unmute(ui.ctx(), out_id);
                     }
                 });
@@ -2197,46 +1885,25 @@ impl FlexInputApp {
     }
 
     fn settings_folders(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
-        settings_subheading(ui, "User presets");
-        ui.label(egui::RichText::new(
-            "Folder scanned for user-authored .fxsp sub-patch presets, in addition to the factory presets shipped under app/assets/sub-patches/."
-        ).small().color(crate::settings::tinted_gray(140)));
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("User presets folder:");
-            let label = self.settings.user_presets_folder.as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(none)".into());
-            ui.monospace(label);
+        let presets = self.settings.user_presets_folder.as_ref().map(|p| p.display().to_string());
+        form_row(ui, "User presets", "", |ui| {
             if ui.button("Browse…").clicked() {
                 if let Some(p) = crate::overlay::with_overlay_not_topmost(|| rfd::FileDialog::new().pick_folder()) {
                     self.settings.user_presets_folder = Some(p);
                     *dirty = true;
                 }
             }
-            if self.settings.user_presets_folder.is_some()
-                && ui.button("Clear").clicked()
-            {
+            if ui.add_enabled(presets.is_some(), egui::Button::new("Clear")).clicked() {
                 self.settings.user_presets_folder = None;
                 *dirty = true;
             }
+            form_path(ui, presets.as_deref(), "(none)");
         });
-        settings_subheading(ui, "3D controller models");
-        ui.horizontal(|ui| {
-            ui.label("User models folder")
-                .on_hover_text(
-                    "Optional folder with your own controller models. Same \
-                     structure as the bundled ones: <Name>/info.txt + .obj files \
-                     (+ optional colors.fxcol). A same-named folder overrides the \
-                     bundled model.",
-                );
-            let cur = self.settings.user_models_dir.clone().unwrap_or_default();
-            ui.label(
-                egui::RichText::new(if cur.is_empty() { "(none)" } else { &cur })
-                    .small()
-                    .color(crate::settings::tinted_gray(160)),
-            );
-            if ui.small_button("Browse…").clicked() {
+        form_note(ui, "Folder scanned for your own .fxsp sub-patch presets, beside the factory presets shipped under app/assets/sub-patches/.");
+
+        let models = self.settings.user_models_dir.clone().filter(|s| !s.is_empty());
+        form_row(ui, "3D controller models", "", |ui| {
+            if ui.button("Browse…").clicked() {
                 if let Some(p) = crate::overlay::with_overlay_not_topmost(|| rfd::FileDialog::new().pick_folder()) {
                     let s = p.to_string_lossy().to_string();
                     self.settings.user_models_dir = Some(s);
@@ -2244,32 +1911,22 @@ impl FlexInputApp {
                     *dirty = true;
                 }
             }
-            if !cur.is_empty() && ui.small_button("Clear").clicked() {
+            if ui.add_enabled(models.is_some(), egui::Button::new("Clear")).clicked() {
                 self.settings.user_models_dir = None;
                 crate::model::set_user_models_dir(None);
                 *dirty = true;
             }
+            form_path(ui, models.as_deref(), "(none)");
         });
-        settings_subheading(ui, "Bluetooth");
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Bluetooth link keys");
-            let cur = self.settings.bt_key_dir.clone().unwrap_or_default();
-            ui.label(
-                egui::RichText::new(if cur.is_empty() { "(working directory)" } else { &cur })
-                    .small()
-                    .color(crate::settings::tinted_gray(160)),
-            )
-            .on_hover_text(
-                "Where link keys for controllers paired to FlexInput's own \
-                 Bluetooth dongle are kept.\n\n\
-                 A pairing is between the controller and the DONGLE, not this PC \
-                 — so the same dongle works on another machine. Both ends have to \
-                 hold the key, though, and this file is the host's copy. Point \
-                 this at a cloud-synced folder and the key follows the dongle \
-                 everywhere with nothing to copy by hand.",
-            );
-            if ui.small_button("Browse…").clicked() {
+        form_note(ui,
+            "Optional folder with your own controller models. Same \
+             structure as the bundled ones: <Name>/info.txt + .obj files \
+             (+ optional colors.fxcol). A same-named folder overrides the \
+             bundled model.");
+
+        let keys = self.settings.bt_key_dir.clone().filter(|s| !s.is_empty());
+        form_row(ui, "Bluetooth link keys", "", |ui| {
+            if ui.button("Browse…").clicked() {
                 if let Some(p) = crate::overlay::with_overlay_not_topmost(
                     || rfd::FileDialog::new().pick_folder(),
                 ) {
@@ -2299,7 +1956,7 @@ impl FlexInputApp {
                     }
                 }
             }
-            if !cur.is_empty() && ui.small_button("Clear").clicked() {
+            if ui.add_enabled(keys.is_some(), egui::Button::new("Clear")).clicked() {
                 self.settings.bt_key_dir = None;
                 flexinput_btle::keystore::set_dir(None);
                 ui.ctx().data_mut(|d| {
@@ -2307,13 +1964,21 @@ impl FlexInputApp {
                 });
                 *dirty = true;
             }
+            form_path(ui, keys.as_deref(), "(working directory)");
         });
         if let Some(err) = ui
             .ctx()
             .data(|d| d.get_temp::<String>(egui::Id::new("bt_key_dir_error")))
         {
-            ui.label(egui::RichText::new(err).small().color(egui::Color32::from_rgb(230, 140, 60)));
+            form_status(ui, &err, egui::Color32::from_rgb(230, 140, 60));
         }
+        form_note(ui,
+            "Where link keys for controllers paired to FlexInput's own \
+             Bluetooth dongle are kept. A pairing is between the controller and \
+             the DONGLE, not this PC — so the same dongle works on another machine. \
+             Both ends have to hold the key, though, and this file is the host's \
+             copy. Point this at a cloud-synced folder and the key follows the \
+             dongle everywhere with nothing to copy by hand.");
     }
 
     /// Profiler toggle: flips `puffin::set_scopes_on()` and starts/stops a
@@ -2324,7 +1989,7 @@ impl FlexInputApp {
     #[cfg(debug_assertions)]
     fn settings_developer(&mut self, ui: &mut egui::Ui) {
         let mut prof = self.settings.profiler_enabled;
-        if ui.checkbox(&mut prof, "Enable puffin profiler (127.0.0.1:8585)").changed() {
+        if form_check(ui, "Profiler", true, &mut prof, "puffin, on 127.0.0.1:8585", "").changed() {
             self.settings.profiler_enabled = prof;
             if prof {
                 match puffin_http::Server::new("127.0.0.1:8585") {
@@ -2344,111 +2009,86 @@ impl FlexInputApp {
                 eprintln!("[profiler] stopped");
             }
         }
-        ui.label(egui::RichText::new(
+        form_note(ui,
             "Install once: `cargo install puffin_viewer`.\n\
-             Then run `puffin_viewer --url 127.0.0.1:8585` with this toggle on."
-        ).small().weak());
+             Then run `puffin_viewer --url 127.0.0.1:8585` with this toggle on.");
     }
 
     fn settings_about(&mut self, ui: &mut egui::Ui) {
-        ui.label(format!("FlexInput v{}", env!("CARGO_PKG_VERSION")));
-        settings_subheading(ui, "Links");
-        ui.hyperlink_to("FlexInput repository",      "https://github.com/x-iso/FlexInput");
-        ui.hyperlink_to("HIDMaestro — virtual HID driver", "https://github.com/hifihedgehog/HIDMaestro");
-        ui.hyperlink_to("HidHide — latest release",  "https://github.com/nefarius/HidHide/releases/latest");
-        settings_subheading(ui, "Credits");
-        ui.label(egui::RichText::new(
-            "Built with egui, eframe, egui-snarl, egui_extras, gilrs, SDL, midir, rfd, serde, HidHide."
-        ).small());
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Virtual devices powered by").small());
-            ui.hyperlink_to(
-                egui::RichText::new("HIDMaestro").small(),
-                "https://github.com/hifihedgehog/HIDMaestro",
-            );
-            ui.label(egui::RichText::new("by hifihedgehog (MIT).").small());
+        form_row(ui, "Version", "", |ui| {
+            ui.label(format!("FlexInput v{}", env!("CARGO_PKG_VERSION")));
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Input prompt SVG icons by Kenney —").small());
-            ui.hyperlink_to(
-                egui::RichText::new("kenney.nl/assets/input-prompts").small(),
-                "https://kenney.nl/assets/input-prompts",
-            );
-            ui.label(egui::RichText::new("(CC0).").small());
+        form_row(ui, "Source", "", |ui| {
+            ui.hyperlink_to("FlexInput repository", "https://github.com/x-iso/FlexInput");
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Macro & menu icons from").small());
-            ui.hyperlink_to(
-                egui::RichText::new("game-icons.net").small(),
-                "https://game-icons.net/",
-            );
-            ui.label(egui::RichText::new("by their respective authors, licensed").small());
-            ui.hyperlink_to(
-                egui::RichText::new("CC BY 3.0").small(),
-                "https://creativecommons.org/licenses/by/3.0/",
-            );
-            ui.label(egui::RichText::new("(per-icon authors listed on the site).").small());
+        form_row(ui, "Virtual HID driver", "", |ui| {
+            ui.hyperlink_to("HIDMaestro", "https://github.com/hifihedgehog/HIDMaestro");
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("3D controller models adapted from").small());
-            ui.hyperlink_to(
-                egui::RichText::new("3d-controller-overlay").small(),
-                "https://github.com/larfingshnew/3d-controller-overlay",
-            );
-            ui.label(egui::RichText::new("by larfingshnew (MIT).").small());
+        form_row(ui, "Controller hiding", "", |ui| {
+            ui.hyperlink_to("HidHide — latest release", "https://github.com/nefarius/HidHide/releases/latest");
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(
-                "Steam Controller 3D model © Valve Corporation, modified by FlickStick Videos and",
-            ).small());
-            ui.hyperlink_to(
-                egui::RichText::new("ceski").small(),
-                "https://github.com/ceski-1/3d-controller-overlay",
-            );
-            ui.label(egui::RichText::new("—").small());
-            ui.hyperlink_to(
-                egui::RichText::new("CC BY-NC-SA 4.0").small(),
-                "https://creativecommons.org/licenses/by-nc-sa/4.0/",
-            );
-            ui.label(egui::RichText::new(
-                "(non-commercial use only). Not affiliated with or endorsed by Valve.",
-            ).small());
+        form_subheading(ui, "Credits");
+        // Each credit a paragraph of its own, in the notes' size, with the same gap after it.
+        let t = |s: &str| egui::RichText::new(s).size(crate::settings::ui_size(FORM_NOTE_PT));
+        let credit = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                add(ui);
+            });
+            ui.add_space(2.0);
+        };
+        credit(ui, &mut |ui| {
+            ui.label(t("Built with egui, eframe, egui-snarl, egui_extras, gilrs, SDL, midir, rfd, serde, HidHide."));
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("JSM Config follows").small());
-            ui.hyperlink_to(
-                egui::RichText::new("JoyShockMapper").small(),
-                "https://github.com/Electronicks/JoyShockMapper",
-            );
-            ui.label(egui::RichText::new("by Jibb Smart and Electronicks, and its").small());
-            ui.hyperlink_to(
-                egui::RichText::new("JSM_custom_curve").small(),
-                "https://github.com/evan1mclean/JSM_custom_curve",
-            );
-            ui.label(egui::RichText::new("fork by evan1mclean (both MIT).").small());
+        credit(ui, &mut |ui| {
+            ui.label(t("Virtual devices powered by"));
+            ui.hyperlink_to(t("HIDMaestro"), "https://github.com/hifihedgehog/HIDMaestro");
+            ui.label(t("by hifihedgehog (MIT)."));
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Adaptive-trigger effects follow Nielk1's").small());
-            ui.hyperlink_to(
-                egui::RichText::new("TriggerEffectGenerator").small(),
-                "https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db",
-            );
-            ui.label(egui::RichText::new("(MIT).").small());
+        credit(ui, &mut |ui| {
+            ui.label(t("Input prompt SVG icons by Kenney —"));
+            ui.hyperlink_to(t("kenney.nl/assets/input-prompts"), "https://kenney.nl/assets/input-prompts");
+            ui.label(t("(CC0)."));
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Controller protocol research by").small());
-            ui.hyperlink_to(
-                egui::RichText::new("dekuNukem").small(),
-                "https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering",
-            );
-            ui.label(egui::RichText::new("(Switch Pro) and").small());
-            ui.hyperlink_to(
-                egui::RichText::new("ndeadly").small(),
-                "https://github.com/ndeadly/switch2_controller_research",
-            );
-            ui.label(egui::RichText::new("(Switch 2 / Joy-Con 2).").small());
+        credit(ui, &mut |ui| {
+            ui.label(t("Macro & menu icons from"));
+            ui.hyperlink_to(t("game-icons.net"), "https://game-icons.net/");
+            ui.label(t("by their respective authors, licensed"));
+            ui.hyperlink_to(t("CC BY 3.0"), "https://creativecommons.org/licenses/by/3.0/");
+            ui.label(t("(per-icon authors listed on the site)."));
         });
-        ui.add_space(8.0);
+        credit(ui, &mut |ui| {
+            ui.label(t("3D controller models adapted from"));
+            ui.hyperlink_to(t("3d-controller-overlay"), "https://github.com/larfingshnew/3d-controller-overlay");
+            ui.label(t("by larfingshnew (MIT)."));
+        });
+        credit(ui, &mut |ui| {
+            ui.label(t("Steam Controller 3D model © Valve Corporation, modified by FlickStick Videos and"));
+            ui.hyperlink_to(t("ceski"), "https://github.com/ceski-1/3d-controller-overlay");
+            ui.label(t("—"));
+            ui.hyperlink_to(t("CC BY-NC-SA 4.0"), "https://creativecommons.org/licenses/by-nc-sa/4.0/");
+            ui.label(t("(non-commercial use only). Not affiliated with or endorsed by Valve."));
+        });
+        credit(ui, &mut |ui| {
+            ui.label(t("JSM Config follows"));
+            ui.hyperlink_to(t("JoyShockMapper"), "https://github.com/Electronicks/JoyShockMapper");
+            ui.label(t("by Jibb Smart and Electronicks, and its"));
+            ui.hyperlink_to(t("JSM_custom_curve"), "https://github.com/evan1mclean/JSM_custom_curve");
+            ui.label(t("fork by evan1mclean (both MIT)."));
+        });
+        credit(ui, &mut |ui| {
+            ui.label(t("Adaptive-trigger effects follow Nielk1's"));
+            ui.hyperlink_to(t("TriggerEffectGenerator"), "https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db");
+            ui.label(t("(MIT)."));
+        });
+        credit(ui, &mut |ui| {
+            ui.label(t("Controller protocol research by"));
+            ui.hyperlink_to(t("dekuNukem"), "https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering");
+            ui.label(t("(Switch Pro) and"));
+            ui.hyperlink_to(t("ndeadly"), "https://github.com/ndeadly/switch2_controller_research");
+            ui.label(t("(Switch 2 / Joy-Con 2)."));
+        });
+        form_gap(ui);
         if ui.button("Third-party licenses…")
             .on_hover_text("Full licence text for everything FlexInput redistributes")
             .clicked()
@@ -2632,19 +2272,238 @@ fn settings_section_header(ui: &mut egui::Ui, title: &str) -> egui::Response {
     let resp = ui.label(egui::RichText::new(title).size(crate::settings::ui_size(17.0)).strong());
     ui.separator();
     ui.add_space(4.0);
+    // A subheading straight under the title adds no space of its own.
+    form_trail(2.0 * FORM_GAP);
     resp
 }
 
-/// A group title inside a Settings section.
-fn settings_subheading(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(egui::RichText::new(title).strong().color(crate::settings::tinted_gray(200)));
-    ui.add_space(2.0);
+// ── The page's form ──────────────────────────────────────────────────────────
+//
+// Every setting on the page is laid out alike: its name in a column of its own, its controls
+// beside it in a second - a checkbox too, its words saying what it turns on - and a note in
+// the hint colour under the controls, after which comes the same gap before the next setting.
+// A section's groups open with a subheading. Laid out row by row, the page had names with a
+// colon and without, controls starting wherever their name ended, notes in two greys at
+// egui's smallest size, and gaps of anything from 2 to 8 points: nothing lined up.
+
+/// The gap after a setting's note, and before a subheading (twice it).
+const FORM_GAP: f32 = 10.0;
+/// The widest a slider is drawn, and a dropdown: as wide for every setting.
+const FORM_SLIDER_W: f32 = 200.0;
+const FORM_COMBO_W: f32 = 190.0;
+/// A value box beside a slider, as wide for every one.
+const FORM_VALUE_W: f32 = 64.0;
+/// A note's text size, before the text size setting: egui's small style is 9 points, too
+/// small for a paragraph.
+const FORM_NOTE_PT: f32 = 11.0;
+/// A warning's colour, and an error's.
+const FORM_WARN: egui::Color32 = egui::Color32::from_rgb(230, 170, 80);
+const FORM_ERROR: egui::Color32 = egui::Color32::from_rgb(220, 120, 120);
+
+/// The room between the widest name and the controls, besides egui's own item spacing.
+const FORM_NAME_GAP: f32 = 6.0;
+
+thread_local! {
+    /// The names' column's width on the page being drawn ([`form_page`]).
+    static FORM_NAME_W: std::cell::Cell<f32> = const { std::cell::Cell::new(150.0) };
+    /// The widest setting's name drawn on the page so far this pass, which the column is
+    /// sized to on the next.
+    static FORM_WIDEST: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// The space already left under what was drawn last (a note's gap), which a subheading
+    /// counts toward its own.
+    static FORM_TRAIL: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
 }
 
-/// Small explanatory text under a setting.
-fn settings_note(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).small().color(crate::settings::tinted_gray(140)));
+/// Start a page `w` wide: its names' column as wide as the widest setting's name on it was
+/// last pass, and no more than two fifths of the page (a longer name wraps). It was a third
+/// of the page, which left a short name's controls far off beside it.
+fn form_page(w: f32) {
+    let widest = FORM_WIDEST.with(|c| c.replace(0.0));
+    let fit = if widest > 0.0 { widest + FORM_NAME_GAP } else { 150.0 };
+    FORM_NAME_W.with(|c| c.set(fit.clamp(80.0, (w * 0.4).max(80.0))));
+    form_trail(0.0);
+}
+
+fn form_name_w() -> f32 {
+    FORM_NAME_W.with(|c| c.get())
+}
+
+fn form_trail(space: f32) {
+    FORM_TRAIL.with(|c| c.set(space));
+}
+
+/// The gap that ends a setting.
+fn form_gap(ui: &mut egui::Ui) {
+    ui.add_space(FORM_GAP);
+    form_trail(FORM_GAP);
+}
+
+/// A group's title inside a section.
+fn form_subheading(ui: &mut egui::Ui, title: &str) {
+    let have = FORM_TRAIL.with(|c| c.get());
+    ui.add_space((2.0 * FORM_GAP - have).max(0.0));
+    ui.label(egui::RichText::new(title).strong().color(crate::settings::tinted_gray(200)));
+    ui.add_space(2.0);
+    form_trail(0.0);
+}
+
+/// One setting's row: `name` in the names' column - its hover saying more, where `hover`
+/// does - and `add`'s controls beside it, its sliders and dropdowns as wide as every other's
+/// (or as the room left holds).
+fn form_row<R>(ui: &mut egui::Ui, name: &str, hover: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let need = ui.painter()
+        .layout_no_wrap(name.to_string(), egui::TextStyle::Body.resolve(ui.style()), egui::Color32::PLACEHOLDER)
+        .size()
+        .x;
+    FORM_WIDEST.with(|c| c.set(c.get().max(need)));
+    form_data_row(ui, name, hover, add)
+}
+
+/// [`form_row`] for a row named by something it lists - a MIDI port pair - rather than a
+/// setting: a long name wraps in the column rather than widening it for the whole page.
+fn form_data_row<R>(ui: &mut egui::Ui, name: &str, hover: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let w = form_name_w();
+    let r = ui.horizontal(|ui| {
+        let gap = ui.spacing().item_spacing.x;
+        let room = ui.available_width() - w - gap;
+        ui.spacing_mut().slider_width = (room - FORM_VALUE_W - 2.0 * gap).clamp(60.0, FORM_SLIDER_W);
+        ui.spacing_mut().combo_width = FORM_COMBO_W.min(room.max(60.0));
+        let h = ui.spacing().interact_size.y;
+        let shown = ui.allocate_ui_with_layout(
+            egui::vec2(w, h),
+            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                ui.set_width(w);
+                ui.add(egui::Label::new(name).wrap())
+            },
+        ).inner;
+        if !hover.is_empty() {
+            shown.on_hover_text(hover).on_disabled_hover_text(hover);
+        }
+        add(ui)
+    }).inner;
+    form_trail(0.0);
+    r
+}
+
+/// A setting that's a checkbox: `name` in the names' column (empty for the next of a group),
+/// the box and its `text` - wrapping to the room - in the controls'.
+fn form_check(ui: &mut egui::Ui, name: &str, enabled: bool, on: &mut bool, text: &str, hover: &str) -> egui::Response {
+    form_row(ui, name, "", |ui| {
+        ui.vertical(|ui| {
+            let r = ui.add_enabled(enabled, egui::Checkbox::new(on, text));
+            if hover.is_empty() { r } else { r.on_hover_text(hover) }
+        }).inner
+    })
+}
+
+/// `add` in the controls' column, under the row above: a note, a live readout, a warning.
+fn form_column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let indent = form_name_w() + ui.spacing().item_spacing.x;
+    let mut rect = ui.available_rect_before_wrap();
+    rect.min.x = (rect.min.x + indent).min(rect.max.x - 40.0);
+    let r = ui.scope_builder(
+        egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)),
+        add,
+    ).inner;
+    form_trail(0.0);
+    r
+}
+
+/// A line of text in the controls' column, wrapping to it.
+fn form_line(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let text = text.into();
+    form_column(ui, |ui| ui.label(text))
+}
+
+/// A live readout, or a warning, under a setting: `text` in `color`.
+fn form_status(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
+    form_line(ui, egui::RichText::new(text).size(crate::settings::ui_size(FORM_NOTE_PT)).color(color))
+}
+
+/// The note that ends a setting: under its controls, in the hint colour.
+fn form_note(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let r = form_status(ui, text, crate::settings::tinted_gray(140));
+    form_gap(ui);
+    r
+}
+
+/// A line under a section's title or a group's, from the page's edge: what the group is.
+fn form_group_line(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.label(text);
+    ui.add_space(FORM_GAP * 0.5);
+    form_trail(FORM_GAP * 0.5);
+}
+
+/// [`form_group_line`] as a note, in the hint colour.
+fn form_group_note(ui: &mut egui::Ui, text: &str) {
+    form_group_line(ui, egui::RichText::new(text).size(crate::settings::ui_size(FORM_NOTE_PT)).color(crate::settings::tinted_gray(140)));
+}
+
+/// A value box beside a slider, as wide as every other.
+fn form_value(ui: &mut egui::Ui, value: egui::DragValue<'_>) -> egui::Response {
+    ui.add_sized([FORM_VALUE_W, ui.spacing().interact_size.y], value)
+}
+
+/// A folder's path after its buttons, cut to the room left - all of it in its hover - or
+/// `none` when there's none.
+fn form_path(ui: &mut egui::Ui, path: Option<&str>, none: &str) {
+    let text = path.unwrap_or(none);
+    let shown = ui.add(egui::Label::new(
+        egui::RichText::new(text).size(crate::settings::ui_size(FORM_NOTE_PT)).color(crate::settings::tinted_gray(170)),
+    ).truncate());
+    if path.is_some() {
+        shown.on_hover_text(text);
+    }
+}
+
+/// One system-wide hotkey: its name, and a button showing its chord - click it, then press
+/// the new modifier + key, which goes to `value` and to `shared` (the hotkey thread's copy).
+/// `what` finishes the button's hover: what pressing the hotkey does. True when it changed.
+fn key_shortcut_row(
+    ui: &mut egui::Ui, name: &str, what: &str, learning: &mut bool,
+    value: &mut settings::PinShortcut, shared: &std::sync::RwLock<settings::PinShortcut>,
+) -> bool {
+    form_row(ui, name, "", |ui| {
+        let text = if *learning { "Press chord…".to_string() } else { value.label() };
+        let mut btn = egui::Button::new(egui::RichText::new(text).size(crate::settings::ui_size(12.0)));
+        if *learning {
+            btn = btn.fill(egui::Color32::from_rgb(80, 60, 30))
+                     .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(200, 160, 80)));
+        }
+        let hover = if *learning {
+            "Press the new shortcut (modifier + key).\nClick again to cancel.".to_string()
+        } else {
+            format!("Click to re-bind. Press the shortcut anywhere on the system to {what}.")
+        };
+        if ui.add(btn).on_hover_text(hover).clicked() {
+            *learning = !*learning;
+        }
+    });
+    if !*learning {
+        return false;
+    }
+    let ctx = ui.ctx().clone();
+    let pressed: Option<egui::Key> = ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Key { key, pressed: true, repeat: false, .. } => Some(*key),
+            _ => None,
+        })
+    });
+    let Some(key) = pressed else { return false };
+    let m = ctx.input(|i| i.modifiers);
+    *value = settings::PinShortcut {
+        ctrl:  m.ctrl,
+        shift: m.shift,
+        alt:   m.alt,
+        win:   m.command && !m.ctrl,
+        key:   Some(format!("{:?}", key)),
+    };
+    if let Ok(mut s) = shared.write() {
+        *s = value.clone();
+    }
+    *learning = false;
+    true
 }
 
 /// The Performance section's live readout: per-second rates differenced from
@@ -2689,4 +2548,108 @@ fn live_rates(ctx: &egui::Context) -> LiveRates {
     }
     ctx.request_repaint_after(Duration::from_millis(250));
     r
+}
+
+#[cfg(test)]
+mod form_tests {
+    use super::*;
+
+    /// A page drawn as the Settings page is: a setting of each kind, names short and long.
+    /// Where each control starts goes to `edges`.
+    fn sample_page(ui: &mut egui::Ui, edges: &mut Vec<(&'static str, f32)>) {
+        form_page(ui.available_width());
+        let (mut v, mut w, mut on, mut off) = (0.5_f32, 120.0_f32, true, false);
+        settings_section_header(ui, "Display");
+        form_subheading(ui, "Appearance");
+        form_row(ui, "Contrast", "", |ui| {
+            let r = ui.add(egui::Slider::new(&mut v, -1.0..=1.0).show_value(false));
+            edges.push(("a slider", r.rect.left()));
+            form_value(ui, egui::DragValue::new(&mut v).fixed_decimals(2));
+        });
+        let r = form_note(ui, "Adjusts panel/widget background lightness. Negative = darker, positive = lighter. Double-click the slider to reset to 0.50.");
+        edges.push(("a note", r.rect.left()));
+        form_row(ui, "Background repaint rate", "", |ui| {
+            let r = ui.add(egui::Slider::new(&mut w, 1.0..=240.0).suffix(" Hz"));
+            edges.push(("a slider beside a long name", r.rect.left()));
+        });
+        form_subheading(ui, "Workspace");
+        let r = form_check(ui, "On launch", true, &mut on, "Keep open tabs", "");
+        edges.push(("a checkbox", r.rect.left()));
+        let r = form_check(ui, "", true, &mut off, "Show FlexInput's own virtual controllers in the physical-devices panel, which wraps", "");
+        edges.push(("a checkbox with no name", r.rect.left()));
+        form_row(ui, "After FlexInput exits", "", |ui| {
+            let r = egui::ComboBox::from_id_salt("keep").selected_text("Only manually hidden").show_ui(ui, |_| {}).response;
+            edges.push(("a dropdown", r.rect.left()));
+        });
+        form_data_row(ui, "loopMIDI Port 1 (a long port name) → loopMIDI Port 1 (a long port name)", "", |ui| {
+            let r = ui.label("echoes seen — cancelled");
+            edges.push(("a line beside a listed name that wraps", r.rect.left()));
+        });
+        let r = form_status(ui, "Now: polling 1000 Hz · output 1000 Hz · virtual mouse idle", crate::settings::tinted_gray(170));
+        edges.push(("a live readout", r.rect.left()));
+        form_row(ui, "User presets", "", |ui| {
+            let r = ui.button("Browse…");
+            edges.push(("a button", r.rect.left()));
+            let _ = ui.add_enabled(false, egui::Button::new("Clear"));
+            form_path(ui, Some("C:/Users/someone/Documents/FlexInput/presets/a folder with a long name"), "(none)");
+        });
+        form_note(ui, "Folder scanned for your own .fxsp sub-patch presets, beside the factory presets shipped under app/assets/sub-patches/.");
+    }
+
+    fn draw(ctx: &egui::Context, size: egui::Vec2) -> (Vec<(&'static str, f32)>, egui::Rect, Vec<egui::epaint::ClippedShape>, egui::TexturesDelta) {
+        let mut edges = Vec::new();
+        let mut page = egui::Rect::NOTHING;
+        let mut delta = egui::TexturesDelta::default();
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    edges.clear();
+                    page = ui.max_rect();
+                    sample_page(ui, &mut edges);
+                });
+            });
+            delta.append(out.textures_delta);
+            shapes = out.shapes;
+        }
+        (edges, page, shapes, delta)
+    }
+
+    /// Every setting's controls start at one edge - a slider, a checkbox, a dropdown, a
+    /// button, a note and a live readout alike - just past the widest setting's name: a port
+    /// pair's long name wraps in the column rather than pushing its line out or widening the
+    /// column for the page.
+    #[test]
+    fn a_settings_controls_line_up_past_the_names() {
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        for width in [560.0, 900.0] {
+            let (edges, page, _, _) = draw(&ctx, egui::vec2(width, 900.0));
+            let (_, first) = edges[0];
+            for (what, x) in &edges {
+                assert!((x - first).abs() < 0.5, "at {width} wide {what} starts at {x}, the others at {first}: {edges:?}");
+            }
+            let body = egui::TextStyle::Body.resolve(&ctx.style());
+            let widest = ctx.fonts_mut(|f| f.layout_no_wrap("Background repaint rate".into(), body, egui::Color32::WHITE)).size().x;
+            let gap = first - page.left() - widest;
+            assert!(gap > 4.0 && gap < 20.0, "at {width} wide the controls start {gap} past the widest name");
+        }
+    }
+
+    /// A picture of the page, for looking at: `cargo test -p flexinput-ui --lib shoot_settings_form -- --ignored`
+    /// writes `target/module_shots/settings_form.png`.
+    #[test]
+    #[ignore = "writes a picture, asserts nothing"]
+    fn shoot_settings_form() {
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let size = egui::vec2(620.0, 760.0);
+        let (_, _, shapes, delta) = draw(&ctx, size);
+        let mut shot = crate::canvas::shot::Shot::default();
+        shot.absorb(&delta);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots/settings_form.png");
+        shot.save(&ctx, &shapes, egui::Rect::from_min_size(egui::Pos2::ZERO, size), 1.5, &path).expect("the picture saves");
+        println!("{}", path.display());
+    }
 }

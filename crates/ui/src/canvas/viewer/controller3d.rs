@@ -143,6 +143,33 @@ fn controller3d_trace(
 /// instances. Draws the styled background, the model (cropped to the visible
 /// area, tinted) or an error hint, and an optional outline into `full_rect`.
 /// Does NOT allocate — the caller reserves `full_rect` first.
+/// `instance` for this view, made its own when another view in this pass of this viewport
+/// already drew with it. A module draws its model under one id wherever it's drawn - 3DOF
+/// to 2D's preview under its node's - so the same module twice in view (pinned whole, and
+/// its preview pinned beside it) shared the renderer's buffers: the second's camera drew
+/// both, and the depth readback for the x-ray mapped its buffer before the copy into it was
+/// submitted, which crashed the app. A repeat gets a key of its own, the same each frame
+/// while the views are drawn in the same order.
+fn view_instance(ctx: &egui::Context, instance: u64) -> u64 {
+    let pass = ctx.cumulative_pass_nr();
+    let id = egui::Id::new(("c3d_instances_this_pass", ctx.viewport_id()));
+    ctx.data_mut(|d| {
+        let (at, used) = d.get_temp_mut_or_default::<(u64, Vec<u64>)>(id);
+        if *at != pass {
+            *at = pass;
+            used.clear();
+        }
+        let mut key = instance;
+        let mut n: u64 = 0;
+        while used.contains(&key) {
+            n += 1;
+            key = instance ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        used.push(key);
+        key
+    })
+}
+
 pub(crate) fn render_controller3d_core(
     ui: &mut egui::Ui,
     // Stable per-viewer id. ❗ GPU callback resources are a type-map SHARED by
@@ -162,6 +189,7 @@ pub(crate) fn render_controller3d_core(
     composite: f32,
 ) {
     use crate::model;
+    let instance = view_instance(ui.ctx(), instance);
     match model::load_model_cached(resolved) {
         Some(m) => {
             ui.painter_at(full_rect).rect_filled(full_rect, 4.0, bg);
@@ -681,6 +709,35 @@ mod capacitive_glow_tests {
         let live = controller3d_live(&signals, &[dev], &egui::Context::default(), 1, 0.25, [1.0; 3], [0.0; 2], 0.3);
         assert_eq!(live.touch_pressure, [Some(0.4), None]);
         assert!(crate::model::callback::touch_dot_alpha(live.touch_pressure[0]) < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod view_instance_tests {
+    use super::view_instance;
+
+    // A module's model drawn twice in one pass - pinned whole, and its preview pinned
+    // beside it - gets two keys for the renderer, not one they'd share (the second's camera
+    // drew both, and the x-ray's readback crashed the app); the same two again next pass,
+    // so each view keeps its buffers.
+    #[test]
+    fn the_same_model_twice_in_a_pass_gets_a_key_each() {
+        let ctx = egui::Context::default();
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            let mut pass = Vec::new();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                pass.push(view_instance(ctx, 7));
+                pass.push(view_instance(ctx, 7));
+                pass.push(view_instance(ctx, 9));
+            });
+            keys.push(pass);
+        }
+        let first = &keys[0];
+        assert_eq!(first[0], 7, "the first view keeps its own id");
+        assert_ne!(first[1], first[0], "the second gets one of its own");
+        assert_eq!(first[2], 9);
+        assert!(keys.iter().all(|k| k == first), "the same keys every pass: {keys:?}");
     }
 }
 
@@ -1290,7 +1347,7 @@ pub(crate) fn show_controller3d_body(
             // higher = more overhead). Defaults to a 3/4 overhead view.
             let shown = format!("{pitch_deg:.0}°");
             if super::curve_rows::real_pill(ui, node_id, "c3d_view", at(0), "view|view angle", &mut pitch_deg, &shown, 0.0..=85.0, 0.4,
-                "Camera elevation above the controller.\n0° = front/level, higher = more overhead.")
+                "Camera elevation above the controller.\n0° = front/level, higher = more overhead.", C3D_DEFAULT_PITCH_DEG)
             {
                 write("cam_pitch", serde_json::json!(pitch_deg));
             }
@@ -1301,7 +1358,7 @@ pub(crate) fn show_controller3d_body(
             // the shell.
             let shown = format!("{opacity:.2}");
             if super::curve_rows::real_pill(ui, node_id, "c3d_alpha", at(1), "alpha|model opacity", &mut opacity, &shown, 0.1..=1.0, 0.004,
-                "Whole-model transparency (see-through).")
+                "Whole-model transparency (see-through).", 1.0)
             {
                 write("overlay_alpha", serde_json::json!(opacity));
             }
@@ -1309,7 +1366,7 @@ pub(crate) fn show_controller3d_body(
             // Active-input highlight fade time (how long a press glow lingers).
             let shown = format!("{tail:.2} s");
             if super::curve_rows::real_pill(ui, node_id, "c3d_fade", at(2), "fade|highlight fade", &mut tail, &shown, 0.05..=2.0, 0.008,
-                "How long the active-input highlight takes to fade out.")
+                "How long the active-input highlight takes to fade out.", 0.25)
             {
                 write("highlight_tailoff", serde_json::json!(tail));
             }
@@ -1317,7 +1374,7 @@ pub(crate) fn show_controller3d_body(
             // How brightly touched capacitive sensors light.
             let shown = format!("{touch_glow:.2}");
             if super::curve_rows::real_pill(ui, node_id, "c3d_touch", at(3), "touch|touch sensors", &mut touch_glow, &shown, 0.0..=1.0, 0.004,
-                "How brightly a touched capacitive sensor lights, on pads\nthat have them: the stick caps and grips of a Steam\nController. A stick click still lights its cap fully.\n0 = not shown.")
+                "How brightly a touched capacitive sensor lights, on pads\nthat have them: the stick caps and grips of a Steam\nController. A stick click still lights its cap fully.\n0 = not shown.", 0.3)
             {
                 write("capacitive_glow", serde_json::json!(touch_glow));
             }
@@ -1329,7 +1386,7 @@ pub(crate) fn show_controller3d_body(
                  the accelerometer), then let it drift back. 0 = off.\n\
                  Needs the Orientation input wired: the reading is turned\n\
                  into world axes with it, so turning the pad doesn't\n\
-                 read as moving it.")
+                 read as moving it.", 0.5)
             {
                 write("motion_cue", serde_json::json!(motion));
             }
@@ -1341,7 +1398,7 @@ pub(crate) fn show_controller3d_body(
                 "When a pressed input shows through the shell: once less than this\n\
                  much of it is in view. Raise it for inputs that only peek out past\n\
                  the shell, like a pad's back buttons, which at a small size read as\n\
-                 barely lit. 0 = never.")
+                 barely lit. 0 = never.", crate::model::callback::GHOST_VIS_LOW * 100.0)
             {
                 write("xray_visible", serde_json::json!(xray_pct / 100.0));
             }

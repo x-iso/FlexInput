@@ -148,6 +148,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
         0.0,
         lo as f64..=hi as f64,
         super::simple_bodies::PillFill::span(f64::from(freq_p), lo as f64..=hi as f64),
+        None,
     );
     let freq_resp = freq_resp.on_hover_text(if freq_wired {
         "The frequency the wire is driving - unplug it to set this here."
@@ -207,6 +208,7 @@ pub(crate) fn show_oscillator_body(node_id: NodeId, inputs: &[InPin], ui: &mut e
         0.0,
         0.0..=1.0,
         super::simple_bodies::PillFill::span(f64::from(phase_p), 0.0..=1.0),
+        None,
     );
     let phase_resp = phase_resp.on_hover_text(if phase_wired {
         "The offset the wire is driving - unplug it to set this here."
@@ -469,7 +471,7 @@ pub(crate) fn paint_envelope_curve_graph(
     if show_grid_labels {
         const MIN_LABEL_PX: f32 = 20.0;
         let label_col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-        let font = crate::settings::ui_font(9.0);
+        let font = crate::settings::graph_font(9.0);
         let mut last_sx = f32::NEG_INFINITY;
         for &u in &grid_x_positions {
             let sx = c2s(u, 1.0).x;
@@ -1123,6 +1125,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             0.0,
                             lo as f64..=hi as f64,
                             super::simple_bodies::PillFill::span(f64::from(time_mul), lo as f64..=hi as f64),
+                            None,
                         );
                         if let Some(v) = typed {
                             time_mul = v as f32;
@@ -1280,6 +1283,7 @@ pub(crate) fn show_envelope_body(node_id: NodeId, inputs: &[InPin], ui: &mut egu
                             16.0,
                             1.0..=20.0,
                             super::simple_bodies::PillFill::span(*value, 1.0..=20.0),
+                            None,
                         );
                         if let Some(v) = typed {
                             *value = v.round().clamp(1.0, 20.0);

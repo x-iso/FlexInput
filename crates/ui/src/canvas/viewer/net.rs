@@ -153,7 +153,7 @@ pub(crate) fn net_num_param(
     // A drag the length of the pill covers a useful part of the range, not all of it: a
     // port is typed, a rate is nudged.
     let per_px = (((*range.end() - *range.start()) / 2000.0) as f32).max(0.2);
-    if super::curve_rows::count_pill(ui, node_id, key, rect, &word, &mut v, &shown, range, per_px, label) {
+    if super::curve_rows::count_pill(ui, node_id, key, rect, &word, &mut v, &shown, range, per_px, label, None) {
         if let Some(node) = snarl.get_node_mut(node_id) {
             if let Some(n) = Number::from_f64(v.round()) {
                 node.params.insert(key.to_string(), Value::Number(n));

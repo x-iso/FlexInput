@@ -1449,6 +1449,48 @@ fn a_quantize_factor_can_be_typed_exactly() {
 }
 
 #[test]
+fn a_double_click_on_a_pills_word_puts_it_back() {
+    // The word before a pill's value is where it goes back to its default: Quantize's ÷ to 1,
+    // after 7 was typed. The value cell's double-click still opens the field.
+    let (mut rig, ids) = Rig::real("math.quantize", &[egui::pos2(100.0, 300.0)]);
+    let node = ids[0];
+    let factor = |rig: &Rig| {
+        rig.canvas
+            .snarl
+            .get_node(node)
+            .and_then(|n| n.params.get("factor").and_then(|v| v.as_f64()))
+    };
+    let pill = rig.traced(node, "quantize_factor_pill");
+    rig.double_click(pill.center());
+    rig.type_text("7");
+    assert_eq!(factor(&rig), Some(7.0));
+    // A second later: two more clicks straight after the first two are a triple-click.
+    rig.idle(30);
+    rig.double_click(egui::pos2(pill.left() + 4.0, pill.center().y));
+    assert_eq!(factor(&rig), Some(1.0), "a double-click on ÷ put the factor back to 1");
+}
+
+#[test]
+fn a_modules_words_are_as_big_as_its_pills() {
+    // Section titles, a row's caption and the words beside a value were egui's small style -
+    // 9 points beside the pills' 15. They are drawn at the pills' size now: 3DOF to 2D's
+    // "2D Output mode" heading and "Pointer" caption as tall as its "recenter" pill's word.
+    let (rig, _) = Rig::real("processing.gyro_3dof", &[egui::pos2(100.0, 100.0)]);
+    let height = |text: &str| {
+        rig.painted_all(text).into_iter().find(|(t, _)| t == text).map(|(_, r)| r.height())
+            .unwrap_or_else(|| panic!("{text} isn't drawn"))
+    };
+    let pill = height("recenter");
+    for word in ["2D Output mode", "Pointer", "Edge turn"] {
+        let h = height(word);
+        assert!((h - pill).abs() <= pill * 0.12, "{word} is {h} tall beside the pill's {pill}");
+    }
+    // A graph's labels keep their own size (and their own setting): the preview's legend.
+    let legend = height("output");
+    assert!(legend < pill * 0.85, "the preview's legend is {legend} tall, the pill's word {pill}");
+}
+
+#[test]
 fn a_small_module_holds_its_two_blocks_without_the_grid() {
     // The grid rounds a frame up to whole blocks, which is what hid the fact that these
     // bodies ask for less than two blocks of their own content. With the sizing off, the

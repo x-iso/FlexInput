@@ -242,8 +242,10 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
 /// after the sub-patch editors). No-op while hidden.
 pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     if !overlay_visible(ctx) {
+        crate::monitors::overlay_closed(ctx, "info");
         return;
     }
+    let frames_open = crate::monitors::overlay_frames_open(ctx, "info");
 
     // Cover the monitor picked in the header (`crate::monitors`), the primary
     // until one is; the viewport puts itself exactly there once open.
@@ -300,6 +302,10 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     anchor: Default::default(),
                     pin_style: Some(2),
                     zoom: None,
+                    hidden_sections: Vec::new(),
+                    sections_open: false,
+                    graph_labels: None,
+                    text_max: None,
                 },
             ));
             let idx = overlay_layout.items.len() - 1;
@@ -328,11 +334,12 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
 
     let mut exit_edit = false;
 
-    ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
+    crate::monitors::with_settle_passes(ctx, "info", frames_open, || ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Self-correct geometry from INSIDE the viewport: the builder size was
         // computed from the parent's monitor before the child window existed
         // (wrong DPI/monitor possible). The child's own input has the truth.
-        crate::monitors::keep_overlay_on_monitor(vctx);
+        let moved = crate::monitors::keep_overlay_on_monitor(vctx);
+        let hidden = crate::monitors::settle_overlay_frame(vctx, "info", frames_open, moved);
 
         // Mouse passthrough follows the mode; only send the command when the
         // desired state changes (each send is a SetWindowLong round-trip).
@@ -413,6 +420,11 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(vctx, |ui| {
+                // Still being moved onto its monitor: nothing laid out for the wrong place,
+                // and an edited layout's items not re-anchored to it.
+                if hidden {
+                    return;
+                }
                 let rect = ui.max_rect();
 
                 if pick {
@@ -446,7 +458,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     overlay_edit_toolbar(ui, rect, tab_snarl, overlay_layout, &mut exit_edit);
                 }
             });
-    });
+    }));
 
     if exit_edit {
         set_overlay_edit(ctx, false);
@@ -671,5 +683,68 @@ mod toolbar_shots {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/module_shots/overlay_tabs.png");
         shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
         println!("{}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod first_frame_tests {
+    /// Where a row pinned on an overlay (3DOF to 2D's steering options, in their first look)
+    /// draws its "re-center" on the overlay's first frame and once settled - its frames
+    /// settled as an overlay's are (`monitors::settle_overlay_frame`) or not.
+    fn first_and_settled(as_overlay: bool) -> (egui::Rect, egui::Rect) {
+        use crate::canvas::node::{LayoutItem, NodeData};
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut snarl: egui_snarl::Snarl<NodeData> = egui_snarl::Snarl::new();
+        let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor)
+            .find(|d| d.id == "processing.gyro_3dof").expect("3DOF");
+        let node = snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc));
+        let mut layout = crate::canvas::OverlayLayout::default();
+        layout.items.push(LayoutItem::Module(serde_json::from_value(serde_json::json!({
+            "inner_node_id": node.0, "element_id": "steering_opts", "pos": [40.0, 40.0], "size": [520.0, 70.0],
+            "pin_style": 1,
+        })).expect("a pin")));
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let panic = crate::app::PanicShortcut::default();
+        let mut at = Vec::new();
+        for t in 0..7u32 {
+            let raw = egui::RawInput { screen_rect: Some(screen), time: Some(t as f64 / 30.0), ..Default::default() };
+            let run = || ctx.run(raw, |ctx| {
+                if as_overlay {
+                    crate::monitors::settle_overlay_frame(ctx, "first_frame_test", t, false);
+                }
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                    crate::canvas::overlay_body::show_overlay_body(
+                        ui, screen, &mut snarl, &mut layout, false, &Default::default(), &panic,
+                    );
+                });
+            });
+            let out = if as_overlay { crate::monitors::with_settle_passes(&ctx, "first_frame_test", t, run) } else { run() };
+            fn walk(s: &egui::Shape, out: &mut Option<egui::Rect>) {
+                match s {
+                    egui::Shape::Text(t) if t.galley.text() == "re-center" => *out = Some(t.galley.rect.translate(t.pos.to_vec2())),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut found = None;
+            out.shapes.iter().for_each(|c| walk(&c.shape, &mut found));
+            at.push(found.expect("the row's words"));
+        }
+        (at[0], at[6])
+    }
+
+    // An overlay's window is made afresh each time it opens, and a pinned row in its first look
+    // scales to the size it measured the frame before - so on the frame it opened it came out
+    // at a guess, and jumped into place a frame later. That frame is laid out twice now, and
+    // the one shown is where it stays.
+    #[test]
+    fn an_overlays_first_frame_has_its_widgets_in_place() {
+        let (first, settled) = first_and_settled(false);
+        assert!((first.min - settled.min).length() > 1.0 || (first.size() - settled.size()).length() > 1.0,
+            "a first frame already in place shows nothing: {first:?} {settled:?}");
+        let (first, settled) = first_and_settled(true);
+        assert!((first.min - settled.min).length() < 0.5 && (first.size() - settled.size()).length() < 0.5,
+            "the first frame's row at {first:?}, settled at {settled:?}");
     }
 }

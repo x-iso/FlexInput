@@ -28,10 +28,17 @@ pub(crate) fn publish_nav_focus_field(
     element: &str,
     idx: usize,
 ) {
-    let pass = ctx.cumulative_pass_nr();
+    let pass = crate::widgets::nav_pass(ctx);
     ctx.data_mut(|d| {
         d.insert_temp(egui::Id::new(("gp_nav_focus_field", inner_id.0, element.to_string())), (pass, idx))
     });
+}
+
+/// Whether something the nav driver stamped with `pass` is still current where `ui` draws: a
+/// few nav passes old at most - counted in the main window's passes, which the driver runs in,
+/// not this viewport's - and drawn in the window the pad drives (`widgets::nav_drives_view`).
+fn nav_fresh(ui: &egui::Ui, pass: u64) -> bool {
+    crate::widgets::nav_pass(ui.ctx()).saturating_sub(pass) <= 4 && crate::widgets::nav_drives_view(ui.ctx())
 }
 
 /// The focused field for this element, if nav published one recently.
@@ -43,7 +50,7 @@ pub(crate) fn nav_focus_field(ui: &egui::Ui, inner_id: NodeId) -> Option<usize> 
         d.get_temp(egui::Id::new(("gp_nav_cur_element", inner_id.0)))).unwrap_or_default();
     let (pass, idx): (u64, usize) = ui.ctx().data(|d|
         d.get_temp(egui::Id::new(("gp_nav_focus_field", inner_id.0, element))))?;
-    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(idx)
+    nav_fresh(ui, pass).then_some(idx)
 }
 
 /// Where the pad's token cursor sits in a JSM config, published by the nav
@@ -56,7 +63,7 @@ pub(crate) fn publish_jsm_cursor(
     inner_id: NodeId,
     cur: flexinput_engine::eval::JsmCursor,
 ) {
-    let pass = ctx.cumulative_pass_nr();
+    let pass = crate::widgets::nav_pass(ctx);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_cursor", inner_id.0)), (pass, cur)));
 }
 
@@ -70,7 +77,7 @@ pub(crate) fn jsm_nav_cursor(
 ) -> Option<flexinput_engine::eval::JsmCursor> {
     let (pass, cur): (u64, flexinput_engine::eval::JsmCursor) =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_cursor", inner_id.0))))?;
-    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(cur)
+    nav_fresh(ui, pass).then_some(cur)
 }
 
 /// Ask the nav driver to put its cursor somewhere.
@@ -106,28 +113,26 @@ pub(crate) fn take_jsm_cursor_request(
 
 /// Which pane of a JSM editor the pad is driving, for the body to show.
 pub(crate) fn publish_jsm_pane(ctx: &egui::Context, inner_id: NodeId, pane: &'static str) {
-    let pass = ctx.cumulative_pass_nr();
+    let pass = crate::widgets::nav_pass(ctx);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_pane", inner_id.0)), (pass, pane)));
 }
 
 pub(crate) fn jsm_nav_pane(ui: &egui::Ui, inner_id: NodeId) -> Option<&'static str> {
     let (pass, pane): (u64, &'static str) =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_pane", inner_id.0))))?;
-    (ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4).then_some(pane)
+    nav_fresh(ui, pass).then_some(pane)
 }
 
 /// Whether the pad is holding the editor's modifier, so the body can show it.
 pub(crate) fn publish_jsm_chord(ctx: &egui::Context, inner_id: NodeId, held: bool) {
-    let pass = ctx.cumulative_pass_nr();
+    let pass = crate::widgets::nav_pass(ctx);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new(("jsm_nav_chord", inner_id.0)), (pass, held)));
 }
 
 pub(crate) fn jsm_nav_chord(ui: &egui::Ui, inner_id: NodeId) -> bool {
     let held: Option<(u64, bool)> =
         ui.ctx().data(|d| d.get_temp(egui::Id::new(("jsm_nav_chord", inner_id.0))));
-    held.is_some_and(|(pass, h)| {
-        h && ui.ctx().cumulative_pass_nr().saturating_sub(pass) <= 4
-    })
+    held.is_some_and(|(pass, h)| h && nav_fresh(ui, pass))
 }
 
 /// Inside a whole-module widget (its parts being collected for `inner_id`), the fields of its
@@ -440,5 +445,45 @@ mod tests {
             });
         }
         assert_eq!(cached(&ctx), Some(taller));
+    }
+}
+
+#[cfg(test)]
+mod nav_marker_scope_tests {
+    use super::*;
+
+    /// Whether node 7's pane highlight shows in a frame of `ctx` drawn as viewport `here`,
+    /// with the pad driving `view` and the highlight `age` nav passes old.
+    fn shows(view: egui::ViewportId, here: egui::ViewportId, age: u64) -> bool {
+        let ctx = egui::Context::default();
+        let node = NodeId(7);
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(crate::widgets::NAV_VIEW_KEY), view);
+            d.insert_temp(egui::Id::new(crate::widgets::NAV_PASS_KEY), 100u64);
+            d.insert_temp(egui::Id::new(("jsm_nav_pane", node.0)), (100u64 - age, "Tune"));
+        });
+        let mut seen = None;
+        let mut input = egui::RawInput { viewport_id: here, ..Default::default() };
+        input.viewports.insert(here, egui::ViewportInfo::default());
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| seen = jsm_nav_pane(ui, node));
+        });
+        seen.is_some()
+    }
+
+    // The pad drives one copy of a node - pinned on the Easy body, or on the config overlay -
+    // and the same node drawn elsewhere, on a sub-patch editor's canvas in a window of its
+    // own, wore the driven copy's highlights. Counted in that window's own passes, far behind
+    // the main window's, they never went stale there either: the frame round the tune strip
+    // stayed on after the pad had left.
+    #[test]
+    fn a_pane_highlight_shows_only_where_the_pad_drives() {
+        let root = egui::ViewportId::ROOT;
+        let editor = egui::ViewportId::from_hash_of("a sub-patch editor");
+        assert!(shows(root, root, 1), "on the copy the pad drives");
+        assert!(!shows(root, editor, 1), "on another window's copy");
+        assert!(!shows(root, root, 40), "once the pad has moved on");
+        let overlay = crate::canvas::viewer::config_overlay_viewport();
+        assert!(shows(overlay, overlay, 0) && !shows(overlay, root, 0), "the config overlay's, when it drives that");
     }
 }

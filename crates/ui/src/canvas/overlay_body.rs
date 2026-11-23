@@ -445,7 +445,7 @@ pub(crate) fn show_overlay_body(
                     let iv_style_ov = m.iv_style_override.clone();
                     let menu_style_ov = m.menu_style_override;
                 let pin_style = m.pin_style.unwrap_or(1);
-                let zoom = m.zoom.unwrap_or(1.0);
+                let look = crate::canvas::node::WidgetLook::of(m);
                     let outer_snap_ref = outer_snapshot.as_ref();
                     let path = m.source_path.clone();
                     ui.scope_builder(egui::UiBuilder::new().max_rect(item_rect), |ui| {
@@ -464,7 +464,7 @@ pub(crate) fn show_overlay_body(
                                         inner_id, &module_id, &element_id, ui, tab_snarl,
                                         mod_size, live_signals, panic_shortcut, None,
                                         None, OVERLAY_TOP_OUTER, edit, graph_ov, iv_style_ov,
-                                        menu_style_ov, pin_style, zoom,
+                                        menu_style_ov, pin_style, &look,
                                     );
                                 }
                                 [sp] => {
@@ -478,7 +478,7 @@ pub(crate) fn show_overlay_body(
                                             inner_id, &module_id, &element_id, ui, inner_snarl,
                                             mod_size, live_signals, panic_shortcut, None,
                                             outer_snap_ref, sp_node, edit, graph_ov, iv_style_ov,
-                                            menu_style_ov, pin_style, zoom,
+                                            menu_style_ov, pin_style, &look,
                                         );
                                     }
                                 }

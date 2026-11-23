@@ -45,6 +45,7 @@ pub(crate) use jsm::knobs_of as jsm_knobs_of;
 pub(crate) use jsm::nav_nudge_knob as jsm_nav_nudge_knob;
 pub(crate) use jsm::nav_toggle_pair as jsm_nav_toggle_pair;
 pub(crate) use jsm_widgets::knob_name_of as jsm_knob_name_of;
+pub(crate) use jsm_widgets::knob_element_id as jsm_knob_element_id;
 // The pad drives the command list by asking it to move, not by index: see
 // `CommandList`.
 pub(crate) use jsm_widgets::{command_list_state, set_command_list_state};
@@ -320,6 +321,25 @@ pub(crate) fn show_module_body(
     body_h: f32,
     kit_w: f32,
 ) -> BodyAsks {
+    // Its words - section titles, captions, the words beside a value - at its pills' size.
+    simple_bodies::with_label_size(ui, |ui| {
+        show_module_body_inner(cx, module_id, node_id, inputs, outputs, ui, snarl, body_w, body_h, kit_w)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_module_body_inner(
+    cx: &BodyCtx<'_>,
+    module_id: &str,
+    node_id: NodeId,
+    inputs: &[InPin],
+    outputs: &[OutPin],
+    ui: &mut egui::Ui,
+    snarl: &mut Snarl<NodeData>,
+    body_w: f32,
+    body_h: f32,
+    kit_w: f32,
+) -> BodyAsks {
     let mut asks = BodyAsks::default();
     match module_id {
         "device.sink"          => show_sink_body(node_id, inputs, ui, snarl, cx.automap_parent),
@@ -484,6 +504,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
+        // Its small words ("Labels" beside the labels pick) at the pills' size, as in the
+        // body; its title keeps its own. Put back at the end.
+        let saved_style = ui.style().clone();
+        ui.style_mut().text_styles.insert(egui::TextStyle::Small, simple_bodies::label_font());
         // Where the header's first row is, laid out rather than clipped, for the sockets
         // drawn on it (`header_row_y`): as a distance from the node's top, which folding the
         // node or a category in its body never changes. The top it's drawn at: on its way
@@ -1936,6 +1960,7 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                 }
             }
         });
+        ui.set_style(saved_style);
     }
 
     fn inputs(&mut self, node: &NodeData) -> usize {

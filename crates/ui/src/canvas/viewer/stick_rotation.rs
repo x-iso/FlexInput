@@ -184,7 +184,7 @@ pub(crate) fn show_stick_rotation_body(
             let pr = egui::Rect::from_min_max(r.min, egui::pos2(r.right() - iw - super::kit::GAP, r.bottom()));
             let tr = egui::Rect::from_min_max(egui::pos2(r.right() - iw, r.top()), r.max);
             let shown = format!("{sens:.2}×");
-            if super::curve_rows::real_pill(ui, node_id, "sr_sens", pr, "sens|sensitivity", &mut sens, &shown, 0.0..=10.0, 0.01, SENS_TIP) {
+            if super::curve_rows::real_pill(ui, node_id, "sr_sens", pr, "sens|sensitivity", &mut sens, &shown, 0.0..=10.0, 0.01, SENS_TIP, STICK_ROT_SENS_DEFAULT) {
                 set.extend(number(STICK_ROT_SENS_PARAM, sens));
             }
             if super::curve_rows::word_toggle(ui, tr, &mut invert, "invert", INVERT_TIP, ("sr_invert", node_id)) {
@@ -197,7 +197,7 @@ pub(crate) fn show_stick_rotation_body(
         }
         ui.add_enabled_ui(relative, |ui| {
             let shown = format!("{ret:.0} ms");
-            if super::curve_rows::real_pill(ui, node_id, "sr_return", cells[2], "return|return time", &mut ret, &shown, 0.0..=2000.0, 2.0, RETURN_TIP) {
+            if super::curve_rows::real_pill(ui, node_id, "sr_return", cells[2], "return|return time", &mut ret, &shown, 0.0..=2000.0, 2.0, RETURN_TIP, STICK_ROT_RETURN_DEFAULT_MS) {
                 set.extend(number(STICK_ROT_RETURN_PARAM, ret));
             }
         });
@@ -215,23 +215,23 @@ pub(crate) fn show_stick_rotation_body(
             }
             ui.add_enabled_ui(take, |ui| {
                 let shown = format!("{speed:.0} °/s");
-                if super::curve_rows::real_pill(ui, node_id, "sr_take_dps", pr, "above|takes over above", &mut speed, &shown, 0.0..=120.0, 0.5, TAKEOVER_SPEED_TIP) {
+                if super::curve_rows::real_pill(ui, node_id, "sr_take_dps", pr, "above|takes over above", &mut speed, &shown, 0.0..=120.0, 0.5, TAKEOVER_SPEED_TIP, STICK_ROT_TAKEOVER_SPEED_DEFAULT) {
                     set.extend(number(STICK_ROT_TAKEOVER_SPEED_PARAM, speed));
                 }
                 let shown = format!("{outer:.2}");
-                if super::curve_rows::real_pill(ui, node_id, "sr_outer", cells[1], "outer|outer zone", &mut outer, &shown, 0.05..=1.0, 0.005, OUTER_TIP) {
+                if super::curve_rows::real_pill(ui, node_id, "sr_outer", cells[1], "outer|outer zone", &mut outer, &shown, 0.05..=1.0, 0.005, OUTER_TIP, STICK_ROT_OUTER_DEFAULT) {
                     set.extend(number(STICK_ROT_OUTER_PARAM, outer));
                 }
             });
             register_exposable_element(ui, node_id, "takeover", r.union(cells[1]));
         }
         let shown = format!("{dz:.2}");
-        if super::curve_rows::real_pill(ui, node_id, "sr_dz", cells[2], "dz|deadzone", &mut dz, &shown, 0.0..=0.95, 0.005, DEADZONE_TIP) {
+        if super::curve_rows::real_pill(ui, node_id, "sr_dz", cells[2], "dz|deadzone", &mut dz, &shown, 0.0..=0.95, 0.005, DEADZONE_TIP, STICK_ROT_DEADZONE_DEFAULT) {
             set.extend(number(STICK_ROT_DEADZONE_PARAM, dz));
         }
         register_exposable_element(ui, node_id, "deadzone", cells[2]);
         let shown = format!("{smooth:.0} ms");
-        if super::curve_rows::real_pill(ui, node_id, "sr_smooth", cells[3], "stab|stabilise", &mut smooth, &shown, 0.0..=500.0, 1.0, SMOOTH_TIP) {
+        if super::curve_rows::real_pill(ui, node_id, "sr_smooth", cells[3], "stab|stabilise", &mut smooth, &shown, 0.0..=500.0, 1.0, SMOOTH_TIP, 0.0) {
             set.extend(number(STICK_ROT_SMOOTH_PARAM, smooth));
         }
         register_exposable_element(ui, node_id, "stabilise", cells[3]);
@@ -483,7 +483,7 @@ pub(crate) fn paint_stick_rotation(
         egui::pos2(rect.center().x, rect.bottom() - 2.0),
         egui::Align2::CENTER_BOTTOM,
         text,
-        crate::settings::ui_font(11.0),
+        crate::settings::graph_font(11.0),
         if engaged { visuals.text_color() } else { weak },
     );
     rect

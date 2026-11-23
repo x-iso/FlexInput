@@ -385,11 +385,11 @@ pub(crate) fn vrs_pill_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl
             let cells = pill_bands(ui, w, &[110.0, 110.0]);
             let (mut im, mut om) = (p.in_max as f32, p.out_max as f32);
             let shown = format!("{im:.2}");
-            if real_pill(ui, node_id, "vrs_in_max", cells[0], "in↑|in max", &mut im, &shown, 0.05..=2.0, 0.01, "The input deflection that reads as full.") {
+            if real_pill(ui, node_id, "vrs_in_max", cells[0], "in↑|in max", &mut im, &shown, 0.05..=2.0, 0.01, "The input deflection that reads as full.", 1.0) {
                 if let Some(n) = Number::from_f64(im as f64) { set.push(("in_max", Value::Number(n))); }
             }
             let shown = format!("{om:.2}");
-            if real_pill(ui, node_id, "vrs_out_max", cells[1], "out↑|out max", &mut om, &shown, 0.05..=2.0, 0.01, "The output a full deflection gives.") {
+            if real_pill(ui, node_id, "vrs_out_max", cells[1], "out↑|out max", &mut om, &shown, 0.05..=2.0, 0.01, "The output a full deflection gives.", 1.0) {
                 if let Some(n) = Number::from_f64(om as f64) { set.push(("out_max", Value::Number(n))); }
             }
             rects.extend([cells[0], cells[1]]);
@@ -400,10 +400,10 @@ pub(crate) fn vrs_pill_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl
             let hv = split(cells[0], &[1.0, 1.0]);
             let (mut gx, mut gy) = (p.grid_x as f64, p.grid_y as f64);
             let (gx_shown, gy_shown) = (format!("{gx:.0}"), format!("{gy:.0}"));
-            if count_pill(ui, node_id, "vrs_grid_x", hv[0], "H", &mut gx, &gx_shown, 1.0..=16.0, 0.05, "Grid divisions across the curve.") {
+            if count_pill(ui, node_id, "vrs_grid_x", hv[0], "H", &mut gx, &gx_shown, 1.0..=16.0, 0.05, "Grid divisions across the curve.", 4.0) {
                 set.push(("grid_x", serde_json::json!(gx as i64)));
             }
-            if count_pill(ui, node_id, "vrs_grid_y", hv[1], "V", &mut gy, &gy_shown, 1.0..=16.0, 0.05, "Grid divisions up the curve.") {
+            if count_pill(ui, node_id, "vrs_grid_y", hv[1], "V", &mut gy, &gy_shown, 1.0..=16.0, 0.05, "Grid divisions up the curve.", 4.0) {
                 set.push(("grid_y", serde_json::json!(gy as i64)));
             }
             let mut sn = p.snap;
@@ -412,7 +412,7 @@ pub(crate) fn vrs_pill_row(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl
             }
             let mut tm = p.trail_ms as f32;
             let shown = format!("{} ms", p.trail_ms);
-            if real_pill(ui, node_id, "vrs_trail", cells[2], "trail", &mut tm, &shown, 0.0..=1000.0, 2.0, "How long the live point's trail on the pad lasts.") {
+            if real_pill(ui, node_id, "vrs_trail", cells[2], "trail", &mut tm, &shown, 0.0..=1000.0, 2.0, "How long the live point's trail on the pad lasts.", 300.0) {
                 set.push(("trail_ms", serde_json::json!(tm.round() as i64)));
             }
             rects.extend([hv[0], hv[1], cells[1], cells[2]]);
@@ -515,7 +515,7 @@ pub(crate) fn draw_reshape_curve_editor(
 
             // Corner labels: axis↔diagonal (X), and value extremes (Y).
             let lbl = Color32::from_rgba_unmultiplied(170, 170, 170, 150);
-            let f = crate::settings::ui_font(8.5);
+            let f = crate::settings::graph_font(8.5);
             painter.text(egui::pos2(rect.left() + 2.0, rect.bottom() - 1.0), egui::Align2::LEFT_BOTTOM, "axis", f.clone(), lbl);
             painter.text(egui::pos2(rect.right() - 2.0, rect.bottom() - 1.0), egui::Align2::RIGHT_BOTTOM, "diag", f.clone(), lbl);
             painter.text(egui::pos2(rect.left() + 2.0, rect.top() + 1.0), egui::Align2::LEFT_TOP, &format!("{:.2}", y_max), f.clone(), lbl);

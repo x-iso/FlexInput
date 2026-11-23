@@ -259,6 +259,14 @@ impl FlexInputApp {
         // `nav_selected_kind`, and the editors once entered).
         self.gamepad_nav.config_nav_sel = self.config_pin_outer_inner_elem();
 
+        // Select on a JSM fader the walk is on, whose setting splits or joins.
+        if let Some((outer, _, _)) = self.gamepad_nav.config_nav_sel.clone() {
+            if self.nav_jsm_pair_select(ctx, outer, nav) {
+                ctx.request_repaint();
+                return;
+            }
+        }
+
         // South / RT → enter the SAME editor the sub-patch canvas would, chosen
         // by widget kind (mirrors the Widget-level enters in nav_drive_subpatch).
         if nav.is_rising("btn_south") || (nav.rt_down && !self.gamepad_nav.prev_rt) {

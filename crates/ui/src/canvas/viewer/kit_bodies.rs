@@ -139,6 +139,7 @@ fn pill_at(
     shown: &str,
     value: f64,
     range: std::ops::RangeInclusive<f64>,
+    default: impl Into<Option<f64>>,
 ) -> (egui::Response, Option<f64>) {
     use super::simple_bodies::{value_pill_number, PILL_H};
     let rect = egui::Rect::from_min_size(left, egui::vec2(w, PILL_H));
@@ -148,7 +149,7 @@ fn pill_at(
     let label_w = super::simple_bodies::pill_label_width(ui, label);
     simple_bodies::trace_rect(ui, node_id, &format!("{salt}_pill"), rect);
     let fill = simple_bodies::PillFill::span(value, range.clone());
-    value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range, fill)
+    value_pill_number(ui, node_id, salt, rect, label, shown, label_w, range, fill, default)
 }
 
 /// Milliseconds written compactly: a delay of a second is `1000 ms`, a window of five
@@ -191,6 +192,7 @@ pub(crate) fn show_delay_body(
         &ms_text(ms),
         f64::from(ms),
         0.0..=60_000.0,
+        None,
     );
     let resp = resp.on_hover_text(
         "How long every channel is delayed by.\nDrag across the pill to change it, double-click to type.",
@@ -223,7 +225,7 @@ pub(crate) fn show_average_body(
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
-    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "", &ms_text(ms), f64::from(ms), 0.5..=5_000.0);
+    let (r1, t1) = pill_at(ui, node_id, "samples", left, PILL_W, "", &ms_text(ms), f64::from(ms), 0.5..=5_000.0, None);
     let r1 = r1.on_hover_text(
         "How much of the recent signal the average runs over.\nDrag to change it, double-click to type.",
     );
@@ -235,7 +237,7 @@ pub(crate) fn show_average_body(
     let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
     caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Spikes");
     let shown2 = if mad > 0.0 { format!("{mad:.1}") } else { "off".into() };
-    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "", &shown2, f64::from(mad), 0.0..=20.0);
+    let (r2, t2) = pill_at(ui, node_id, "spike_mad", left2, PILL_W, "", &shown2, f64::from(mad), 0.0..=20.0, None);
     let r2 = r2.on_hover_text(
         "Outlier threshold in median absolute deviations: a reading further from the middle than this is dropped.\n0 = off. Try 3.0 to start.",
     );
@@ -266,7 +268,7 @@ pub(crate) fn show_dc_filter_body(
     let Some((cx, top)) = pill_group(ui, node_id, view_salt, PILL_W, 2, true) else { return };
     let left = egui::pos2(cx - PILL_W * 0.5, top + CAP_H);
     caption_at(ui, egui::pos2(cx - PILL_W * 0.5, top), PILL_W, "Window");
-    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "", &ms_text(window), f64::from(window), 10.0..=60_000.0);
+    let (r1, t1) = pill_at(ui, node_id, "window_ms", left, PILL_W, "", &ms_text(window), f64::from(window), 10.0..=60_000.0, None);
     let r1 = r1.on_hover_text(
         "How slowly a change has to move to count as offset rather than signal.\nDrag to change it, double-click to type.",
     );
@@ -277,7 +279,7 @@ pub(crate) fn show_dc_filter_body(
     }
     let left2 = egui::pos2(left.x, left.y + CAP_H + PILL_H + 4.0);
     caption_at(ui, egui::pos2(left2.x, top + CAP_H + PILL_H + 4.0), PILL_W, "Decay");
-    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "", &ms_text(decay), f64::from(decay), 10.0..=60_000.0);
+    let (r2, t2) = pill_at(ui, node_id, "decay_ms", left2, PILL_W, "", &ms_text(decay), f64::from(decay), 10.0..=60_000.0, None);
     let r2 = r2.on_hover_text(
         "How quickly the filter settles after a real change goes through it.",
     );
@@ -351,7 +353,7 @@ pub(crate) fn show_inverse_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut 
         let shown = format!("{max:.2}");
         simple_bodies::trace_rect(ui, node_id, "inverse_max_pill", r_max);
         let (resp, typed) =
-            value_pill_number(ui, node_id, "inverse_max", r_max, "", &shown, 0.0, 0.0..=1000.0, simple_bodies::PillFill::span(f64::from(max), 0.0..=1000.0));
+            value_pill_number(ui, node_id, "inverse_max", r_max, "", &shown, 0.0, 0.0..=1000.0, simple_bodies::PillFill::span(f64::from(max), 0.0..=1000.0), None);
         let resp = resp.on_hover_text(
             "The top of the range the value is mirrored inside. Drag to change, double-click to type.",
         );
@@ -470,6 +472,7 @@ pub(crate) fn show_quantize_body(
         14.0,
         1.0..=1_000_000.0,
         simple_bodies::PillFill::span(f64::from(factor), 1.0..=1_000_000.0),
+        1.0,
     );
     let resp = resp.on_hover_text(if factor_wired {
         "Steps per unit, from the wire: 1 = integers, 2 = halves, 4 = quarters.\nUnwire it to set it here."
@@ -628,7 +631,7 @@ pub(crate) fn show_logic_delay_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
     let shown = format!("{}", time.round() as i32);
     simple_bodies::trace_rect(ui, node_id, "delay_time_pill", r_time);
     let (resp, typed) =
-        value_pill_number(ui, node_id, "delay_time", r_time, "", &shown, 0.0, 0.0..=limit as f64, simple_bodies::PillFill::span(f64::from(time), 0.0..=limit as f64));
+        value_pill_number(ui, node_id, "delay_time", r_time, "", &shown, 0.0, 0.0..=limit as f64, simple_bodies::PillFill::span(f64::from(time), 0.0..=limit as f64), None);
     let resp = resp.on_hover_text(if ms {
         "How long, in milliseconds. Drag to change, double-click to type, or use the pinned field."
     } else {
@@ -789,8 +792,8 @@ pub(crate) fn show_counter_body(
     let shown_min = if min_wired { wired_value(4).unwrap_or_else(|| trim_num(min)) } else { trim_num(min) };
     let shown_max = if max_wired { wired_value(5).unwrap_or_else(|| trim_num(max)) } else { trim_num(max) };
     let shown_step = if step_wired { wired_value(3).unwrap_or_else(|| trim_num(step)) } else { trim_num(step) };
-    let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, f64::from(min), -1e6..=1e6);
-    let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, f64::from(max), -1e6..=1e6);
+    let (r_min, t_min) = pill_at(ui, node_id, "min", egui::pos2(left, row_top(3)), cell_w, "min", &shown_min, f64::from(min), -1e6..=1e6, 0.0);
+    let (r_max, t_max) = pill_at(ui, node_id, "max", egui::pos2(cx + ROW * 0.5, row_top(3)), cell_w, "max", &shown_max, f64::from(max), -1e6..=1e6, 10.0);
     let (r_step, t_step) = pill_at(
         ui,
         node_id,
@@ -801,6 +804,7 @@ pub(crate) fn show_counter_body(
         &shown_step,
         f64::from(step),
         0.001..=10_000.0,
+        1.0,
     );
     let r_min = r_min.on_hover_text("The bottom of the count: it stops, loops or turns here, depending on the mode.");
     let r_max = r_max.on_hover_text(if max_off {
@@ -911,6 +915,7 @@ pub(crate) fn show_has_changed_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &
         0.0,
         0.0..=(100.0 * field.scale) as f64,
         simple_bodies::PillFill::span(f64::from(shown), 0.0..=(100.0 * field.scale) as f64),
+        None,
     );
     let resp = resp.on_hover_text(
         "Ignores movement smaller than this, like noise or a shaky hand: it reacts once the input \

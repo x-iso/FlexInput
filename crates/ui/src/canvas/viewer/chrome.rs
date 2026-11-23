@@ -181,10 +181,40 @@ pub(crate) fn channel_label_color(module_id: &str, ch: usize) -> Option<Color32>
 /// Unmultiplied source is (16,16,16,153); premultiplied bytes ≈ round(16*153/255)=10.
 pub(crate) const GRAPH_BG_DEFAULT: Color32 = Color32::from_rgba_premultiplied(10, 10, 10, 153);
 
+thread_local! {
+    /// The graph colours of the pin being drawn (`ExposedModule::graph_override`), for the
+    /// graphs in a module pinned whole: its body is the module's own, drawn as on the canvas,
+    /// and hands its graphs no colours of their own.
+    static PIN_GRAPH: std::cell::RefCell<Option<crate::canvas::node::PinGraphOverride>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `ov` as the graph colours of the pin being drawn, and put the old back after.
+pub(crate) fn with_pin_graph<R>(ov: Option<&crate::canvas::node::PinGraphOverride>, f: impl FnOnce() -> R) -> R {
+    let was = PIN_GRAPH.with(|p| p.replace(ov.cloned()));
+    let r = f();
+    PIN_GRAPH.with(|p| *p.borrow_mut() = was);
+    r
+}
+
+/// The graph colours of the pin being drawn, if it has any (see [`with_pin_graph`]).
+pub(crate) fn pin_graph() -> Option<crate::canvas::node::PinGraphOverride> {
+    PIN_GRAPH.with(|p| p.borrow().clone())
+}
+
+/// `f` of `ov`, or - where a graph is handed none - of the pin's being drawn: a module pinned
+/// whole draws its graphs as on the canvas, which hands them none, and its pin's colours
+/// went nowhere.
+fn resolve_ov<R>(ov: Option<&crate::canvas::node::PinGraphOverride>, f: impl FnOnce(Option<&crate::canvas::node::PinGraphOverride>) -> R) -> R {
+    match ov {
+        Some(o) => f(Some(o)),
+        None => PIN_GRAPH.with(|p| f(p.borrow().as_ref())),
+    }
+}
+
 /// Per-channel line/dot color, honoring an optional `PinGraphOverride`'s
 /// `channel_colors[ch]` when present, else the built-in palette.
 pub(crate) fn graph_channel_color(ov: Option<&crate::canvas::node::PinGraphOverride>, ch: usize) -> Color32 {
-    ov.and_then(|o| o.channel_colors.get(ch).copied().flatten())
+    resolve_ov(ov, |ov| ov.and_then(|o| o.channel_colors.get(ch).copied().flatten()))
         .map(rgba_to_color32)
         .unwrap_or(MULTI_COLORS[ch % MULTI_COLORS.len()])
 }
@@ -195,6 +225,10 @@ pub(crate) fn graph_channel_color(ov: Option<&crate::canvas::node::PinGraphOverr
 pub(crate) fn graph_chrome(
     ov: Option<&crate::canvas::node::PinGraphOverride>,
 ) -> (Color32, Option<egui::Stroke>) {
+    resolve_ov(ov, graph_chrome_of)
+}
+
+fn graph_chrome_of(ov: Option<&crate::canvas::node::PinGraphOverride>) -> (Color32, Option<egui::Stroke>) {
     let bg = ov.and_then(|o| o.background).map(rgba_to_color32).unwrap_or(crate::settings::tinted(GRAPH_BG_DEFAULT));
     let outline = ov.and_then(|o| {
         let px = o.outline_px.unwrap_or(0.0);
@@ -214,7 +248,7 @@ pub(crate) const GRAPH_GRID_DEFAULT: Color32 = Color32::from_rgba_premultiplied(
 /// ~64% of the axis color so a single override swatch drives both intensities
 /// consistently (mirrors the old 35-vs-55 gray relationship).
 pub(crate) fn graph_grid_colors(ov: Option<&crate::canvas::node::PinGraphOverride>) -> (Color32, Color32) {
-    let axis = ov.and_then(|o| o.gridline).map(rgba_to_color32).unwrap_or(GRAPH_GRID_DEFAULT);
+    let axis = resolve_ov(ov, |ov| ov.and_then(|o| o.gridline)).map(rgba_to_color32).unwrap_or(GRAPH_GRID_DEFAULT);
     let faint = Color32::from_rgba_unmultiplied(
         (axis.r() as f32 * 0.64) as u8,
         (axis.g() as f32 * 0.64) as u8,
@@ -396,5 +430,31 @@ mod dropped_wire_tests {
         delete_moved_wires(&mut snarl, &AnyPins::Out(&carried), AnyPin::In(pin));
 
         assert_eq!(wires(&snarl), [(o2, pin)]);
+    }
+}
+
+#[cfg(test)]
+mod pin_graph_tests {
+    use super::*;
+
+    // A graph handed no colours of its own takes its pin's while the pin draws - a module
+    // pinned whole draws its graphs as on the canvas, which hands them none - and the
+    // module's own outside it. One handed colours keeps them.
+    #[test]
+    fn a_graph_handed_no_colours_takes_its_pins() {
+        let ov = crate::canvas::node::PinGraphOverride {
+            background: Some([1, 2, 3, 255]),
+            gridline: Some([4, 5, 6, 255]),
+            channel_colors: vec![Some([7, 8, 9, 255])],
+            ..Default::default()
+        };
+        let plain = (graph_chrome(None).0, graph_grid_colors(None).1, graph_channel_color(None, 0));
+        let pinned = with_pin_graph(Some(&ov), || (graph_chrome(None).0, graph_grid_colors(None).1, graph_channel_color(None, 0)));
+        assert_eq!(pinned, (Color32::from_rgb(1, 2, 3), Color32::from_rgb(4, 5, 6), Color32::from_rgb(7, 8, 9)));
+        assert_ne!(plain.0, pinned.0, "the module's own pane");
+        assert_eq!((graph_chrome(None).0, graph_channel_color(None, 0)), (plain.0, plain.2), "the pin's colours outlived it");
+        let own = crate::canvas::node::PinGraphOverride { background: Some([9, 9, 9, 255]), ..Default::default() };
+        let kept = with_pin_graph(Some(&ov), || graph_chrome(Some(&own)).0);
+        assert_eq!(kept, Color32::from_rgb(9, 9, 9), "colours handed to a graph are its own");
     }
 }

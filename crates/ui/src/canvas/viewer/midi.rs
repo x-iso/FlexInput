@@ -337,7 +337,7 @@ pub(crate) fn midi_pin_picker_fields(
             let mut v = st.number as f64;
             let label = if is_note { "note" } else { "#" };
             if super::curve_rows::count_pill(ui, pill_node, "midi_pick_num", r, label, &mut v, &shown, 0.0..=max as f64,
-                if max > 127 { 0.5 } else { 0.1 }, "Which one: the note, controller or parameter number.")
+                if max > 127 { 0.5 } else { 0.1 }, "Which one: the note, controller or parameter number.", None)
             {
                 st.number = v.round().clamp(0.0, max as f64) as u32;
             }

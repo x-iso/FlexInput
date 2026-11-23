@@ -255,6 +255,20 @@ pub(crate) fn nav_pass(ctx: &egui::Context) -> u64 {
         .unwrap_or_else(|| ctx.cumulative_pass_nr())
 }
 
+/// Ctx-data slot naming the window the pad drives this frame: the config overlay's while it
+/// is up, the main window's otherwise. See [`nav_drives_view`].
+pub(crate) const NAV_VIEW_KEY: &str = "gp_nav_view";
+
+/// Whether the pad drives what is being drawn in `ctx`'s current viewport: a highlight the
+/// driver publishes for a node belongs to the copy of it the pad is working in. The same node
+/// is drawn on the canvas of a sub-patch editor - a window of its own - and pinned in Easy
+/// mode at once, and the canvas copy wore the pinned one's highlights; with that window's own
+/// pass count far behind the main window's, they never even went stale there.
+pub(crate) fn nav_drives_view(ctx: &egui::Context) -> bool {
+    let view: Option<egui::ViewportId> = ctx.data(|d| d.get_temp(egui::Id::new(NAV_VIEW_KEY)));
+    view.is_none_or(|v| v == ctx.viewport_id())
+}
+
 /// True if a highlight channel stamped with `pass` is current this frame,
 /// tolerant of a small lag (mirrors the existing `saturating_sub(pass) <= 2`
 /// gates). Use at every SELECTION/focus channel read that a pinned body or glow
@@ -420,6 +434,39 @@ pub(crate) fn nav_reveal_delta(top: f32, bot: f32, view_top: f32, view_bot: f32,
 /// flicker under the cards it rings.
 ///
 /// Inert unless [`install_nav_glow_cut`] ran on the context.
+/// How tall a scroll shadow is, in points.
+pub(crate) const SCROLL_SHADOW_H: f32 = 14.0;
+
+/// A thin shadow along the top of `rect` while there's content scrolled out above it
+/// (`above`), and along its bottom while there's more below (`below`): a hint that the view
+/// scrolls, where content is cut off at the frame. Dark at the edge, gone in
+/// [`SCROLL_SHADOW_H`].
+pub(crate) fn paint_scroll_shadows(painter: &egui::Painter, rect: egui::Rect, above: bool, below: bool) {
+    let h = SCROLL_SHADOW_H.min(rect.height() * 0.25);
+    if h < 1.0 {
+        return;
+    }
+    let dark = egui::Color32::from_black_alpha(110);
+    let clear = egui::Color32::from_black_alpha(0);
+    let band = |top: f32, top_col: egui::Color32, bottom_col: egui::Color32| {
+        let r = egui::Rect::from_x_y_ranges(rect.x_range(), top..=top + h);
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(r.left_top(), top_col);
+        mesh.colored_vertex(r.right_top(), top_col);
+        mesh.colored_vertex(r.right_bottom(), bottom_col);
+        mesh.colored_vertex(r.left_bottom(), bottom_col);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    };
+    if above {
+        band(rect.top(), dark, clear);
+    }
+    if below {
+        band(rect.bottom() - h, clear, dark);
+    }
+}
+
 pub(crate) fn nav_glow_layer(
     ctx: &egui::Context,
     order: egui::Order,
@@ -874,6 +921,58 @@ mod scaled_text_tests {
             let back = egui::Rect::from_min_max((bounds.min.to_vec2() / scale).to_pos2(), (bounds.max.to_vec2() / scale).to_pos2());
             for (a, b) in [(back.min, at_one.min), (back.max, at_one.max)] {
                 assert!((a - b).length() < 1.5, "scale {scale}: the text moved, {back:?} vs {at_one:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scaled_text_rows_tests {
+    /// Where each line of `lines` lines of monospace text is drawn, in the layer's own points,
+    /// against where its galley - what a text field puts its caret by - has it: painted in a
+    /// layer scaled by `scale` on a screen of `ppp` pixels a point.
+    fn rows_drawn_and_laid_out(ppp: f32, scale: f32, lines: usize) -> Vec<(f32, f32)> {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("scaled_rows"));
+        let text: String = (0..lines).map(|i| format!("STICK_SENS = {i}\n")).collect();
+        let origin = egui::pos2(10.0, 10.0);
+        let mut laid = None;
+        let mut out = None;
+        for _ in 0..3 {
+            out = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                ctx.set_transform_layer(layer, egui::emath::TSTransform::from_scaling(scale));
+                let galley = ctx.fonts_mut(|f| f.layout_no_wrap(text.clone(), egui::FontId::monospace(12.0), egui::Color32::WHITE));
+                laid = Some(galley.clone());
+                ctx.layer_painter(layer).galley(origin, galley, egui::Color32::WHITE);
+            }));
+        }
+        let laid = laid.expect("laid out");
+        let out = out.expect("ran");
+        let mut drawn = None;
+        for c in &out.shapes {
+            if let egui::Shape::Text(t) = &c.shape {
+                drawn = Some(t.clone());
+            }
+        }
+        let drawn = drawn.expect("the text is painted");
+        drawn.galley.rows.iter().zip(&laid.rows)
+            .map(|(d, l)| ((drawn.pos.y + d.pos.y) / scale - origin.y, l.pos.y))
+            .collect()
+    }
+
+    // Text in a scaled layer is laid out again at the size it's drawn at, for sharp glyphs; its
+    // rows rounded to that finer pixel grid came out a fraction of a point shorter than the
+    // ones it replaced, so each line was drawn a little higher than the last - JSM Config's
+    // editor pinned in Easy mode had its caret a whole line below the text by the 16th line.
+    // Each line is drawn where its galley has it.
+    #[test]
+    fn lines_of_text_in_a_scaled_layer_stay_where_the_caret_puts_them() {
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            for scale in [1.1f32, 1.25, 1.6, 2.0] {
+                for (i, (drawn, laid)) in rows_drawn_and_laid_out(ppp, scale, 40).into_iter().enumerate() {
+                    assert!((drawn - laid).abs() < 0.3, "{ppp} ppp, scale {scale}: line {i} drawn at {drawn}, laid out at {laid}");
+                }
             }
         }
     }

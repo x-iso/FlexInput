@@ -781,6 +781,10 @@ pub(crate) fn show_subpatch_editors(
                             anchor: Default::default(),
                             pin_style: Some(2),
                             zoom: None,
+                            hidden_sections: Vec::new(),
+                            sections_open: false,
+                            graph_labels: None,
+                            text_max: None,
                         });
                     }
                 }

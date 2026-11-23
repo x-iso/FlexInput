@@ -35,9 +35,10 @@ fn pill(
     range: std::ops::RangeInclusive<f32>,
     per_px: f32,
     hover: &str,
+    default: impl Into<Option<f32>>,
 ) -> bool {
     let shown = show(*value);
-    cr::real_pill(ui, node, salt, rect, label, value, &shown, range, per_px, hover)
+    cr::real_pill(ui, node, salt, rect, label, value, &shown, range, per_px, hover, default)
 }
 
 /// A plain button filling `rect`, its text small.
@@ -167,13 +168,13 @@ pub(super) fn options(
     if shape == Shape::Rect {
         let label = format!("round|cell {cell} round");
         if pill(ui, node_id, "area_round", cells[3], &label, &mut round, |v| format!("{v:.0}%"), 0.0..=100.0, 0.5,
-            "Round this cell like a bubble: same area, up to a circle (an ellipse for an oblong cell). Past its sides it shares the overlap with its neighbours, or pushes into them with more pressure; it gives up its corners. Equal bubbles meet in flat seams.")
+            "Round this cell like a bubble: same area, up to a circle (an ellipse for an oblong cell). Past its sides it shares the overlap with its neighbours, or pushes into them with more pressure; it gives up its corners. Equal bubbles meet in flat seams.", 0.0)
         {
             set.push((AREA_CELL_ROUND, json!(round / 100.0)));
         }
         rects.push(cells[3]);
         if pill(ui, node_id, "area_press", cells[4], "press|pressure", &mut press, |v| format!("{v:.0}%"), 0.0..=100.0, 0.5,
-            "Where this cell's shape overlaps another's, the higher-pressure one pushes into the lower; at equal pressure they share the overlap. A round cell at full pressure among unpressurised ones takes its whole circle.")
+            "Where this cell's shape overlaps another's, the higher-pressure one pushes into the lower; at equal pressure they share the overlap. A round cell at full pressure among unpressurised ones takes its whole circle.", 0.0)
         {
             set.push((AREA_CELL_PRESSURE, json!(press / 100.0)));
         }
@@ -421,12 +422,12 @@ pub(super) fn analog(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         rects.push(cells[1]);
         if smooth {
             if pill(ui, node_id, "area_min", cells[2], "min|shortest press", &mut hold, |v| format!("{v:.0} ms"), 1.0..=500.0, 1.0,
-                "The shortest press or gap. Make it at least two of the game's frames (≈ 34 ms at 60 fps, 14 ms at 144) so it reads every one; longer if the game ignores short taps.")
+                "The shortest press or gap. Make it at least two of the game's frames (≈ 34 ms at 60 fps, 14 ms at 144) so it reads every one; longer if the game ignores short taps.", None)
             {
                 set.push((AREA_LAYER_HOLD_PARAM, json!(hold)));
             }
         } else if pill(ui, node_id, "area_pwm", cells[2], "PWM|PWM period", &mut ms, |v| format!("{v:.0} ms"), 1.0..=1000.0, 1.0,
-            "The pulse period. Games read keys once a frame, so keep it a few frames long (≈ 50–100 ms at 60 fps): shorter pulses get sampled at random and feel jittery.")
+            "The pulse period. Games read keys once a frame, so keep it a few frames long (≈ 50–100 ms at 60 fps): shorter pulses get sampled at random and feel jittery.", None)
         {
             set.push((AREA_LAYER_MS_PARAM, json!(ms)));
         }
@@ -435,7 +436,7 @@ pub(super) fn analog(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         let ramp_changed = ui
             .add_enabled_ui(smooth, |ui| {
                 pill(ui, node_id, "area_ramp", cells[3], "ramp|ramp time", &mut ramp, |v| format!("{v:.0} ms"), 0.0..=1000.0, 2.0,
-                    "How long the game takes to get from standing to full speed (and back). Set it to match and the presses are timed against the game's own acceleration, holding its speed at your push instead of stopping and starting. Raise it until the movement stops stuttering; if the speed then wanders or lags, it's too high. 0 = the game moves at full speed at once.")
+                    "How long the game takes to get from standing to full speed (and back). Set it to match and the presses are timed against the game's own acceleration, holding its speed at your push instead of stopping and starting. Raise it until the movement stops stuttering; if the speed then wanders or lags, it's too high. 0 = the game moves at full speed at once.", None)
             })
             .inner;
         if ramp_changed {
@@ -446,7 +447,7 @@ pub(super) fn analog(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         }
         let k = 4;
         if pill(ui, node_id, "area_mid", cells[k], "half|half at", &mut mid, |v| format!("{v:.0}%"), 5.0..=95.0, 0.5,
-            "How far you push for the keys to hold half the time. Below 50% light pushes hold longer (faster, fewer gaps at low deflection); above, finer control near the centre.")
+            "How far you push for the keys to hold half the time. Below 50% light pushes hold longer (faster, fewer gaps at low deflection); above, finer control near the centre.", 50.0)
         {
             set.push((AREA_LAYER_MID_PARAM, json!(mid / 100.0)));
         }
@@ -515,7 +516,7 @@ pub(super) fn border(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
     if ring {
         let mut pct = b.square * 100.0;
         if pill(ui, node_id, "area_square", cells[1], "square", &mut pct, |v| format!("{v:.0}%"), 0.0..=100.0, 0.5,
-            "Take this ring from a circle (0%) to a square (100%) — e.g. a square deadzone. It stops short where it would touch the next ring.")
+            "Take this ring from a circle (0%) to a square (100%) — e.g. a square deadzone. It stops short where it would touch the next ring.", None)
         {
             new_square = Some(pct / 100.0);
         }
@@ -537,7 +538,7 @@ pub(super) fn border(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         let (scale, suffix, max) = if deg { (360.0, "°", 120.0) } else { (100.0, "%", 100.0) };
         let mut shown = g.width * scale;
         if pill(ui, node_id, "area_grad_w", cells[0], "width", &mut shown, |v| format!("{v:.0}{suffix}"), 1.0..=max, 0.5,
-            "How wide the crossfade is, centred on the border.")
+            "How wide the crossfade is, centred on the border.", None)
         {
             g.width = shown / scale;
             changed = true;
@@ -582,14 +583,14 @@ pub(super) fn border(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeD
         rects.push(cells[0]);
         if g.digital == DigitalMode::Threshold {
             let mut t = g.threshold;
-            if pill(ui, node_id, "area_grad_thr", cells[1], "level", &mut t, |v| format!("{v:.2}"), 0.0..=1.0, 0.005, "The share at which the key holds.") {
+            if pill(ui, node_id, "area_grad_thr", cells[1], "level", &mut t, |v| format!("{v:.2}"), 0.0..=1.0, 0.005, "The share at which the key holds.", None) {
                 g.threshold = t;
                 changed = true;
             }
         } else {
             let mut ms = g.period_ms;
             let tip = if pwm { "PWM period." } else { "Slowest tap period (at the smallest share)." };
-            if pill(ui, node_id, "area_grad_ms", cells[1], "period", &mut ms, |v| format!("{v:.0} ms"), 1.0..=1000.0, 1.0, tip) {
+            if pill(ui, node_id, "area_grad_ms", cells[1], "period", &mut ms, |v| format!("{v:.0} ms"), 1.0..=1000.0, 1.0, tip, None) {
                 g.period_ms = ms;
                 changed = true;
             }
@@ -685,7 +686,7 @@ pub(super) fn cell(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
         let pill = egui::Rect::from_min_max(egui::pos2(tog.right() + z(GAP), r.top()), r.max);
         let shown = format!("{pct:.0}%");
         changed |= ui
-            .add_enabled_ui(on, |ui| cr::real_pill(ui, node_id, "area_haptic_pct", pill, "strength", &mut pct, &shown, 5.0..=100.0, 0.5, "How strong the haptic is."))
+            .add_enabled_ui(on, |ui| cr::real_pill(ui, node_id, "area_haptic_pct", pill, "strength", &mut pct, &shown, 5.0..=100.0, 0.5, "How strong the haptic is.", 100.0))
             .inner;
         all = button_at(ui, cells[1], "all cells in layer", false)
             .on_hover_text("Give every cell in this layer this cell's haptic setting.")
@@ -705,14 +706,14 @@ pub(super) fn cell(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
         ui.add_enabled_ui(on && tone_on, |ui| {
             let shown = format!("{:.0} Hz", t.hz);
             changed |= cr::real_pill(ui, node_id, "area_tone_hz", cells[1], "pitch", &mut t.hz, &shown, 60.0..=600.0, 1.0,
-                "The click's pitch. Lower feels like a thud, higher like a tick.");
+                "The click's pitch. Lower feels like a thud, higher like a tick.", default_hz);
             let shown = format!("{:.0} ms", t.ms);
             changed |= cr::real_pill(ui, node_id, "area_tone_ms", cells[2], "length", &mut t.ms, &shown, 4.0..=80.0, 0.2,
-                "The click's length: short feels crisp, long feels more like a pulse.");
+                "The click's length: short feels crisp, long feels more like a pulse.", default_ms);
             let mut soft = t.soft * 100.0;
             let shown = format!("{soft:.0}%");
             if cr::real_pill(ui, node_id, "area_tone_soft", cells[3], "soft|softness", &mut soft, &shown, 0.0..=100.0, 0.5,
-                "Sharp to soft. At 0 the click starts and stops dead; higher, more of it fades in and out, until at 100% it swells and dies away.")
+                "Sharp to soft. At 0 the click starts and stops dead; higher, more of it fades in and out, until at 100% it swells and dies away.", 0.0)
             {
                 t.soft = soft / 100.0;
                 changed = true;
@@ -763,7 +764,7 @@ pub(super) fn press(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDa
         }
         rects.push(cells[1]);
         changed |= pill(ui, node_id, "area_press_ms", cells[2], "time", &mut ms, |v| format!("{v:.0} ms"), 1.0..=5000.0, 2.0,
-            "The press mode's time window (pulse length for On press / On release, Enter / Leave).");
+            "The press mode's time window (pulse length for On press / On release, Enter / Leave).", None);
         rects.push(cells[2]);
         let s = cr::split(cells[3], &[word_w(ui, "hold"), word_w(ui, "turbo")]);
         changed |= cr::word_toggle(ui, s[0], &mut hold, "hold", "Hold the output for as long as the press lasts.", ("area_press_hold", node_id.0));

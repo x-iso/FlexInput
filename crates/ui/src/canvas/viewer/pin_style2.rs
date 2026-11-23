@@ -193,7 +193,7 @@ fn render_fields(inner_id: NodeId, module_id: &str, element: &str, ui: &mut egui
             };
             let hint: &str = key.and_then(|k| crate::app::field_hint(module_id, k)).unwrap_or(&f.label);
             match (&f.field, &now[i]) {
-                (NavField::Value { key, lo, hi, step, .. }, Now::Value(v)) => {
+                (NavField::Value { key, lo, hi, step, default, .. }, Now::Value(v)) => {
                     let factor = match step {
                         NavStep::FixedScaled { factor, .. } => factor.max(f32::EPSILON),
                         _ => 1.0,
@@ -207,7 +207,7 @@ fn render_fields(inner_id: NodeId, module_id: &str, element: &str, ui: &mut egui
                         NavStep::Decade => 10f32.powf(disp.abs().max(1e-3).log10().floor()) * 0.02,
                         NavStep::Linear => (hi - lo).abs() / 300.0,
                     };
-                    if real_pill(ui, inner_id, &format!("ps2_{element}_{i}"), cell, &label, &mut disp, &shown, lo..=hi, per_px, hint) {
+                    if real_pill(ui, inner_id, &format!("ps2_{element}_{i}"), cell, &label, &mut disp, &shown, lo..=hi, per_px, hint, *default * factor) {
                         let v = disp / factor;
                         let whole = matches!(*key, "grid_x" | "grid_y" | "trail_ms");
                         set.push((key, if whole { serde_json::json!(v.round() as i64) } else { serde_json::json!(v as f64) }));
@@ -628,7 +628,7 @@ mod tests {
                     key = Some(super::super::scale::pin_ws_nat_key(pin.ctx(), outer.0, id.0, "scale_row"));
                     super::super::pinned::render_pinned_element(
                         id, "module.response_curve", "scale_row", &mut pin, &mut snarl, frame.size(),
-                        &live, &panic, None, None, outer, true, None, None, None, style, 1.0);
+                        &live, &panic, None, None, outer, true, None, None, None, style, &Default::default());
                     if style == 2 {
                         assert!(
                             (pin.min_rect().width() - 296.0).abs() < 0.6,
@@ -783,7 +783,7 @@ mod tests {
                             let cells = pill_bands(ui, 700.0, &[word_w(ui, "sticky"), 150.0, 120.0, 150.0, 80.0, word_w(ui, "smooth")]);
                             word_toggle(ui, cells[0], &mut on, "sticky", "", ("fs_t", mono, bold, size as i32));
                             segmented(ui, cells[1], &1, &[(0, "ports", ""), (1, "mapping", "")], ("fs_s", mono, bold, size as i32));
-                            real_pill(ui, node, &format!("fs_p{mono}{bold}{size}"), cells[2], "dz|deadzone", &mut v, "0.25", 0.0..=1.0, 0.01, "");
+                            real_pill(ui, node, &format!("fs_p{mono}{bold}{size}"), cells[2], "dz|deadzone", &mut v, "0.25", 0.0..=1.0, 0.01, "", None);
                             pill_combo(ui, cells[3], "show", &"hold".to_string(), &[("hold".to_string(), "hold")], "", ("fs_c", mono, bold, size as i32));
                             ui.put(cells[4], egui::Button::new(control_text("Learn")));
                             word_toggle(ui, cells[5], &mut off, "smooth", "", ("fs_t2", mono, bold, size as i32));

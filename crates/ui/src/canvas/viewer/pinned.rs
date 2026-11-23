@@ -26,12 +26,17 @@ pub(crate) fn render_pinned_element(
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
     pin_style: u8,
-    zoom: f32,
+    look: &crate::canvas::node::WidgetLook,
 ) {
     // Stable identity for this pin's natural-size cache: (viewport, outer node,
     // inner node, element) — see `pin_ws_nat_key` for why the viewport.
     let ws_key = pin_ws_nat_key(ui.ctx(), outer_id.0, inner_id.0, element_id);
-    ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), ws_key));
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(pin_ws_key_scratch(), ws_key);
+        // A card module pinned whole says again, as it draws, how tall it has to stay; a
+        // pin that isn't one keeps no such floor from before.
+        d.remove::<f32>(pin_min_body_h_id(ws_key));
+    });
     // A Style 2 row fits any frame by itself (`pin_style2::fit`) and measures nothing; a
     // measurement left from when the same pin wore Style 1 would hold the frame to the old
     // row's proportions while it is resized (`clamp_pin_frame_to_content`).
@@ -39,12 +44,21 @@ pub(crate) fn render_pinned_element(
         ui.ctx().data_mut(|d| d.remove::<egui::Vec2>(ws_key));
     }
 
-    render_pinned_element_impl(
-        inner_id, module_id, element_id, ui, inner_snarl, container_size,
-        live_signals, panic_shortcut, automap_parent, outer_snapshot,
-        outer_id, is_layout_mode, graph_override, iv_style_override,
-        menu_style_override, pin_style, zoom,
-    );
+    let pin_graph = graph_override.clone();
+    super::simple_bodies::with_text_cap(ui, look.text_max, |ui| {
+        super::simple_bodies::with_label_size(ui, |ui| {
+            super::simple_bodies::with_graph_labels(look.graph_labels, || {
+                super::chrome::with_pin_graph(pin_graph.as_ref(), || {
+                    render_pinned_element_impl(
+                        inner_id, module_id, element_id, ui, inner_snarl, container_size,
+                        live_signals, panic_shortcut, automap_parent, outer_snapshot,
+                        outer_id, is_layout_mode, graph_override, iv_style_override,
+                        menu_style_override, pin_style, look,
+                    );
+                });
+            });
+        });
+    });
 
     // `applied` is only present when the renderer routed through
     // `apply_widget_scale` (row-style widgets). Graphs / whole-module pins
@@ -82,9 +96,10 @@ pub(crate) fn render_module_widget(
     live_signals: &std::collections::HashMap<(String, String), Signal>,
     panic_shortcut: &crate::app::PanicShortcut,
     automap_parent: Option<&AutomapGlowParent<'_>>,
-    zoom: f32,
+    look: &crate::canvas::node::WidgetLook,
     is_layout_mode: bool,
 ) {
+    let zoom = look.zoom;
     let Some(node) = inner_snarl.get_node(inner_id) else { return };
     let module_id = node.module_id.clone();
     let (n_in, n_out) = (node.inputs.len(), node.outputs.len());
@@ -183,6 +198,20 @@ pub(crate) fn render_module_widget(
     // part whose row doesn't say where they are.
     let layer = body.layer_id();
     let controls_before = ui.ctx().viewport(|v| v.this_pass.widgets.get_layer(layer).count());
+    // The sections the pin leaves out or keeps open, for `curve_rows::section` while the body
+    // draws, and a fresh list of the sections it has, for the Inspector.
+    let rules = WidgetSectionRules {
+        node: inner_id.0,
+        module: module_id.clone(),
+        hidden: look.hidden_sections.clone(),
+        open: look.sections_open,
+    };
+    let outer_rules: Option<WidgetSectionRules> = ui.ctx().data_mut(|d| {
+        d.insert_temp(widget_sections_seen_id(inner_id.0, &module_id), Vec::<(String, String)>::new());
+        let was = d.get_temp(widget_section_rules_id());
+        d.insert_temp(widget_section_rules_id(), rules);
+        was
+    });
     // While the layout is edited, a part of the body that has a layer of its own (a card
     // window) draws on the host's instead: see `widget_layout_id`.
     let outer_layout: Option<usize> = ui.ctx().data_mut(|d| {
@@ -214,6 +243,12 @@ pub(crate) fn render_module_widget(
         Some(was) => d.insert_temp(widget_layout_id(), was),
         None => {
             d.remove_temp::<usize>(widget_layout_id());
+        }
+    });
+    ui.ctx().data_mut(|d| match outer_rules {
+        Some(was) => d.insert_temp(widget_section_rules_id(), was),
+        None => {
+            d.remove_temp::<WidgetSectionRules>(widget_section_rules_id());
         }
     });
     let controls: Vec<egui::Rect> = ui.ctx().viewport(|v| {
@@ -338,7 +373,7 @@ pub(crate) fn render_pinned_element_impl(
     iv_style_override: Option<crate::canvas::node::IvStyleOverride>,
     menu_style_override: Option<crate::canvas::node::MenuStyleOverride>,
     pin_style: u8,
-    zoom: f32,
+    look: &crate::canvas::node::WidgetLook,
 ) {
     let cap_w = container_size.x.max(20.0);
     // Whole-module pinned renderers manage their own width/clip; don't cap
@@ -426,7 +461,7 @@ pub(crate) fn render_pinned_element_impl(
         }
         // Any other module pinned whole (or by the old "default", which meant the same).
         (_, "whole_module" | "default") => {
-            render_module_widget(inner_id, ui, inner_snarl, container_size, live_signals, panic_shortcut, bridged_parent, zoom, is_layout_mode);
+            render_module_widget(inner_id, ui, inner_snarl, container_size, live_signals, panic_shortcut, bridged_parent, look, is_layout_mode);
             return;
         }
         // Input Viewer board: whole-container render, letterboxed to the
@@ -1930,6 +1965,47 @@ const ONE_CARD_H: f32 = 76.0;
 /// and 3DOF's two Lean lists shared one scroll, the first pushing the second out of view.
 /// Returns the window's rect (the pinnable `cards` element's).
 #[allow(clippy::too_many_arguments)]
+/// While a whole-module widget's body draws, which sections of it the pin leaves out and
+/// whether it keeps them open (`ExposedModule::hidden_sections` / `sections_open`), for
+/// `curve_rows::section`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WidgetSectionRules {
+    pub node: usize,
+    pub module: String,
+    pub hidden: Vec<String>,
+    pub open: bool,
+}
+
+fn widget_section_rules_id() -> egui::Id {
+    egui::Id::new("fxi_widget_section_rules")
+}
+
+fn widget_sections_seen_id(node: usize, module: &str) -> egui::Id {
+    egui::Id::new(("fxi_widget_sections_seen", node, module))
+}
+
+/// The section rules for node `node`'s body, while it draws in a whole-module widget.
+pub(crate) fn widget_section_rules(ctx: &egui::Context, node: NodeId) -> Option<WidgetSectionRules> {
+    let rules: Option<WidgetSectionRules> = ctx.data(|d| d.get_temp(widget_section_rules_id()));
+    rules.filter(|r| r.node == node.0)
+}
+
+/// Note section `key` (headed `title`) of the body a widget is drawing, shown or not.
+pub(crate) fn note_widget_section(ctx: &egui::Context, rules: &WidgetSectionRules, key: &str, title: &str) {
+    ctx.data_mut(|d| {
+        let seen = d.get_temp_mut_or_default::<Vec<(String, String)>>(widget_sections_seen_id(rules.node, &rules.module));
+        if !seen.iter().any(|(k, _)| k == key) {
+            seen.push((key.to_string(), title.to_string()));
+        }
+    });
+}
+
+/// The sections, `(key, title)`, the body of module `module` (node `node`) had when a widget
+/// last drew it whole - hidden ones too - for the Inspector to offer.
+pub(crate) fn widget_sections(ctx: &egui::Context, node: usize, module: &str) -> Vec<(String, String)> {
+    ctx.data(|d| d.get_temp(widget_sections_seen_id(node, module))).unwrap_or_default()
+}
+
 /// While a whole-module widget's body draws for a layout being edited, its node. A part of
 /// the body with a layer of its own (`card_window`'s cards) is drawn on the host's layer then,
 /// as a pinned mapping body is while its layout is edited: scaled with the shapes, so with the
@@ -1991,11 +2067,23 @@ where
     };
     let top_left = ui.cursor().min;
     let laid_out = ui.ctx().data(|d| d.get_temp::<usize>(widget_layout_id())) == Some(node_id.0);
+    // A card window keeps its own height, by its own bar: the pin it's drawn in (3DOF to 2D
+    // pinned whole, its Lean lists) isn't held to "its top part and one card" the way a card
+    // module pinned whole is. That floor, read at the pin's width, held the widget's height to
+    // its width - widened, it only grew taller.
+    let outer_pin = ui.ctx().data_mut(|d| {
+        let k = d.get_temp::<egui::Id>(pin_ws_key_scratch());
+        d.remove::<egui::Id>(pin_ws_key_scratch());
+        k
+    });
     render_remap_whole_module_impl(
         tag, REMAP_DESIGN_W, node_id, ui, snarl, egui::vec2(width, h),
         live_signals, panic_shortcut, automap_parent, laid_out, "",
         body_fn, map_len_fn, draft_len_fn,
     );
+    if let Some(k) = outer_pin {
+        ui.ctx().data_mut(|d| d.insert_temp(pin_ws_key_scratch(), k));
+    }
     let rect = egui::Rect::from_min_size(top_left, egui::vec2(width, h));
     // A window given its height (`fixed_h`, a column beside the
     // rest of a body that sets it) has no bar of its own to drag it taller.

@@ -868,6 +868,13 @@ fn update_ghost_latch(frac: Option<f32>, low: f32, ghosted: &mut bool, streak: &
 enum VisMapState {
     /// No measurement in flight — record one this frame.
     Idle,
+    /// Depth prepass copied to the staging buffer in THIS frame's encoder, which
+    /// hasn't gone out yet. `finish_prepare` - after every callback's `prepare`,
+    /// before egui submits - makes it [`Self::Copied`]. A second callback for the
+    /// same instance in the frame finds it here and leaves it: mapping the buffer
+    /// with the copy into it still unsubmitted is a wgpu validation error ("buffer
+    /// is still mapped") that took the app down.
+    Recorded,
     /// Depth prepass copied to the staging buffer (submits with egui's frame);
     /// map it next frame.
     Copied,
@@ -1683,8 +1690,10 @@ impl CallbackTrait for MeshRenderState {
                             cam,
                             depth_eps: (d0 - d1).abs().max(1e-6),
                         });
-                        *vm.state.lock().unwrap() = VisMapState::Copied;
+                        *vm.state.lock().unwrap() = VisMapState::Recorded;
                     }
+                    // Recorded by another callback for this instance this frame.
+                    VisMapState::Recorded => {}
                 }
             }
         }
@@ -1692,6 +1701,24 @@ impl CallbackTrait for MeshRenderState {
         per_instance(callback_resources).frame.insert(self.instance, (MatteActive(use_matte), order));
 
         Vec::new() // write_buffer is immediate; no command buffers to submit
+    }
+
+    fn finish_prepare(
+        &self,
+        _device: &wgpu::Device,
+        _queue: &Queue,
+        _egui_encoder: &mut CommandEncoder,
+        callback_resources: &mut CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        // Every prepare of the frame is done: a copy recorded in it goes out with
+        // this frame's encoder, so next frame may map the buffer.
+        if let Some(vm) = callback_resources.get::<PerInstance>().and_then(|p| p.vis.get(&self.instance)) {
+            let mut st = vm.state.lock().unwrap();
+            if *st == VisMapState::Recorded {
+                *st = VisMapState::Copied;
+            }
+        }
+        Vec::new()
     }
 
     fn paint(

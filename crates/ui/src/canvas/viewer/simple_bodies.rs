@@ -1716,9 +1716,67 @@ pub(crate) fn calibrate_control_fonts(ctx: &egui::Context) {
     }
 }
 
-/// The control font's size setting, in the normal font's points.
+thread_local! {
+    /// The largest the text of the pin being drawn may be (`ExposedModule::text_max`), in the
+    /// setting's points: no bound outside a pin, or for a pin that follows the setting.
+    static TEXT_CAP: std::cell::Cell<f32> = const { std::cell::Cell::new(f32::INFINITY) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own control font size, in place of the app's (which is process-wide, and
+    /// tests run side by side).
+    static TEST_FONT_SIZE: std::cell::Cell<Option<f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` as if the control font size setting were `size`, on this thread alone.
+#[cfg(test)]
+pub(crate) fn with_test_font_size<R>(size: f32, f: impl FnOnce() -> R) -> R {
+    let was = TEST_FONT_SIZE.with(|c| c.replace(Some(size)));
+    let r = f();
+    TEST_FONT_SIZE.with(|c| c.set(was));
+    r
+}
+
+/// The control font's size setting, in the normal font's points, as the drawing is to use
+/// it: no larger than the cap of the pin being drawn ([`with_text_cap`]).
 pub(crate) fn control_font_size() -> f32 {
-    f32::from_bits(CONTROL_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed))
+    #[cfg(test)]
+    if let Some(size) = TEST_FONT_SIZE.with(|c| c.get()) {
+        return size.min(TEXT_CAP.with(|c| c.get()));
+    }
+    f32::from_bits(CONTROL_FONT_SIZE.load(std::sync::atomic::Ordering::Relaxed)).min(TEXT_CAP.with(|c| c.get()))
+}
+
+/// Set egui's own text styles from the font setting (as [`control_font_size`] has it where
+/// this is called): the Button style - every egui button and dropdown beside the pills - in
+/// the control font, and the other text styles egui draws in its normal font at egui's sizes
+/// scaled by the setting (labels, hints, headings). Monospace stays: it is for code.
+pub(crate) fn apply_text_styles(style: &mut egui::Style) {
+    style.text_styles.insert(egui::TextStyle::Button, control_font_at(control_font_size().min(CONTROL_FONT_MAX_PX)));
+    for (ts, base) in egui::Style::default().text_styles {
+        if base.family == egui::FontFamily::Proportional && ts != egui::TextStyle::Button {
+            style.text_styles.insert(ts, ui_font(base.size));
+        }
+    }
+}
+
+/// Run `f` with the text no larger than `cap` points of the setting - a pin's own cap, from
+/// the Inspector (`ExposedModule::text_max`) - and put it back after. A larger setting then
+/// leaves the pin as it is at `cap`: its words, its pills, and the rows they make, which a
+/// larger font widens and so wraps onto more lines. `None`, or a cap the setting is under,
+/// changes nothing.
+pub(crate) fn with_text_cap<R>(ui: &mut egui::Ui, cap: Option<f32>, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let Some(cap) = cap.filter(|c| c.is_finite() && *c < control_font_size()) else {
+        return f(ui);
+    };
+    let was = TEXT_CAP.with(|c| c.replace(cap));
+    let saved = ui.style().clone();
+    apply_text_styles(ui.style_mut());
+    let r = f(ui);
+    ui.set_style(saved);
+    TEXT_CAP.with(|c| c.set(was));
+    r
 }
 
 /// How much wider than the rows were laid out for the control font draws: 1 at
@@ -1753,6 +1811,60 @@ pub(crate) fn ui_font(size: f32) -> egui::FontId {
     let scaled = size * ui_text_factor() * norm;
     let scaled = if (scaled - size).abs() < 1e-3 { size } else { super::scale::quantize_font_size(scaled.max(4.0)) };
     egui::FontId::new(scaled, family)
+}
+
+thread_local! {
+    /// How large the pin being drawn has its graph's labels (`ExposedModule::graph_labels`),
+    /// as a share of their own sizes: 1 outside a pin.
+    static GRAPH_LABELS: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// The graph labels' size where the drawing is (see [`with_graph_labels`]).
+pub(crate) fn graph_label_scale() -> f32 {
+    GRAPH_LABELS.with(|c| c.get())
+}
+
+/// Run `f` with the graph labels drawn `scale` times their size - a pin's own setting, from
+/// the Inspector - and put it back after.
+pub(crate) fn with_graph_labels<R>(scale: f32, f: impl FnOnce() -> R) -> R {
+    let scale = if scale.is_finite() { scale.clamp(0.5, 3.0) } else { 1.0 };
+    let was = GRAPH_LABELS.with(|c| c.replace(scale));
+    let r = f();
+    GRAPH_LABELS.with(|c| c.set(was));
+    r
+}
+
+/// A label inside a graph or a picture - a curve's axis marks, a scope's scale, the 3DOF
+/// preview's degrees - at `size` as [`ui_font`] draws it, then by its pin's graph labels
+/// setting (the Inspector's): drawn into the picture, they keep their own size, apart from a
+/// module's words.
+pub(crate) fn graph_font(size: f32) -> egui::FontId {
+    ui_font(size * graph_label_scale())
+}
+
+/// The size a module's own words are drawn at - section titles, a row's caption, the word
+/// beside a value: the value pills' (the control font, [`control_font_at`]).
+pub(crate) fn label_font() -> egui::FontId {
+    control_font_at(control_font_size().min(CONTROL_FONT_MAX_PX))
+}
+
+/// A module body's text styles, for the words in it: egui's small style (section titles,
+/// captions, notes) and body style (labels, a slider's words) at the value pills' size.
+/// Small was 9 points beside the pills' 15. The app's other text keeps its sizes.
+pub(crate) fn use_label_size(style: &mut egui::Style) {
+    let font = label_font();
+    style.text_styles.insert(egui::TextStyle::Small, font.clone());
+    style.text_styles.insert(egui::TextStyle::Body, font);
+}
+
+/// Run `f` with `ui`'s text styles at the module words' size ([`use_label_size`]), and put
+/// them back after.
+pub(crate) fn with_label_size<R>(ui: &mut egui::Ui, f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let saved = ui.style().clone();
+    use_label_size(ui.style_mut());
+    let r = f(ui);
+    ui.set_style(saved);
+    r
 }
 
 /// The size [`ui_font`] draws `size` at, for `RichText::size` (whose face is the text
@@ -2147,6 +2259,8 @@ pub(crate) fn value_pill(
 /// committed is read back as a number - a unit suffix rides along in the field, so anything
 /// that isn't part of a number is dropped - and clamped to `range`. Returns the response and
 /// the new value, if the user typed one. `fill` is what it shows while dragged ([`PillFill`]).
+/// A double-click on its label puts it back to `default`, where it has one: the new value
+/// then is that, as if it had been typed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn value_pill_number(
     ui: &mut egui::Ui,
@@ -2158,9 +2272,22 @@ pub(crate) fn value_pill_number(
     label_w: f32,
     range: std::ops::RangeInclusive<f64>,
     fill: PillFill,
+    default: impl Into<Option<f64>>,
 ) -> (egui::Response, Option<f64>) {
     let widest = widest_shown(shown, range.clone());
     let (resp, typed) = value_pill(ui, node, salt, rect, label, shown, &widest, label_w, fill);
+    if let Some(d) = default.into().filter(|_| label_w > 1.0 && ui.is_enabled()) {
+        let label_rect = egui::Rect::from_min_size(rect.min, egui::vec2(label_w.min(rect.width()), rect.height()));
+        let label_resp = ui.interact(label_rect, ui.id().with(("pill_label_reset", node.0, salt)), egui::Sense::click());
+        if label_resp.double_clicked() {
+            return (resp, Some(d.clamp(*range.start(), *range.end())));
+        }
+    }
+    let value = match fill {
+        PillFill::Span { at, .. } => Some(span_value(at, &range)),
+        PillFill::Whole => None,
+    };
+    let per_unit = shown_per_unit(shown, value, &range);
     let typed = typed
         .map(|t| {
             t.chars()
@@ -2169,8 +2296,46 @@ pub(crate) fn value_pill_number(
         })
         .and_then(|t| t.parse::<f64>().ok())
         .filter(|v| v.is_finite())
-        .map(|v| v.clamp(*range.start(), *range.end()));
+        .map(|v| (v / per_unit).clamp(*range.start(), *range.end()));
     (resp, typed)
+}
+
+/// How many of what a pill shows make one of its value: 100 where a share or a factor is
+/// shown as a percentage (a widget's zoom, 0.4 to 2, as "74%" for 0.74), so a number typed in
+/// is read as it's shown. Read as the value itself, 74 was clamped to the top of the range:
+/// whatever was typed came out as the most it could be. A value that is a percentage already
+/// (a roll mix, "+94 %" for 94; a hysteresis of 0 to 10 %) is read as it is. Told by the
+/// number shown against the `value`; where they can't tell (0 shows as 0 either way), a
+/// range no wider than ±2 is a share.
+pub(crate) fn shown_per_unit(shown: &str, value: Option<f64>, range: &std::ops::RangeInclusive<f64>) -> f64 {
+    if !shown.contains('%') {
+        return 1.0;
+    }
+    let digits: String = shown.chars().filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-')).collect();
+    let Ok(n) = digits.parse::<f64>() else { return 1.0 };
+    // Half the last digit shown: what rounding to it can account for.
+    let places = digits.split('.').nth(1).map_or(0, str::len) as i32;
+    let tol = 0.51 * 10f64.powi(-places);
+    let share = range.start().abs().max(range.end().abs()) <= 2.0;
+    match value {
+        Some(v) if (n - v * 100.0).abs() <= tol && (n - v).abs() > tol => 100.0,
+        Some(v) if (n - v).abs() <= tol && (n - v * 100.0).abs() > tol => 1.0,
+        _ if share => 100.0,
+        _ => 1.0,
+    }
+}
+
+/// The value at `at` along `range`, as `egui::widgets::value_span` places it (linear, or a
+/// log scale over a wide range from 0 up): its inverse.
+fn span_value(at: f32, range: &std::ops::RangeInclusive<f64>) -> f64 {
+    let (lo, hi) = (*range.start(), *range.end());
+    let t = f64::from(at);
+    let unit = if lo > 0.0 { lo } else { 1.0 };
+    if lo >= 0.0 && (hi - lo) / unit > 100.0 {
+        lo + unit * ((1.0 + (hi - lo) / unit).powf(t) - 1.0)
+    } else {
+        lo + t * (hi - lo)
+    }
 }
 
 /// A trace of where a body put a control, and of the column it centred it in. Nothing
@@ -3964,7 +4129,8 @@ pub(crate) fn show_knob_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Sna
     } else {
         Shape::Dial
     };
-    let font = egui::TextStyle::Small.resolve(ui.style());
+    // The reading is part of the dial's picture: the graph labels' size, not the words'.
+    let font = crate::settings::graph_font(9.0);
     let text_col = ui.visuals().strong_text_color();
     let galley = ui.painter().layout_no_wrap(knob_reading(snarl, node_id, v), font.clone(), text_col);
     let text_h = galley.size().y;
@@ -4360,5 +4526,32 @@ pub(crate) fn clear_unused_inputs(
 
 // ── Processing module body renderers ──────────────────────────────────────────
 
+#[cfg(test)]
+mod shown_per_unit_tests {
+    use super::{shown_per_unit, span_value};
 
+    // A number typed into a pill is read in what it shows: a share shown as a percentage
+    // (zoom "74%" for 0.74) takes 74 as 0.74, while a percentage that is the value (a roll
+    // mix "+94 %", a hysteresis "0.50%" of 0 to 10) takes it as it is.
+    #[test]
+    fn a_typed_number_is_read_as_the_pill_shows_it() {
+        assert_eq!(shown_per_unit("74%", Some(0.74), &(0.4..=2.0)), 100.0);
+        assert_eq!(shown_per_unit("200%", Some(2.0), &(0.4..=2.0)), 100.0);
+        assert_eq!(shown_per_unit("+94 %", Some(94.0), &(-100.0..=100.0)), 1.0);
+        assert_eq!(shown_per_unit("0.50%", Some(0.5), &(0.0..=10.0)), 1.0);
+        assert_eq!(shown_per_unit("0%", Some(0.0), &(0.0..=1.0)), 100.0, "a share at 0");
+        assert_eq!(shown_per_unit("0%", Some(0.0), &(0.0..=100.0)), 1.0, "a percentage at 0");
+        assert_eq!(shown_per_unit("30°", Some(30.0), &(0.0..=170.0)), 1.0);
+    }
 
+    // The value a pill's fill stands for, back from where egui put it along the range - a
+    // wide range from 0 on a log scale.
+    #[test]
+    fn a_pills_value_comes_back_from_its_fill() {
+        for (v, range) in [(0.74, 0.4..=2.0), (250.0, 0.0..=60_000.0), (7.0, 1.0..=1_000_000.0)] {
+            let (at, _) = egui::widgets::value_span(v, &range).expect("a span");
+            let back = span_value(at, &range);
+            assert!((back - v).abs() < v * 1e-4 + 1e-6, "{v} came back as {back}");
+        }
+    }
+}

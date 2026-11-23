@@ -298,8 +298,10 @@ fn rws_reference_frame(
 /// `FlexInputApp::update`, right after the menu overlay). No-op while hidden.
 pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     if !config_overlay_visible(ctx) {
+        crate::monitors::overlay_closed(ctx, "config");
         return;
     }
+    let frames_open = crate::monitors::overlay_frames_open(ctx, "config");
     let edit = config_overlay_edit(ctx);
     let frame_interval = Duration::from_secs_f64(1.0 / app.overlay_fps() as f64);
     // The gamepad-focused tweak-pin index (M3.5), read before the tab borrow.
@@ -391,6 +393,10 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     anchor: Default::default(),
                     pin_style: Some(2),
                     zoom: None,
+                    hidden_sections: Vec::new(),
+                    sections_open: false,
+                    graph_labels: None,
+                    text_max: None,
                 }));
                 let idx = config_layout.items.len() - 1;
                 config_layout.selected_item = Some(idx);
@@ -430,10 +436,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // Set by the top-bar checkbox to the new pass-through-default value.
     let mut set_passthrough_default: Option<bool> = None;
 
-    ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
+    crate::monitors::with_settle_passes(ctx, "config", frames_open, || ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Geometry self-correction from inside the viewport (see overlay.rs):
         // force the window to fill the monitor if the OS handed us a wrong size.
-        crate::monitors::keep_overlay_on_monitor(vctx);
+        let moved = crate::monitors::keep_overlay_on_monitor(vctx);
+        let hidden = crate::monitors::settle_overlay_frame(vctx, "config", frames_open, moved);
         let (inner_rect, child_monitor) = vctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
 
         const HIT_MARGIN: f32 = 14.0;
@@ -672,6 +679,11 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(vctx, |ui| {
+                // Still being moved onto its monitor: nothing laid out for the wrong place,
+                // and an edited layout's items not re-anchored to it.
+                if hidden {
+                    return;
+                }
                 let rect = ui.max_rect();
 
                 if pick {
@@ -797,7 +809,7 @@ pub fn show_config_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     }
                 }
             });
-    });
+    }));
 
     if enter_edit {
         set_config_overlay_edit(ctx, true);

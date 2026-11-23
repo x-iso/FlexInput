@@ -149,7 +149,12 @@ impl FlexInputApp {
             if self.nav_drive_jsm_calibrate(ctx, outer_id, nav, rt_rising) {
                 return;
             }
-            if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
+            if self.nav_on_widget_part(outer_id) {
+                // A JSM module pinned whole has its faders as stops of their own, walked onto
+                // straight from the editor: there the editor is the text alone, and the
+                // bumpers don't switch it to a second copy of the faders.
+                self.gamepad_nav.jsm_pane = crate::gamepad_nav::JsmPane::Text;
+            } else if nav.is_rising("btn_lb") || nav.is_rising("btn_rb") {
                 self.gamepad_nav.jsm_pane = self.gamepad_nav.jsm_pane.other();
             }
             // LT/RT walk the editor's own config tabs. They are free here: in
@@ -168,13 +173,8 @@ impl FlexInputApp {
                 self.nav_drive_jsm_text(ctx, outer_id, nav, step_dir);
                 return;
             }
-            // Select splits the focused setting into two faders, or joins a pair
-            // back into one. The app's own Select (Alt-Tab) stands aside while
-            // this widget is being edited — see `nav_claimed_buttons`.
-            if nav.is_rising("btn_back") {
-                self.nav_toggle_jsm_pair(ctx, outer_id);
-                return;
-            }
+            // Select on the focused fader splits or joins its pair: taken before this, by
+            // `nav_jsm_pair_select`, for every place a JSM fader is focused.
         }
         let fields = self.nav_element_fields(outer_id);
         if fields.is_empty() { return; }
@@ -1494,6 +1494,33 @@ impl crate::app::FlexInputApp {
         self.nav_driving_outer_id().is_some_and(|o| self.nav_is_jsm_editor(o))
     }
 
+    /// Whether the JSM editor that's selected takes the bumpers for its two panes: an editor
+    /// pinned by itself. One that is a stop of a module pinned whole has its faders as stops
+    /// of their own, so there the bumpers stay the layout's.
+    pub(crate) fn nav_jsm_takes_bumpers(&self) -> bool {
+        self.nav_driving_outer_id().is_some_and(|o| self.nav_is_jsm_editor(o) && !self.nav_on_widget_part(o))
+    }
+
+    /// Whether the selection is a stop of a module pinned whole (on the Easy body or the
+    /// config overlay) - the part [`Self::nav_selected_element`] names - rather than an
+    /// element pinned by itself.
+    pub(crate) fn nav_on_widget_part(&self, outer_id: egui_snarl::NodeId) -> bool {
+        let item = match self.nav_config_override(outer_id) {
+            Some((_, _, elem)) if elem == "whole_module" => self.gamepad_nav.config_index,
+            Some(_) => return false,
+            None => {
+                let canvas = &self.tabs[self.active_tab].canvas;
+                let Some(sp) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref()) else { return false };
+                let Some(sel) = sp.selected_item else { return false };
+                match sp_item_element(sp, sel) {
+                    Some((_, elem)) if elem == "whole_module" => Some(sel),
+                    _ => return false,
+                }
+            }
+        };
+        self.gamepad_nav.module_part.is_some() && self.gamepad_nav.module_part_item == item
+    }
+
     /// Is the selection a pinned JSM editor (rather than one of its faders)?
     pub(crate) fn nav_is_jsm_editor(&self, outer_id: egui_snarl::NodeId) -> bool {
         matches!(
@@ -2091,6 +2118,11 @@ impl crate::app::FlexInputApp {
     pub(crate) fn nav_claimed_buttons(&self) -> &'static [&'static str] {
         use crate::gamepad_nav::EditLevel;
         let Some(outer) = self.nav_driving_outer_id() else { return &[] };
+        // A JSM fader whose setting takes a pair, walked onto or entered: Select splits or
+        // joins it (`nav_jsm_pair_select`).
+        if self.nav_jsm_pair_action().is_some() {
+            return &["btn_back"];
+        }
         match self.gamepad_nav.edit_level {
             // Select splits / joins a pair setting's faders in the Tune pane,
             // and steps a setting's value through its words in the text pane.
@@ -2112,6 +2144,60 @@ impl crate::app::FlexInputApp {
         }
     }
 
+    /// The buttons what the pad is working in acts on right now, which every shortcut the
+    /// user assigns gives way to (`publish_nav_claims`, and the layout's tab chord): the widget
+    /// being edited, a list or panel open over everything, and at the walk a selected
+    /// widget's own buttons. Not the walk's D-pad and face buttons: those are getting about,
+    /// and the Home + D-pad shortcuts are made of them.
+    pub(crate) fn nav_context_buttons(&self) -> Vec<&'static str> {
+        use crate::gamepad_nav::EditLevel as L;
+        const DPAD: [&str; 4] = ["dpad_up", "dpad_down", "dpad_left", "dpad_right"];
+        const FACE: [&str; 4] = ["btn_south", "btn_east", "btn_west", "btn_north"];
+        const TRIGGERS: [&str; 2] = ["btn_lt_dig", "btn_rt_dig"];
+        const BUMPERS: [&str; 2] = ["btn_lb", "btn_rb"];
+        let g = &self.gamepad_nav;
+        let mut out: Vec<&'static str> = Vec::new();
+        // A list or a panel over everything has the pad while it's up: the Choose picker, the
+        // press-mode list, the MIDI editor, the presets, the gamepad settings.
+        if g.kbm_picker_open || g.press_mode_open || g.midi_modal.is_some() || g.preset_nav_open || g.settings_open {
+            out.extend(DPAD);
+            out.extend(FACE);
+            out.extend(TRIGGERS);
+            out.extend(BUMPERS);
+            return out;
+        }
+        // In a widget, or setting a device card's value: the D-pad steps and adjusts, the face
+        // buttons confirm, go back, fine-tune and reset, the triggers back out or add and
+        // remove (a curve's dots, Touch Zones' lines, a card list's filter, JSM's tabs).
+        if g.edit_level != L::Widget || g.left_edit.is_some() {
+            out.extend(DPAD);
+            out.extend(FACE);
+            out.extend(TRIGGERS);
+        }
+        // The bumpers: a card list and Touch Zones' levels jump with them, a JSM editor pinned
+        // by itself picks its pane.
+        if matches!(g.edit_level, L::RemapScroll | L::RemapCard | L::RemapMove | L::TzLines | L::TzGrab | L::TzCards)
+            || self.nav_jsm_takes_bumpers()
+        {
+            out.extend(BUMPERS);
+        }
+        // Select and Start, where the widget takes them for itself.
+        out.extend(self.nav_claimed_buttons().iter().copied());
+        if g.edit_level == L::Widget {
+            // A card widget selected cycles its filter with the triggers.
+            if self.nav_driving_outer_id().is_some_and(|o| matches!(self.nav_selected_kind(o), NavWidgetKind::Remapper)) {
+                out.extend(TRIGGERS);
+            }
+            // A device card with a gyro calibrates it on West.
+            if g.left_gyro_card.is_some() {
+                out.push("btn_west");
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Does the widget being edited take this button for itself?
     pub(crate) fn nav_widget_claims(&self, pin: &str) -> bool {
         self.nav_claimed_buttons().contains(&pin)
@@ -2125,17 +2211,46 @@ impl crate::app::FlexInputApp {
         }
     }
 
+    /// The JSM fader Select would split or join, by its key, where one is focused: a fader -
+    /// pinned by itself, or a stop of a module pinned whole - walked onto or entered, or the
+    /// fader focused in the Tune pane of an editor pinned by itself, being edited.
+    fn nav_jsm_pair_key(&self, outer_id: egui_snarl::NodeId) -> Option<String> {
+        use crate::gamepad_nav::{EditLevel, JsmPane};
+        let (mid, elem) = self.nav_selected_element(outer_id)?;
+        if mid != "module.jsm" {
+            return None;
+        }
+        let level = self.gamepad_nav.edit_level;
+        if let Some(key) = crate::canvas::viewer::jsm_knob_name_of(&elem) {
+            return matches!(level, EditLevel::Widget | EditLevel::Editing).then(|| key.to_string());
+        }
+        let tune = elem == "editor"
+            && level == EditLevel::Editing
+            && self.gamepad_nav.jsm_pane == JsmPane::Tune
+            && !self.nav_on_widget_part(outer_id);
+        if !tune {
+            return None;
+        }
+        self.nav_focused_jsm_key(outer_id)
+    }
+
+    /// Select on a focused JSM fader whose setting takes a pair: split it or join it, before
+    /// anything else reads Select - the app's Alt-Tab stands aside for it
+    /// (`nav_claimed_buttons`). True when it did.
+    pub(crate) fn nav_jsm_pair_select(&mut self, ctx: &egui::Context, outer_id: egui_snarl::NodeId, nav: &crate::gamepad_nav::NavInput) -> bool {
+        if !nav.is_rising("btn_back") || self.nav_jsm_pair_action().is_none() {
+            return false;
+        }
+        self.nav_toggle_jsm_pair(ctx, outer_id);
+        true
+    }
+
     /// What Select would do to the focused fader — "Split" or "Join" — or `None`
     /// when its setting has no pair form (so the legend only offers it where it
     /// does something).
     pub(crate) fn nav_jsm_pair_action(&self) -> Option<&'static str> {
         let outer = self.nav_driving_outer_id()?;
-        if !self.nav_is_jsm_editor(outer)
-            || self.gamepad_nav.jsm_pane != crate::gamepad_nav::JsmPane::Tune
-        {
-            return None;
-        }
-        let key = self.nav_focused_jsm_key(outer)?;
+        let key = self.nav_jsm_pair_key(outer)?;
         let k = self.nav_jsm_knobs(outer).into_iter().find(|k| k.key() == key)?;
         if !flexinput_engine::eval::jsm_pairable(&k.name) {
             return None;
@@ -2146,7 +2261,9 @@ impl crate::app::FlexInputApp {
     /// Select on a focused fader: split its setting into two faders, or join a
     /// pair back into one, then keep focus on the setting's first fader.
     fn nav_toggle_jsm_pair(&mut self, ctx: &egui::Context, outer_id: egui_snarl::NodeId) {
-        let Some(key) = self.nav_focused_jsm_key(outer_id) else { return };
+        let Some(key) = self.nav_jsm_pair_key(outer_id) else { return };
+        let fader_stop = self.nav_on_widget_part(outer_id)
+            && self.nav_selected_element(outer_id).is_some_and(|(_, e)| crate::canvas::viewer::jsm_knob_name_of(&e).is_some());
         let Some(inner) = self.nav_selected_inner_node(outer_id) else { return };
         let focus = {
             let canvas = &mut self.tabs[self.active_tab].canvas;
@@ -2158,6 +2275,11 @@ impl crate::app::FlexInputApp {
             crate::canvas::viewer::jsm_nav_toggle_pair(node, &key)
         };
         let Some(focus) = focus else { return };
+        // A fader of a module pinned whole is a stop of its own, named by its key: the walk
+        // goes on from the setting's first fader, which exists split or joined.
+        if fader_stop {
+            self.gamepad_nav.module_part = Some(crate::canvas::viewer::jsm_knob_element_id(&focus));
+        }
         // The field list just changed length under the cursor: land on the
         // setting's first fader, which exists either way.
         if let Some(i) = self.nav_element_fields(outer_id).iter().position(

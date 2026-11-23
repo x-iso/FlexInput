@@ -40,6 +40,10 @@
 //!    zeroes them before every tick and gamepad nav masks them out, each until
 //!    that button is released.
 //!
+//! The widget being worked in comes first, though: the buttons it acts on, on the pads
+//! driving FlexInput's nav ([`NavClaims`], published by the UI), are left to it - a shortcut
+//! with one of them in it doesn't see it pressed, and doesn't take it.
+//!
 //! Leaders ([`LEADER_PINS`]: Home, Capture) are HELD BACK rather than simply
 //! withheld: a leader press no shortcut ended up using is replayed to the game
 //! as a short tap on release ([`Leaders`]), unless the user gave Home to
@@ -105,6 +109,34 @@ pub struct ChordWatchConfig {
     /// The previous / next patch tab: from the nav pads, like the window shortcuts.
     pub tab_prev: Option<ShortcutSpec>,
     pub tab_next: Option<ShortcutSpec>,
+}
+
+/// The buttons FlexInput's gamepad nav is using right now - the widget being worked in, or a
+/// list open over it - on the pads driving it. The UI republishes it every frame, empty while
+/// nav isn't driving (FlexInput unfocused, say). Contextual buttons win: on those pads the
+/// watcher sees them unpressed, so a shortcut assigned to a chord with one of them in it
+/// neither fires nor takes the button away from the widget.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NavClaims {
+    pub devices: HashSet<String>,
+    pub pins: HashSet<String>,
+}
+
+impl NavClaims {
+    fn claims(&self, dev: &str, pin: &str) -> bool {
+        self.pins.contains(pin) && self.devices.contains(dev)
+    }
+}
+
+/// `snap` with the buttons `claims` leaves to FlexInput's nav unpressed.
+fn unclaimed(snap: &SignalMap, claims: &NavClaims) -> SignalMap {
+    let mut out = snap.clone();
+    for ((dev, pin), val) in out.iter_mut() {
+        if claims.claims(dev, pin) {
+            *val = Signal::Bool(false);
+        }
+    }
+    out
 }
 
 /// The six toggle flags the watcher raises; the UI loop consumes each once per
@@ -338,11 +370,14 @@ fn owned_pins(
     snap: &SignalMap,
     targets: &[Target],
     prev: &HashSet<(String, String)>,
+    claims: &NavClaims,
 ) -> HashSet<(String, String)> {
     let mut out: HashSet<(String, String)> = HashSet::new();
+    // Never a button the widget being worked in uses: Home held round a D-pad the widget is
+    // stepping with left the widget without its D-pad.
     let mut own = |dev: &str, pin: &str| {
         let key = (dev.to_string(), pin.to_string());
-        if snap.contains_key(&key) { out.insert(key); }
+        if snap.contains_key(&key) && !claims.claims(dev, pin) { out.insert(key); }
     };
     for &(spec, filter) in targets {
         let Some(spec) = spec else { continue };
@@ -497,6 +532,9 @@ pub fn spawn_chord_watcher(
     // Each pad's calibration, republished by the UI when it changes: a shortcut with a
     // trigger in it presses where the trigger is calibrated to (`calibrated_triggers`).
     pad_cals: Arc<RwLock<HashMap<String, flexinput_engine::eval::PadCalibration>>>,
+    // The buttons the widget being worked in uses, on the nav pads: left to it. See
+    // [`NavClaims`].
+    nav_claims: Arc<RwLock<NavClaims>>,
     proc_device_signals: flexinput_engine::ArcSignals,
     // Where the owned buttons are published: the engine blocks them from the
     // game, gamepad nav masks them. See [`owned_pins`].
@@ -558,6 +596,16 @@ pub fn spawn_chord_watcher(
                 } else {
                     &raw
                 };
+                // The widget being worked in keeps its buttons: on the nav pads they read as
+                // unpressed here. (After the triggers are worked out, which reads the analog.)
+                let claims = nav_claims.read().map(|c| c.clone()).unwrap_or_default();
+                let masked;
+                let snap: &SignalMap = if claims.pins.is_empty() || claims.devices.is_empty() {
+                    snap
+                } else {
+                    masked = unclaimed(snap, &claims);
+                    &masked
+                };
                 let held: [bool; 8] = std::array::from_fn(|i| combos[i]
                     .map_or(false, |c| combo_held(&snap, c, targets[i].1)));
 
@@ -591,7 +639,7 @@ pub fn spawn_chord_watcher(
                 // lets a replayed key through its shortcut block.
                 let now_replay = leaders.update(&snap, &targets, &fired,
                     cfg.home_exclusive, Instant::now());
-                let now_owned = owned_pins(&snap, &targets, &owned);
+                let now_owned = owned_pins(&snap, &targets, &owned, &claims);
                 if now_replay != replay {
                     if let Ok(mut g) = replay_out.write() {
                         *g = now_replay.clone();
@@ -761,11 +809,11 @@ mod chord_tests {
         let mut s = snap(&[(pad, "btn_guide", false), (pad, "dpad_up", false), (pad, "btn_south", false)]);
         s.insert(key(pad, "dpad"), Signal::Vec2(Default::default()));
 
-        let idle = owned_pins(&s, &targets, &HashSet::new());
+        let idle = owned_pins(&s, &targets, &HashSet::new(), &NavClaims::default());
         assert_eq!(idle, HashSet::from([key(pad, "btn_guide")]));
 
         s.insert(key(pad, "btn_guide"), Signal::Bool(true));
-        let leading = owned_pins(&s, &targets, &idle);
+        let leading = owned_pins(&s, &targets, &idle, &NavClaims::default());
         assert!(leading.contains(&key(pad, "dpad_up")), "D-pad owned before it's pressed");
         assert!(leading.contains(&key(pad, "dpad")), "hat follows the digital direction");
         assert!(!leading.contains(&key(pad, "btn_south")));
@@ -773,11 +821,11 @@ mod chord_tests {
         // Home let go first, D-pad still held: still withheld.
         s.insert(key(pad, "dpad_up"), Signal::Bool(true));
         s.insert(key(pad, "btn_guide"), Signal::Bool(false));
-        let trailing = owned_pins(&s, &targets, &leading);
+        let trailing = owned_pins(&s, &targets, &leading, &NavClaims::default());
         assert!(trailing.contains(&key(pad, "dpad_up")));
 
         s.insert(key(pad, "dpad_up"), Signal::Bool(false));
-        assert_eq!(owned_pins(&s, &targets, &trailing), idle);
+        assert_eq!(owned_pins(&s, &targets, &trailing, &NavClaims::default()), idle);
     }
 
     /// A shortcut with a trigger in it presses where the trigger is calibrated to, not where
@@ -807,7 +855,7 @@ mod chord_tests {
         let mic = spec(&["btn_mute"], "long");
         let targets: [Target; 1] = [(&mic, None)];
         let s = snap(&[("gilrs:ps5:0", "btn_mute", false)]);
-        assert!(owned_pins(&s, &targets, &HashSet::new()).is_empty());
+        assert!(owned_pins(&s, &targets, &HashSet::new(), &NavClaims::default()).is_empty());
     }
 
     const PAD: &str = "gilrs:switch:0";
@@ -897,9 +945,9 @@ mod chord_tests {
         let both = spec(&["btn_lb", "btn_rb"], "long");
         let targets: [Target; 1] = [(&both, None)];
         let s = snap(&[("gilrs:xinput:0", "btn_lb", true), ("gilrs:xinput:0", "btn_rb", false)]);
-        assert!(owned_pins(&s, &targets, &HashSet::new()).is_empty());
+        assert!(owned_pins(&s, &targets, &HashSet::new(), &NavClaims::default()).is_empty());
         let s = snap(&[("gilrs:xinput:0", "btn_lb", true), ("gilrs:xinput:0", "btn_rb", true)]);
-        assert_eq!(owned_pins(&s, &targets, &HashSet::new()).len(), 2);
+        assert_eq!(owned_pins(&s, &targets, &HashSet::new(), &NavClaims::default()).len(), 2);
     }
 
     /// A single ordinary pad holding both buttons fires, as it always did.
@@ -910,5 +958,35 @@ mod chord_tests {
             ("gilrs:xinput:0", "btn_back", true),
         ]);
         assert!(combo_held(&s, &combo(&["btn_guide", "btn_back"]), None));
+    }
+
+    /// The widget being worked in keeps its buttons: Home + D-pad up (the info overlay's
+    /// default) doesn't fire from a nav pad whose D-pad the widget is stepping with, and
+    /// doesn't take the D-pad from it - while the same chord on another pad still does.
+    #[test]
+    fn a_shortcut_stands_aside_for_the_buttons_the_widget_uses() {
+        let nav = "gilrs:ds4:1";
+        let other = "gilrs:ds4:2";
+        let s = snap(&[
+            (nav, "btn_guide", true), (nav, "dpad_up", true),
+            (other, "btn_guide", true), (other, "dpad_up", true),
+        ]);
+        let claims = NavClaims {
+            devices: [nav.to_string()].into_iter().collect(),
+            pins: ["dpad_up".to_string(), "btn_south".to_string()].into_iter().collect(),
+        };
+        let chord = combo(&["btn_guide", "dpad_up"]);
+        let only = |dev: &str| -> HashSet<String> { [dev.to_string()].into_iter().collect() };
+        let left = unclaimed(&s, &claims);
+        assert!(!combo_held(&left, &chord, Some(&only(nav))), "it fired on the nav pad");
+        assert!(combo_held(&left, &chord, Some(&only(other))), "and not on another");
+        let spec = Some(ShortcutSpec { combo: chord.clone(), mode: "down".into(), gap_ms: 200.0 });
+        let targets: [Target; 1] = [(&spec, None)];
+        let owned = owned_pins(&left, &targets, &HashSet::new(), &claims);
+        assert!(!owned.contains(&(nav.to_string(), "dpad_up".to_string())), "it took the widget's D-pad");
+        assert!(owned.contains(&(nav.to_string(), "btn_guide".to_string())), "Home is still held back");
+        assert!(owned.contains(&(other.to_string(), "dpad_up".to_string())), "the other pad's chord owns its D-pad");
+        // Nothing claimed: as before.
+        assert!(combo_held(&unclaimed(&s, &NavClaims::default()), &chord, Some(&only(nav))));
     }
 }

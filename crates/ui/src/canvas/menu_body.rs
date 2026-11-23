@@ -1970,7 +1970,7 @@ fn menu_options_pills(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Node
         rects.push(cells[k]);
         let shown = format!("{gyro_sens:.2}");
         if real_pill(ui, node_id, "vm_gyro_sens", cells[k + 1], "×|gyro ×", &mut gyro_sens, &shown, 0.5..=8.0, 0.02,
-            "Gyro pointer sensitivity. 1 ≈ 10× the raw rotation rate; raise it if the gyro feels too weak to reach the zones.")
+            "Gyro pointer sensitivity. 1 ≈ 10× the raw rotation rate; raise it if the gyro feels too weak to reach the zones.", 4.0)
         {
             set.push(("ptr_gyro_sens", serde_json::json!(gyro_sens)));
         }
@@ -2002,14 +2002,14 @@ fn menu_options_pills(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<Node
     rects.push(cells[1]);
     let shown = format!("{dz:.2}");
     if real_pill(ui, node_id, "vm_dz", cells[2], "dz|deadzone", &mut dz, &shown, 0.0..=0.9, 0.004,
-        "Pointer deflection below this doesn't move the highlight.")
+        "Pointer deflection below this doesn't move the highlight.", 0.25)
     {
         set.push(("pointer_deadzone", serde_json::json!(dz)));
     }
     rects.push(cells[2]);
     let shown = format!("{linger:.2} s");
     if real_pill(ui, node_id, "vm_linger", cells[3], "linger", &mut linger, &shown, 0.0..=10.0, 0.02,
-        "After a selection is accepted the menu hides immediately, but the chosen zone cell stays on screen this long, then fades out. 0 = the whole menu disappears at once.")
+        "After a selection is accepted the menu hides immediately, but the chosen zone cell stays on screen this long, then fades out. 0 = the whole menu disappears at once.", 0.5)
     {
         set.push(("select_linger", serde_json::json!(linger)));
     }

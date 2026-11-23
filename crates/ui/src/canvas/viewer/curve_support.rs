@@ -250,7 +250,12 @@ pub(crate) fn log_exp_slider(ui: &mut egui::Ui, id: egui::Id, size: egui::Vec2, 
 /// font's 🔗 renders as something else): two interlocked links while on,
 /// pulled apart while off. Returns the response; the caller acts on clicks.
 pub(crate) fn link_toggle(ui: &mut egui::Ui, linked: bool, hover: &str) -> egui::Response {
-    let h = ui.text_style_height(&egui::TextStyle::Small).max(10.0);
+    // As tall as a line of the small words, but never wider or taller than where it's put:
+    // between two linked pills its slot is a fixed few points, and sized by the words alone -
+    // the pills' size since those grew - it spilled onto the pill to its right.
+    let room = ui.available_size();
+    let h = ui.text_style_height(&egui::TextStyle::Small).max(10.0).min(room.y.max(8.0));
+    let h = h.min(room.x.max(8.0) / 1.3);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(h * 1.3, h), egui::Sense::click());
     let painter = ui.painter_at(rect.expand(1.0));
     let vis = ui.style().interact_selectable(&resp, linked);
@@ -411,7 +416,7 @@ pub(crate) fn snap_point(
 /// where that would run off the graph, on a dark backing.
 pub(crate) fn paint_point_value(painter: &egui::Painter, rect: egui::Rect, at: egui::Pos2, text: String) {
     let col = Color32::from_rgba_unmultiplied(225, 225, 225, 230);
-    let g = painter.layout_no_wrap(text, crate::settings::ui_font(9.0), col);
+    let g = painter.layout_no_wrap(text, crate::settings::graph_font(9.0), col);
     let size = g.size() + egui::vec2(4.0, 2.0);
     let right = at.x + 7.0 + size.x <= rect.right();
     let min = egui::pos2(if right { at.x + 7.0 } else { at.x - 7.0 - size.x }, (at.y - 7.0 - size.y).max(rect.top()));
@@ -461,7 +466,7 @@ pub(crate) fn paint_cursor_reading(
     painter.circle_stroke(on_curve, 4.0, egui::Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 200)));
 
     let col = Color32::from_rgba_unmultiplied(235, 235, 235, 240);
-    let g = painter.layout_no_wrap(text(gx, gy), crate::settings::ui_font(10.0), col);
+    let g = painter.layout_no_wrap(text(gx, gy), crate::settings::graph_font(10.0), col);
     let size = g.size() + egui::vec2(6.0, 3.0);
     let x = if at.x + 12.0 + size.x <= rect.right() { at.x + 12.0 } else { at.x - 12.0 - size.x };
     let y = (at.y + 14.0).min(rect.bottom() - size.y).max(rect.top());
@@ -1238,7 +1243,7 @@ pub(crate) fn paint_axis_labels(
     const ROW_H: f32 = 10.0;
     const GAP: f32 = 3.0;
     let col = Color32::from_rgba_unmultiplied(180, 180, 180, 160);
-    let font = crate::settings::ui_font(9.0);
+    let font = crate::settings::graph_font(9.0);
     let mut row_end = [f32::NEG_INFINITY; 2];
     let mut rows_used = 0usize;
     for (sx, text) in xs {
@@ -1274,7 +1279,7 @@ pub(crate) fn paint_curve_legend(
     if labels.is_empty() {
         return;
     }
-    let font = crate::settings::ui_font(10.0);
+    let font = crate::settings::graph_font(10.0);
     let galleys: Vec<_> = labels.iter().enumerate()
         .map(|(ch, l)| painter.layout_no_wrap(l.to_string(), font.clone(), color_of(ch)))
         .collect();
@@ -2582,5 +2587,30 @@ mod refinement_tests {
         }
         assert!(trail.len() <= 122, "{}", trail.len());
         assert_eq!(trail.back().unwrap().0, 359.0, "the head is always the newest sample");
+    }
+}
+
+#[cfg(test)]
+mod link_toggle_tests {
+    // The link between two linked pills sits in a slot a few points wide. Sized by the small
+    // words alone it grew with them, past its slot and onto the pill to its right; it keeps
+    // to the slot now, however large the words are.
+    #[test]
+    fn a_link_keeps_to_its_slot_whatever_the_words_size() {
+        let ctx = egui::Context::default();
+        let slot = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(18.0, 22.0));
+        let mut drawn = egui::Rect::NOTHING;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.style_mut().text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(18.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(slot)
+                        .layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                );
+                drawn = super::link_toggle(&mut child, true, "").rect;
+            });
+        });
+        assert!(slot.expand(0.5).contains_rect(drawn), "the link {drawn:?} out of its slot {slot:?}");
     }
 }

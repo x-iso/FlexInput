@@ -1577,7 +1577,7 @@ pub(crate) fn show_twoway_response_curve_body(
             changed |= ui
                 .add_enabled_ui(hyst_single, |ui| {
                     real_pill(ui, node_id, "tw_hyst", cells[0], "hyst|hysteresis", &mut h_pct, &shown, 0.0..=TWOWAY_HYST_MAX_PCT, 0.01,
-                        if hyst_single { HYST_HINT } else { HYST_GRAPH_HINT })
+                        if hyst_single { HYST_HINT } else { HYST_GRAPH_HINT }, 0.5)
                 })
                 .inner;
             if let Some(d) = segmented(ui, cells[1], &h_dir, &dirs(HYST_DIR_HINTS), ("tw_hyst_dir", node_id.0)) {
@@ -1594,9 +1594,9 @@ pub(crate) fn show_twoway_response_curve_body(
             let cells = pill_bands(ui, w, &[130.0, 130.0, TW_DIR_W]);
             let shown = format!("{i_ms:.0} ms");
             changed |= real_pill(ui, node_id, "tw_interp", cells[0], "\u{21CC}|crossover", &mut i_ms, &shown, 0.0..=500.0, 1.0,
-                "How long the output takes to cross from one curve to the other when the input turns round.");
+                "How long the output takes to cross from one curve to the other when the input turns round.", 50.0);
             let shown = format!("{ph_ms:.1} ms");
-            changed |= real_pill(ui, node_id, "tw_peak", cells[1], "peak|peak hold", &mut ph_ms, &shown, 0.0..=200.0, 0.5, PEAK_HOLD_HINT);
+            changed |= real_pill(ui, node_id, "tw_peak", cells[1], "peak|peak hold", &mut ph_ms, &shown, 0.0..=200.0, 0.5, PEAK_HOLD_HINT, 0.0);
             if let Some(d) = segmented(ui, cells[2], &ph_dir, &dirs(PEAK_DIR_HINTS), ("tw_peak_dir", node_id.0)) {
                 ph_dir = d;
                 changed = true;
@@ -2211,7 +2211,7 @@ impl TwowayGeom {
         painter.line_segment([egui::pos2(ex, self.rect.top()), egui::pos2(ex, self.rect.bottom())],
             egui::Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(cr, cg, cb, 140)));
         painter.text(egui::pos2(ex, self.rect.top() + 1.0), egui::Align2::CENTER_TOP, glyph,
-            crate::settings::ui_font(9.0), Color32::from_rgba_unmultiplied(cr, cg, cb, 200));
+            crate::settings::graph_font(9.0), Color32::from_rgba_unmultiplied(cr, cg, cb, 200));
     }
 }
 

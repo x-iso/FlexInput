@@ -14,7 +14,7 @@ use crate::{
     canvas::{Canvas, NodeData},
     canvas::node::{ExposedModule, UiSubPatch},
     canvas::ClipboardData,
-    guide_watcher::{spawn_chord_watcher, ChordWatchConfig, ShortcutSpec, ShortcutToggles},
+    guide_watcher::{spawn_chord_watcher, ChordWatchConfig, NavClaims, ShortcutSpec, ShortcutToggles},
     panels::{physical_devices, virtual_devices::{SharedDevicePool, VirtualDevicePanel}},
     panic_hotkey::{load_panic_shortcut, save_panic_shortcut, spawn_panic_hotkey_listener},
     pin_hotkey::spawn_pin_hotkey_listener,
@@ -586,6 +586,9 @@ pub struct FlexInputApp {
     /// Devices currently selected for UI navigation (nav mode on), republished
     /// each frame for the background shortcut watcher's nav-only device filter.
     nav_enabled_devices: Arc<RwLock<HashSet<String>>>,
+    /// The buttons the widget being worked in uses, on the pads driving nav, for the
+    /// gamepad-shortcut watcher to leave alone (`publish_nav_claims`).
+    nav_claims: Arc<RwLock<NavClaims>>,
     /// [`Self::pad_cals`] for the gamepad-shortcut watcher, republished when it changes, so
     /// a shortcut with a trigger in it presses where the trigger is calibrated to.
     shared_pad_cals: Arc<RwLock<HashMap<String, flexinput_engine::eval::PadCalibration>>>,
@@ -1142,6 +1145,7 @@ impl FlexInputApp {
         // in `chord_watch_config_from`). Drives the toggle flags below.
         let config_chord_cfg = Arc::new(RwLock::new(chord_watch_config_from(&app_settings)));
         let nav_enabled_devices = Arc::new(RwLock::new(HashSet::new()));
+        let nav_claims = Arc::new(RwLock::new(NavClaims::default()));
         let shared_pad_cals = Arc::new(RwLock::new(HashMap::new()));
         let seethrough_toggle_requested = Arc::new(AtomicBool::new(false));
         spawn_pin_hotkey_listener(
@@ -1195,6 +1199,7 @@ impl FlexInputApp {
             },
             Arc::clone(&nav_enabled_devices),
             Arc::clone(&shared_pad_cals),
+            Arc::clone(&nav_claims),
             Arc::clone(&proc_device_signals),
             Arc::clone(&shortcut_owned),
             shortcut_replay,
@@ -1335,6 +1340,7 @@ impl FlexInputApp {
             pin_shortcut_shared,
             config_chord_cfg,
             nav_enabled_devices,
+            nav_claims,
             shared_pad_cals,
             pin_learning: false,
             overlay_toggle_requested,
@@ -2929,6 +2935,10 @@ impl FlexInputApp {
         // viewport (not the root) holds focus while the user drives it — so it
         // enables nav regardless of easy-mode / root focus.
         let config_visible = crate::config_overlay::config_overlay_visible(ctx);
+        {
+            let view = if config_visible { crate::canvas::viewer::config_overlay_viewport() } else { egui::ViewportId::ROOT };
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(crate::widgets::NAV_VIEW_KEY), view));
+        }
         // Closing the overlay mid-edit must not leave the shared nav state
         // (edit_level + the config override) pointed at a config pin — that would
         // hijack the main sub-patch nav. Reset on close.
@@ -3093,9 +3103,12 @@ impl FlexInputApp {
                 // No nav-enabled device at all → clear stale edge state.
                 self.gamepad_nav.prev_pressed.clear();
                 self.gamepad_nav.active_dev = None;
+                // Nav isn't driving: every shortcut has its buttons back.
+                self.publish_nav_claims(&[]);
                 return;
             }
         };
+        self.publish_nav_claims(&nav_devs);
         // When nav STARTS (no pad drove it last frame), suppress this frame's
         // rising edges so buttons already held — e.g. the press that focused the
         // window — don't fire an action; the user must release+repress to act.
@@ -3307,39 +3320,38 @@ impl FlexInputApp {
         }
 
         // ── LB/RB: switch tabs ───────────────────────────────────────────────
-        // Reserved while editing Touch Zones: line editing uses the bumpers to
-        // switch the focused PAD, and the cards widget uses them to cycle zones,
-        // so they must not also flip tabs.
-        let tz_editing = matches!(self.gamepad_nav.edit_level,
-            crate::gamepad_nav::EditLevel::TzLines | crate::gamepad_nav::EditLevel::TzGrab
-            | crate::gamepad_nav::EditLevel::TzCards)
+        // Only from the walk: inside a widget the bumpers are its own or nothing. Touch
+        // Zones' line editing switches the focused PAD with them and its cards cycle zones,
+        // an entered card list (Remapper, Map Action, a Lean list) jumps between its action
+        // row and its cards - and in a widget that has no use for them, a tab switched
+        // mid-edit took the selection from under the edit and left its undo step hanging.
+        let tz_editing = self.gamepad_nav.edit_level != crate::gamepad_nav::EditLevel::Widget
             // The JSM editor reserves the bumpers from the moment it is
             // SELECTED, not just once entered: they choose which of its two
             // panes you are about to work in, so they have to belong to it
             // before you commit to one. Move the selection off the editor to get
-            // tab switching back.
-            || self.nav_jsm_editor_selected()
-            // An entered card list (Remapper, Map Action, a Lean list): LB / RB
-            // jump between its action row and its cards.
-            || matches!(self.gamepad_nav.edit_level,
-                crate::gamepad_nav::EditLevel::RemapScroll | crate::gamepad_nav::EditLevel::RemapCard
-                | crate::gamepad_nav::EditLevel::RemapMove);
-        // The layout's tabs (LB / RB unless rebound); a layout without tabs leaves them to
-        // the patch tabs, which also have their own shortcut (Home + LB / RB).
-        let tab_step = if gn::combo_rising(&nav, self.settings.layout_tab_next_chord.as_deref()) {
+            // tab switching back. (Not the editor of a module pinned whole: its
+            // faders are stops of their own there, and it has no panes to pick.)
+            || self.nav_jsm_takes_bumpers();
+        // The layout's tabs (LB / RB unless rebound), in this patch only: a layout without
+        // tabs does nothing with them. (It handed them to the patch tabs, so in a patch with
+        // no layout tabs they took you to the next patch and switched its layout's tab; the
+        // patch tabs have their own shortcut, Home + LB / RB.)
+        // And like every shortcut the user assigns, never on a button the widget selected uses:
+        // the layout's tabs bound to the triggers wait while a card widget cycles its filter
+        // with them.
+        let context = self.nav_context_buttons();
+        let free = |chord: Option<&[String]>| !chord.is_some_and(|c| c.iter().any(|p| context.contains(&p.as_str())));
+        let (next, prev) = (self.settings.layout_tab_next_chord.as_deref(), self.settings.layout_tab_prev_chord.as_deref());
+        let tab_step = if free(next) && gn::combo_rising(&nav, next) {
             1
-        } else if gn::combo_rising(&nav, self.settings.layout_tab_prev_chord.as_deref()) {
+        } else if free(prev) && gn::combo_rising(&nav, prev) {
             -1
         } else {
             0
         };
-        if !tz_editing && tab_step != 0 && self.step_layout_tab(ctx, tab_step).is_none() {
-            if tab_step < 0 && self.active_tab > 0 {
-                self.set_active_tab(self.active_tab - 1);
-            }
-            if tab_step > 0 && self.active_tab + 1 < self.tabs.len() {
-                self.set_active_tab(self.active_tab + 1);
-            }
+        if !tz_editing && tab_step != 0 {
+            let _ = self.step_layout_tab(ctx, tab_step);
         }
 
         // ── Undo / redo ──────────────────────────────────────────────────────
@@ -3440,6 +3452,34 @@ impl FlexInputApp {
         self.gamepad_nav.module_field = None;
         self.gamepad_nav.module_part_item = None;
         Some(true)
+    }
+
+    /// Hand the gamepad-shortcut watcher the buttons the widget being worked in uses
+    /// (`nav_context_buttons`) on `devices`, the pads driving nav this frame - none while nav
+    /// isn't driving. Contextual buttons win: there, a shortcut the user assigned to a chord
+    /// with one of them in it stands aside. Written only when it changes.
+    fn publish_nav_claims(&self, devices: &[String]) {
+        let pins: HashSet<String> = if devices.is_empty() {
+            HashSet::new()
+        } else {
+            self.nav_context_buttons().into_iter().map(str::to_string).collect()
+        };
+        let devices = if pins.is_empty() { HashSet::new() } else { devices.iter().cloned().collect() };
+        let want = NavClaims { devices, pins };
+        if self.nav_claims.read().map(|c| *c != want).unwrap_or(true) {
+            if let Ok(mut c) = self.nav_claims.write() {
+                *c = want;
+            }
+        }
+    }
+
+    /// Whether the Easy body's layout has tabs for LB / RB to step through.
+    pub(crate) fn easy_layout_has_tabs(&self) -> bool {
+        self.settings.ui_mode == settings::UiMode::Easy
+            && self.nav_active_subpatch_id()
+                .and_then(|id| self.tabs[self.active_tab].canvas.snarl.get_node(id))
+                .and_then(|n| n.subpatch.as_ref())
+                .is_some_and(|sp| sp.layout_tabs.len() >= 2)
     }
 
     pub(crate) fn nav_active_subpatch_id(&self) -> Option<egui_snarl::NodeId> {
@@ -3561,6 +3601,13 @@ impl FlexInputApp {
         } else {
             self.gamepad_nav.repeat_dir = None;
             self.gamepad_nav.repeat_accum = 0.0;
+        }
+
+        // Select on a JSM fader that splits or joins: walked onto or entered, the same.
+        if matches!(self.gamepad_nav.edit_level, EditLevel::Widget | EditLevel::Editing)
+            && self.nav_jsm_pair_select(ctx, outer_id, nav)
+        {
+            return;
         }
 
         match self.gamepad_nav.edit_level {

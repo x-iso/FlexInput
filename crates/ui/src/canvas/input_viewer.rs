@@ -340,7 +340,7 @@ pub(crate) fn paint_viewer_board(
                 glyph_chip(ui, &painter, skin, tint, pin, at(px, py), 20.6 * s, glow(pin), accent);
                 painter.text(
                     at(px, py), egui::Align2::CENTER_CENTER, label,
-                    crate::settings::ui_font(7.0 * s), crate::settings::tinted_gray(210),
+                    crate::settings::graph_font(7.0 * s), crate::settings::tinted_gray(210),
                 );
             }
         }
@@ -610,7 +610,7 @@ fn glyph_chip(
         // No glyph mapped: text pill fallback.
         painter.text(
             center, egui::Align2::CENTER_CENTER, pin,
-            crate::settings::ui_font(size * 0.35), crate::settings::tinted_gray(160),
+            crate::settings::graph_font(size * 0.35), crate::settings::tinted_gray(160),
         );
         return;
     };

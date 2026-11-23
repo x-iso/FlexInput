@@ -149,7 +149,7 @@ pub(crate) fn layout_toolbar_controls_core(
             let mut pct = 100.0 / cells as f32;
             let shown = format!("{pct:.1}%");
             if curve_rows::real_pill(ui, node, "grid_pct", r, "grid", &mut pct, &shown, 100.0 / 99.0..=100.0 / 9.0, 0.02,
-                "The grid's cell, as a share of the screen each way (smaller is finer). It lines up with the 3x3 anchor zones.")
+                "The grid's cell, as a share of the screen each way (smaller is finer). It lines up with the 3x3 anchor zones.", 100.0 / crate::canvas::node::default_overlay_divisions() as f32)
             {
                 *state.snap_grid_px = (((100.0 / pct.max(0.01)) / 3.0).round() * 3.0).clamp(9.0, 99.0) as u32;
             }
@@ -157,7 +157,7 @@ pub(crate) fn layout_toolbar_controls_core(
             let mut g = f64::from(*state.snap_grid_px);
             let shown = format!("{g:.0} px");
             if curve_rows::count_pill(ui, node, "grid_px", r, "grid", &mut g, &shown, 2.0..=64.0, 0.25,
-                "The grid's step, in points (even numbers)")
+                "The grid's step, in points (even numbers)", f64::from(crate::canvas::node::default_snap_grid_px()))
             {
                 *state.snap_grid_px = ((g.round() as u32).max(2) / 2) * 2;
             }
@@ -902,6 +902,8 @@ pub(crate) struct ItemStyle {
     // background, outline, and per-channel line/dot colors together. Applied
     // only onto other graph pins (see `apply_to`).
     graph: Option<crate::canvas::node::PinGraphOverride>,
+    /// A module pin's text cap (`ExposedModule::text_max`; `Some(None)`: none).
+    text_max: Option<Option<f32>>,
     // Text-pin / switch-pin overrides are deliberately NOT bulk-propagated
     // here (they're per-module-kind and rarely span a mixed selection); the
     // decoration-level fill/stroke covers the common decoration case.
@@ -911,7 +913,7 @@ impl ItemStyle {
     pub(crate) fn any(&self) -> bool {
         self.fill.is_some() || self.stroke.is_some() || self.stroke_px.is_some()
             || self.corner_radius.is_some() || self.font_size.is_some()
-            || self.fill_gradient.is_some() || self.graph.is_some()
+            || self.fill_gradient.is_some() || self.graph.is_some() || self.text_max.is_some()
     }
     /// Build the set of fields that differ between `self` (before) and `after`.
     pub(crate) fn diff(&self, after: &ItemStyle) -> ItemStyle {
@@ -933,6 +935,7 @@ impl ItemStyle {
                 (b, Some(a)) if b.as_ref() != Some(a) => Some(a.clone()),
                 _ => None,
             },
+            text_max: pick(self.text_max, after.text_max),
         }
     }
     /// Apply each changed field to `it` where that field exists on the item.
@@ -947,6 +950,9 @@ impl ItemStyle {
                         && g.outline_px.is_none() && g.gridline.is_none()
                         && g.channel_colors.iter().all(|c| c.is_none());
                     m.graph_override = if empty { None } else { Some(g.clone()) };
+                }
+                if let Some(v) = self.text_max {
+                    m.text_max = v;
                 }
                 return;
             }
@@ -1021,6 +1027,7 @@ pub(crate) fn item_style_of(it: &LayoutItem) -> ItemStyle {
         // inert for other module kinds.
         LayoutItem::Module(m) => ItemStyle {
             graph: m.graph_override.clone(),
+            text_max: Some(m.text_max),
             ..ItemStyle::default()
         },
     }

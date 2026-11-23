@@ -380,7 +380,7 @@ fn stats_table(rows: &[(String, Kind, ChStats, f32)], fit: usize) -> (String, Ve
 /// A label with a dark backing, so it reads over traces and guides. Returns
 /// its width.
 fn backed_text(p: &egui::Painter, pos: egui::Pos2, align: egui::Align2, text: String, size: f32, col: Color32) -> f32 {
-    let galley = p.layout_no_wrap(text, crate::settings::ui_font(size), col);
+    let galley = p.layout_no_wrap(text, crate::settings::graph_font(size), col);
     let rect = align.anchor_size(pos, galley.size());
     p.rect_filled(rect.expand2(egui::vec2(2.0, 0.0)), 2.0, Color32::from_black_alpha(150));
     p.galley(rect.min, galley, col);
@@ -846,7 +846,7 @@ fn paint_scope(
             .map(|&ch| (f.name(ch), f.kind_of(ch), held[ch], scale_of(ch)))
             .collect();
         if !rows.is_empty() {
-            let font = egui::FontId::monospace(10.0);
+            let font = egui::FontId::monospace(10.0 * crate::canvas::viewer::simple_bodies::graph_label_scale());
             let cw = painter.layout_no_wrap("0".into(), font.clone(), Color32::WHITE).size().x.max(1.0);
             let x0 = rect.left() + 4.0 + if left_w > 0.0 { left_w + 6.0 } else { 0.0 };
             let x1 = rect.right() - 4.0 - if right_w > 0.0 { right_w + 6.0 } else { 0.0 };
@@ -896,7 +896,7 @@ fn paint_scope(
                 let (dec, w) = value_format(kind, scale_of(ch));
                 lines.push((format!("{:<name_w$} {:>+w$.dec$}{}", f.name(ch), val * kind.full_scale(), kind.suffix()), col));
             }
-            let font = egui::FontId::monospace(10.0);
+            let font = egui::FontId::monospace(10.0 * crate::canvas::viewer::simple_bodies::graph_label_scale());
             let galleys: Vec<_> = lines.into_iter().map(|(t, c)| painter.layout_no_wrap(t, font.clone(), c)).collect();
             let bw = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max);
             let bh: f32 = galleys.iter().map(|g| g.size().y + 1.0).sum();
@@ -914,7 +914,7 @@ fn paint_scope(
 
     if waiting {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Waiting for trigger…",
-            crate::settings::ui_font(11.0), crate::settings::tinted_gray(90));
+            crate::settings::graph_font(11.0), crate::settings::tinted_gray(90));
     }
     // Frozen: a blue frame, and the word at the bottom left, clear of the
     // statistics and the value labels.
@@ -1191,13 +1191,13 @@ fn body_rows(
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(s[0]).id_salt(("scope_scale_auto", spec.salt, node_id)));
             child.disable();
             real_pill(&mut child, node_id, &format!("{}_scale_auto", spec.salt), s[0], "scale", &mut v, "auto", 0.0..=1.0, 0.0,
-                "Auto fits each kind of signal's scale to its peak");
+                "Auto fits each kind of signal's scale to its peak", None);
         } else {
             let fs = c.kind.full_scale();
             let shown = format!("{:.3}{}", c.phys, c.kind.suffix());
             let per_px = (c.phys.abs() * 0.01).max(MIN_SCALE * fs);
             if real_pill(ui, node_id, &format!("{}_scale", spec.salt), s[0], "scale", &mut c.phys, &shown,
-                MIN_SCALE * fs..=MAX_SCALE * fs, per_px, "The value at the top of the plot (±, in Bi)")
+                MIN_SCALE * fs..=MAX_SCALE * fs, per_px, "The value at the top of the plot (±, in Bi)", None)
             {
                 c.scale_edited = true;
                 changed = true;
@@ -1264,7 +1264,7 @@ fn body_rows(
         {
             let mut f = f64::from(*v);
             if count_pill(ui, node_id, &format!("{}_grid_{i}", spec.salt), s[i], label, &mut f, &format!("{}", *v),
-                f64::from(lo)..=f64::from(hi), 0.08, hint)
+                f64::from(lo)..=f64::from(hi), 0.08, hint, None)
             {
                 *v = f.round().max(f64::from(lo)).min(f64::from(hi)) as u32;
                 grid_changed = true;

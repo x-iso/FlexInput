@@ -66,7 +66,9 @@ pub(crate) fn show_jsm_body(
     body_w: f32,
     body_h: f32,
 ) {
-    jsm_body(node_id, ui, snarl, None, Some((body_w, body_h)), live, parent, None);
+    // Pinned whole, the pin's colours (none on the canvas).
+    let paint = super::chrome::pin_graph();
+    jsm_body(node_id, ui, snarl, None, Some((body_w, body_h)), live, parent, paint.as_ref());
 }
 
 /// Where the tuning strip sits relative to the editor.

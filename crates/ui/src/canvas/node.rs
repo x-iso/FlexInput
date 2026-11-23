@@ -247,11 +247,67 @@ pub struct ExposedModule {
     /// `pinned::render_module_widget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zoom: Option<f32>,
+    /// A module pinned whole: the sections of its body the widget leaves out, by their keys
+    /// (`curve_rows::section`'s). Empty: every section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_sections: Vec<String>,
+    /// A module pinned whole: its sections always open, their headings with nothing to fold.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sections_open: bool,
+    /// How large the labels inside its graph or picture are drawn - a curve's axis marks, a
+    /// scope's scale, the 3DOF preview's degrees and legend - as a share of their own size.
+    /// Absent is 1. Set in the Inspector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_labels: Option<f32>,
+    /// The largest its text is drawn, in the points of the text size setting (Settings →
+    /// Display): a larger setting leaves the pin as it is at this - its words, its pills and
+    /// the rows they make, which a larger font widens onto more lines. Absent follows the
+    /// setting. Set in the Inspector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_max: Option<f32>,
     /// Which of its layout's tabs this is on ([`ALL_TABS`]: every one). A layout without
     /// tabs shows everything, so this reads 0 until tabs are made.
     #[serde(default, skip_serializing_if = "is_first_tab")]
     pub tab: u8,
 }
+
+/// How a module pinned whole is drawn: its [`ExposedModule::zoom`] (1 when absent), the
+/// sections it leaves out and whether its sections stay open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WidgetLook {
+    pub zoom: f32,
+    pub hidden_sections: Vec<String>,
+    pub sections_open: bool,
+    /// [`ExposedModule::graph_labels`], 1 when absent.
+    pub graph_labels: f32,
+    /// [`ExposedModule::text_max`].
+    pub text_max: Option<f32>,
+}
+
+impl Default for WidgetLook {
+    fn default() -> Self {
+        Self { zoom: 1.0, hidden_sections: Vec::new(), sections_open: false, graph_labels: 1.0, text_max: None }
+    }
+}
+
+impl WidgetLook {
+    pub fn of(m: &ExposedModule) -> Self {
+        Self {
+            zoom: m.zoom.unwrap_or(1.0),
+            hidden_sections: m.hidden_sections.clone(),
+            sections_open: m.sections_open,
+            graph_labels: m.graph_labels.unwrap_or(1.0),
+            text_max: m.text_max,
+        }
+    }
+}
+
+/// The most and least a pin's graph labels can be scaled ([`ExposedModule::graph_labels`]).
+pub const GRAPH_LABELS: std::ops::RangeInclusive<f32> = 0.6..=2.0;
+
+/// The sizes a pin's text can be capped at ([`ExposedModule::text_max`]): the text size
+/// setting's own range.
+pub const TEXT_MAX: std::ops::RangeInclusive<f32> = crate::settings::CONTROL_FONT_SIZE_MIN..=crate::settings::CONTROL_FONT_SIZE_MAX;
 
 /// The least and most a module pinned whole can be zoomed ([`ExposedModule::zoom`]).
 pub const WIDGET_ZOOM: std::ops::RangeInclusive<f32> = 0.4..=2.0;
@@ -405,6 +461,9 @@ pub struct PinGraphOverride {
     #[serde(default)] pub show_grid: Option<bool>,
     #[serde(default)] pub show_labels: Option<bool>,
     #[serde(default)] pub snap: Option<bool>,
+    /// The words drawn on it: JSM Config's tuning faders' names and values, its curve's
+    /// labels. `None` is the theme's text colours.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub text: Option<[u8; 4]>,
 }
 
 /// Text horizontal alignment for layout-decoration Text items.
@@ -1537,11 +1596,11 @@ fn materialize_layout(
     }
 }
 
-fn default_snap_grid_px() -> u32 { 8 }
+pub(crate) fn default_snap_grid_px() -> u32 { 8 }
 /// Default overlay snap: 60 cells per axis (= 1.67% each) — a fine grid by
 /// default (lower % = finer). Always a multiple of 3 so the grid nests inside
 /// the 3×3 anchor zones (edges at 1/3 and 2/3 land on grid lines); floor 9.
-fn default_overlay_divisions() -> u32 { 60 }
+pub(crate) fn default_overlay_divisions() -> u32 { 60 }
 
 fn default_inner_snarl() -> Box<Snarl<NodeData>> {
     Box::new(Snarl::new())
@@ -1698,6 +1757,10 @@ mod tests {
                     anchor: Anchor { x: AnchorAxis::End, y: AnchorAxis::Start, stretch_x: true, ..Default::default() },
                     pin_style: None,
                     zoom: None,
+                    hidden_sections: Vec::new(),
+                    sections_open: false,
+                    graph_labels: None,
+                    text_max: None,
                 }),
                 LayoutItem::Deco(LayoutDecoration::Rect { tab: 0, fill_gradient: None,
                     pos: [5.0, 6.0],
@@ -1896,6 +1959,10 @@ mod tests {
             anchor: Anchor::default(),
             pin_style: None,
             zoom: None,
+            hidden_sections: Vec::new(),
+            sections_open: false,
+            graph_labels: None,
+            text_max: None,
         })
     }
 
