@@ -3,6 +3,32 @@
 All notable changes to FlexInput are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [0.18.2] - 2026-11-25
+
+### Added
+
+- **JSM: rank chords against each other.** JoyShockMapper decides between two held chords by
+  press order alone: with `T1,E = LMOUSE` and `ZR,E = PS_CIRCLE`, E gave whichever chord went
+  down last. A rank on the line settles it: `ZR,E:0 = PS_CIRCLE` wins over any other held
+  chord binding E that has a higher rank or none, in either order. Equal ranks fall back to
+  the chord pressed last, and an unranked line ranks below every number, so a config without
+  ranks behaves exactly as before and only the line that should win needs one. A rank orders
+  lines for its own button only, and works on a modeshift too (`ZR,GYRO_SENS:0 = 2`).
+
+- **JSM: give a chord a moment to complete.** A `~` on a chord line holds the button it sits
+  on back for the other one. `ZR,E~40` makes E wait up to 40 ms for ZR, so ZR pressed just
+  after E still makes the chord. `ZR~40,E` holds ZR's own binding back up to 40 ms for E, and
+  skips it for that press if E comes, so `ZR = PS_R2` doesn't fire when you roll into the
+  chord. A wait ends as soon as the chord is made, only waits for a chord that could still
+  win, and keeps the press's own tap and hold timing; a press let go of mid-wait plays as a
+  quick press. Ranks and waits combine (`ZR~40,E~40:0`). Both are FlexInput's own:
+  JoyShockMapper won't load a line that uses one, and the line says so.
+
+- **A page on how JSM Config differs from JoyShockMapper.** `docs/JSM_CONFIG.md` gathers
+  FlexInput's own additions (chord ranks and waits, `@` targets, MIDI, bound flicks, the gyro
+  turning a stick, `ORIENT`), how tabs and layers behave, and every JSM setting and command
+  the module leaves to another part of FlexInput or doesn't run yet, with the reason.
+
 ## [0.18.1] - 2026-11-24
 
 ### Added

@@ -1048,6 +1048,275 @@ fn the_latest_chord_wins() {
     assert!(!pins.contains("key_3"));
 }
 
+// ── FlexInput's own chord marks: a rank (`:0`) and a wait (`~40`) ────────────
+
+// The marks land on the binding they're written on, in either order after the
+// second button, and say on the line what they do — and that JSM hasn't got them.
+#[test]
+fn chord_marks_parse_onto_the_binding() {
+    let cfg = compile("ZR,E:0 = SPACE\nZR~40,S = Q\nZR,N~25 = R\nZL~30,W~45:3 = T\nL,W:2~50ms = Y");
+    assert!(cfg.lines.iter().all(|l| l.status == LineStatus::Ok), "{:?}", cfg.lines);
+    let b = |i: usize| &cfg.bindings[i];
+    assert_eq!(b(0).trigger, Trigger::Chord { chord: Btn::Zr, btn: Btn::E });
+    assert_eq!((b(0).rank, b(0).chord_wait, b(0).btn_wait), (Some(0), None, None));
+    assert_eq!((b(1).rank, b(1).chord_wait, b(1).btn_wait), (None, Some(0.040), None));
+    assert_eq!((b(2).rank, b(2).chord_wait, b(2).btn_wait), (None, None, Some(0.025)));
+    assert_eq!((b(3).rank, b(3).chord_wait, b(3).btn_wait), (Some(3), Some(0.030), Some(0.045)));
+    assert_eq!((b(4).rank, b(4).btn_wait), (Some(2), Some(0.050)), "rank then wait, `ms` written");
+    for (n, l) in cfg.lines.iter().enumerate() {
+        assert!(
+            l.notes.iter().any(|t| t.contains("FlexInput's own") && t.contains("won't load")),
+            "line {n} says it is ours: {:?}",
+            l.notes
+        );
+    }
+    // Spaces around them are fine, as they are around the comma.
+    let spaced = compile("ZR ~ 40 , E ~ 25 : 1 = SPACE");
+    assert_eq!(spaced.lines[0].status, LineStatus::Ok, "{:?}", spaced.lines[0]);
+    let s = &spaced.bindings[0];
+    assert_eq!((s.rank, s.chord_wait, s.btn_wait), (Some(1), Some(0.040), Some(0.025)));
+}
+
+// Only a chord stacks over other chords, so only a chord line takes the marks —
+// and a modeshift has no press to hold back, so it takes the rank alone.
+#[test]
+fn chord_marks_only_go_on_a_chord() {
+    for line in [
+        "E:0 = SPACE",
+        "E~40 = SPACE",
+        "GYRO_SENS:0 = 2",
+        "E,E:0 = SPACE",
+        "L+R~40 = SPACE",
+        "UP*RIGHT:1 = SPACE",
+        "ZL,GYRO_SENS~40 = 2",
+        "ZL~40,GYRO_SENS = 2",
+    ] {
+        let info = one(line);
+        assert!(matches!(info.status, LineStatus::Error(_)), "{line}: {info:?}");
+    }
+    let cfg = compile("ZL,GYRO_SENS:0 = 2");
+    assert_eq!(cfg.lines[0].status, LineStatus::Ok, "{:?}", cfg.lines[0]);
+    assert_eq!(cfg.modeshifts[0].rank, Some(0));
+    assert!(cfg.lines[0].notes.iter().any(|n| n.contains("FlexInput's own")), "{:?}", cfg.lines[0]);
+}
+
+// A malformed mark says what a good one looks like.
+#[test]
+fn a_bad_chord_mark_says_how_to_write_it() {
+    for (line, wants) in [
+        ("ZR,E~ = SPACE", "milliseconds"),
+        ("ZR,E~0 = SPACE", "milliseconds"),
+        ("ZR,E~5000 = SPACE", "milliseconds"),
+        ("ZR~x,E = SPACE", "milliseconds"),
+        ("ZR,E: = SPACE", "rank"),
+        ("ZR,E:-1 = SPACE", "rank"),
+    ] {
+        let info = one(line);
+        assert!(
+            matches!(info.status, LineStatus::Error(ref e) if e.contains(wants)),
+            "{line}: {info:?}"
+        );
+    }
+    // Twice is no more than once: the line doesn't parse.
+    assert!(matches!(one("ZR,E:0:1 = SPACE").status, LineStatus::Error(_)));
+    assert!(matches!(one("ZR,E~40~50 = SPACE").status, LineStatus::Error(_)));
+}
+
+// A ranked chord wins against an unranked one whichever went down last — the
+// one thing JSM's own rule can't say.
+#[test]
+fn a_ranked_chord_wins_whichever_was_pressed_last() {
+    for (first, second) in [(Btn::L, Btn::Zl), (Btn::Zl, Btn::L)] {
+        let mut r = Rig::new("W = R\nL,W = 3\nZL,W:0 = 4");
+        r.set(first, true);
+        r.tick();
+        r.set(second, true);
+        r.tick();
+        r.set(Btn::W, true);
+        let pins = r.tick();
+        assert!(pins.contains("key_4"), "{first:?} then {second:?}: {pins:?}");
+        assert!(!pins.contains("key_3"), "{first:?} then {second:?}: {pins:?}");
+    }
+}
+
+// Between ranks the lower number wins; on an equal rank it is JSM's rule again,
+// the chord pressed last.
+#[test]
+fn the_lower_rank_wins_and_an_equal_rank_goes_to_the_last_chord() {
+    let order = |cfg: &str, first: Btn, second: Btn| {
+        let mut r = Rig::new(cfg);
+        r.set(first, true);
+        r.tick();
+        r.set(second, true);
+        r.tick();
+        r.set(Btn::W, true);
+        r.tick()
+    };
+    let ranked = "L,W:1 = 3\nZL,W:0 = 4";
+    assert!(order(ranked, Btn::L, Btn::Zl).contains("key_4"));
+    assert!(order(ranked, Btn::Zl, Btn::L).contains("key_4"), "rank 0 beats rank 1");
+    let level = "L,W:2 = 3\nZL,W:2 = 4";
+    assert!(order(level, Btn::L, Btn::Zl).contains("key_4"), "ZL pressed last");
+    assert!(order(level, Btn::Zl, Btn::L).contains("key_3"), "L pressed last");
+}
+
+// A rank only orders lines for the SAME button: ranking ZL over L on W leaves S
+// to JSM's rule.
+#[test]
+fn a_rank_only_orders_chords_for_its_own_button() {
+    let mut r = Rig::new("L,W = 3\nZL,W:0 = 4\nL,S = 5\nZL,S = 6");
+    r.set(Btn::Zl, true);
+    r.tick();
+    r.set(Btn::L, true);
+    r.tick();
+    r.set(Btn::S, true);
+    let pins = r.tick();
+    assert!(pins.contains("key_5"), "L pressed last still wins S: {pins:?}");
+}
+
+// A ranked modeshift has the last word over the same setting whichever chord
+// went down last, and leaves the settings it doesn't name alone.
+#[test]
+fn a_ranked_modeshift_wins_whichever_was_pressed_last() {
+    let cfg = compile("GYRO_SENS = 1\nZL,GYRO_SENS:0 = 4\nZR,GYRO_SENS = 9\nZR,IN_GAME_SENS = 2");
+    assert_eq!(resolve(&cfg, &[Btn::Zl, Btn::Zr]).aim.min_sens, (4.0, 4.0), "ZR pressed later");
+    assert_eq!(resolve(&cfg, &[Btn::Zr, Btn::Zl]).aim.min_sens, (4.0, 4.0), "ZL pressed later");
+    assert_eq!(resolve(&cfg, &[Btn::Zl, Btn::Zr]).aim.in_game_sens, 2.0, "ZR's other setting");
+    assert_eq!(resolve(&cfg, &[Btn::Zr]).aim.min_sens, (9.0, 9.0), "ZR alone");
+}
+
+// `L,W~40`: W waits for L, so L landing just after W still makes the chord —
+// where without the wait W has already taken its own binding.
+#[test]
+fn a_wait_on_the_chorded_button_catches_a_chord_pressed_just_after() {
+    let mut stock = Rig::new("W = R\nL,W = 3");
+    stock.set(Btn::W, true);
+    stock.ticks(2);
+    stock.set(Btn::L, true);
+    assert!(stock.ticks(5).contains("key_r"), "JSM's rule: W was first, W's own binding");
+
+    let mut r = Rig::new("W = R\nL,W~40 = 3");
+    r.set(Btn::W, true);
+    assert!(!r.tick().contains("key_r"), "held back for L");
+    r.tick();
+    r.set(Btn::L, true);
+    assert!(r.tick().contains("key_3"), "L came in time, and the wait ends as it does");
+    for _ in 0..20 {
+        assert!(!r.tick().contains("key_r"), "W's own binding never fires");
+    }
+}
+
+// Pressed alone, the chorded button takes its own binding once the wait is out;
+// a chord that comes too late doesn't count.
+#[test]
+fn a_wait_runs_out_into_the_buttons_own_binding() {
+    let mut r = Rig::new("W = R\nL,W~40 = 3");
+    r.set(Btn::W, true);
+    assert!(!r.tick().contains("key_r"));
+    assert!(r.seen_within(6, "key_r"), "its own binding after ~40 ms");
+    r.set(Btn::L, true);
+    let pins = r.ticks(3);
+    assert!(pins.contains("key_r") && !pins.contains("key_3"), "L was too late: {pins:?}");
+}
+
+// Let go while still waiting, it is a quick press of its own binding — one the
+// game gets to see, not a key down and up inside one tick.
+#[test]
+fn a_press_released_while_waiting_for_a_chord_is_still_seen() {
+    let mut r = Rig::new("W = R\nL,W~40 = 3");
+    r.set(Btn::W, true);
+    r.tick();
+    r.set(Btn::W, false);
+    assert!(r.seen_within(3, "key_r"), "a quick press of W's own binding");
+    assert!(!r.ticks(10).contains("key_r"), "and over");
+}
+
+// `L~40,W`: L's own binding waits for W, and is skipped for the press if W comes.
+#[test]
+fn a_wait_on_the_chord_button_skips_its_own_binding_when_it_is_used() {
+    let mut r = Rig::new("L = Q\nW = R\nL~40,W = 3");
+    r.set(Btn::L, true);
+    assert!(!r.tick().contains("key_q"), "L's own binding is held back");
+    r.tick();
+    r.set(Btn::W, true);
+    assert!(r.tick().contains("key_3"), "the chord");
+    for _ in 0..30 {
+        assert!(!r.tick().contains("key_q"), "L was used as a chord: no Q this press");
+    }
+    r.set(Btn::W, false);
+    r.set(Btn::L, false);
+    assert!(!r.ticks(5).contains("key_q"), "not on release either");
+
+    // Alone, L's own binding starts once the wait is out, and holds as it would.
+    r.set(Btn::L, true);
+    assert!(!r.tick().contains("key_q"));
+    assert!(r.seen_within(6, "key_q"));
+    assert!(r.ticks(20).contains("key_q"), "held while L is");
+    r.set(Btn::L, false);
+    assert!(!r.ticks(3).contains("key_q"));
+}
+
+// A press held back for a chord still keeps its own time: a tap is a tap and a
+// hold a hold, measured from when the button went down.
+#[test]
+fn a_held_back_press_keeps_its_tap_and_hold_times() {
+    // 100 ms: past the 40 ms wait, short of the 150 ms hold.
+    let mut r = Rig::new("L = Q R\nW = E\nL~40,W = 3");
+    r.set(Btn::L, true);
+    let held = r.seen_within(10, "key_r");
+    r.set(Btn::L, false);
+    assert!(!held, "no hold inside 100 ms");
+    assert!(r.seen_within(3, "key_q"), "a tap");
+
+    // Held on: the hold comes 150 ms from the press, not 150 ms from the end of
+    // the wait (which would be ~190 ms).
+    let mut r = Rig::new("L = Q R\nW = E\nL~40,W = 3");
+    r.set(Btn::L, true);
+    assert!(!r.seen_within(14, "key_r"), "no hold before 150 ms");
+    assert!(r.seen_within(4, "key_r"), "the hold by ~170 ms");
+    r.set(Btn::L, false);
+    assert!(!r.ticks(5).contains("key_q"), "a hold is no tap");
+}
+
+// A wait only holds a press back for a chord that could still win it: one
+// outranked by a chord already held doesn't, and one that outranks it does.
+#[test]
+fn a_wait_only_holds_back_for_a_chord_that_could_win() {
+    let mut r = Rig::new("L,W:0 = 3\nZL,W~100 = 4");
+    r.set(Btn::L, true);
+    r.tick();
+    r.set(Btn::W, true);
+    assert!(r.tick().contains("key_3"), "ZL couldn't beat rank 0: no wait");
+
+    let mut r = Rig::new("L,W = 3\nZL,W:0~100 = 4");
+    r.set(Btn::L, true);
+    r.tick();
+    r.set(Btn::W, true);
+    assert!(!r.tick().contains("key_3"), "ZL could still come and win");
+    r.ticks(2);
+    r.set(Btn::Zl, true);
+    let pins = r.tick();
+    assert!(pins.contains("key_4") && !pins.contains("key_3"), "{pins:?}");
+}
+
+// Both sides at once — the roll either way round makes the chord, and neither
+// button's own binding leaks.
+#[test]
+fn waits_on_both_sides_make_the_chord_in_either_order() {
+    for (first, second) in [(Btn::L, Btn::W), (Btn::W, Btn::L)] {
+        let mut r = Rig::new("L = Q\nW = R\nL~40,W~40 = 3");
+        let mut seen = std::collections::HashSet::new();
+        r.set(first, true);
+        seen.extend(r.ticks(2));
+        r.set(second, true);
+        for _ in 0..30 {
+            seen.extend(r.tick());
+        }
+        assert!(seen.contains("key_3"), "{first:?} then {second:?}: {seen:?}");
+        assert!(!seen.contains("key_q") && !seen.contains("key_r"), "{first:?} then {second:?}: {seen:?}");
+    }
+}
+
 // A double press inside the window uses its own binding, and the single press
 // TAP is held back long enough not to fire as well. (A single-key binding fires
 // on the press instead, which JSM applies on the first press either way — hence

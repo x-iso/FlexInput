@@ -751,6 +751,8 @@ pub fn scrub(text: &str, cur: Cursor, dir: i32) -> Option<String> {
         .map(|t| t.text(line))
         .unwrap_or("");
     let name = name.rsplit([',', '+', '*']).next().unwrap_or(name);
+    // A modeshift's rank (`ZL,GYRO_SENS:0`, FlexInput's own) isn't part of the name.
+    let name = name.split(['~', ':']).next().unwrap_or(name).trim();
     let upper = name.to_ascii_uppercase();
     let bounds = if is_trigger_effect(&upper) {
         // A trigger effect's numbers each have their own range, by position

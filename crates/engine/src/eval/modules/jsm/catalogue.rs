@@ -446,7 +446,10 @@ fn line_binds_a_button(text: &str, line: usize) -> bool {
         return false;
     };
     let name = tok.text(l);
-    let last = name.rsplit([',', '+']).next().unwrap_or(name).to_ascii_uppercase();
+    let last = name.rsplit([',', '+']).next().unwrap_or(name);
+    // A chord line's wait and rank (`ZR,E~40:0`, FlexInput's own) aren't part
+    // of the name.
+    let last = last.split(['~', ':']).next().unwrap_or(last).trim().to_ascii_uppercase();
     // `from_name` rather than a walk of `Btn::ALL`: a MIDI name is a button too,
     // and far too many to list. `@Name` is a Macro Output port read as one.
     last.starts_with('@') || Btn::from_name(&last).is_some()
@@ -1156,6 +1159,11 @@ mod catalogue_tests {
         let shift = "ZL,S = SPACE\nZL,GYRO_SENS = 4\n";
         assert_eq!(kinds_at(shift, value_of_a_button), &[Kind::Binding]);
         assert!(kinds_at(shift, value_of_a_setting).is_empty());
+        // Nor do a chord line's rank and wait (FlexInput's own): `S~40:0` still
+        // binds S.
+        let marked = "ZL~30,S~40:0 = SPACE\nZL,GYRO_SENS:1 = 4\n";
+        assert_eq!(kinds_at(marked, value_of_a_button), &[Kind::Binding]);
+        assert!(kinds_at(marked, value_of_a_setting).is_empty());
     }
 
     #[test]

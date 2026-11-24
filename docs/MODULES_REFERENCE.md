@@ -1198,7 +1198,14 @@ pub struct ModuleDescriptor {
 - **Purpose:** Applies a JoyShockMapper config text to the bus with JSM's own
   rules, so an existing JSM config can be loaded and kept editable. NOT a
   front-end for the Remapper — the press semantics, timings and chord layering
-  are JSM's. See `docs/JSM_MODULE_PLAN.md`.
+  are JSM's. See `docs/JSM_MODULE_PLAN.md`; what differs from JSM, for users, is
+  `docs/JSM_CONFIG.md`.
+- **Chord ranks and waits** (FlexInput's own, `parse::Marks`): `ZR,E:0` ranks a
+  chord line (a modeshift too) — lower beats higher, any rank beats none, equal
+  falls back to the last chord pressed (`parse::standing`); `ZR,E~40` holds E back
+  for ZR and `ZR~40,E` holds ZR's own binding back for E, skipping it if E comes
+  (`bind::Role::WaitChord` / `Spent`, decided in `Runtime::settle`). No marks = JSM's
+  rule exactly.
 - **Inputs:** Input 0: Source AutoMap bus (AutoMap)
 - **Outputs:** Output 0: the bus with the config applied, republished as
   `collector:{uid}`

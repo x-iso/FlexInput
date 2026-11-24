@@ -23,6 +23,8 @@ This directory contains comprehensive reference documentation for the FlexInput 
 | Document | Description | Key Topics |
 |----------|-------------|------------|
 | [MODULES_REFERENCE.md](./MODULES_REFERENCE.md) | All 10 module categories | Registration pattern, evaluation flow, adding new modules |
+| [JSM_CONFIG.md](./JSM_CONFIG.md) | The JSM Config module for JoyShockMapper users | FlexInput's own additions (chord ranks and waits, `@` targets, MIDI), tabs and layers, what isn't run |
+| [JSM_MODULE_PLAN.md](./JSM_MODULE_PLAN.md) | How the JSM Config module was designed and built | Locked decisions, phases, name tables, what was left out and why |
 
 ### User Interface
 

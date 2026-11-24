@@ -12,6 +12,10 @@
 //! # comment to end of line
 //! ```
 //!
+//! plus FlexInput's own marks on a chord line, which JSM's grammar hasn't got —
+//! `ZR~40,E~40:0 = …`, a wait on either button and a rank for the line (see
+//! [`Marks`]).
+//!
 //! A line JSM accepts but we don't run yet is NOT an error: it compiles to
 //! [`LineStatus::Pending`] with the phase that will pick it up, or
 //! [`LineStatus::Ignored`] when FlexInput owns that setting instead. Nothing is
@@ -106,6 +110,19 @@ pub struct Binding {
     pub steps: Vec<Step>,
     /// The line it came from, 0-based — so a note can be put back on it.
     pub line: usize,
+    /// FlexInput's own, chord lines only (`ZR,E:0`): against another held chord
+    /// that binds the same button, the lower rank wins whichever was pressed
+    /// last. `None` ranks below every number, so a config with no ranks is
+    /// JSM's own rule throughout — the chord pressed last wins. See [`standing`].
+    pub rank: Option<u32>,
+    /// FlexInput's own (`ZR~40,E`): the chord button's OWN binding waits this
+    /// long (seconds) to see whether the other button comes; if it does, the
+    /// chord button's own binding is skipped for that press.
+    pub chord_wait: Option<f32>,
+    /// FlexInput's own (`ZR,E~40`): the chorded button waits this long (seconds)
+    /// for the chord button before taking a binding, so a chord button landing
+    /// just after it still makes the chord.
+    pub btn_wait: Option<f32>,
 }
 
 /// `button,SETTING = value` — while `chord` is held, the setting reads `value`.
@@ -117,6 +134,19 @@ pub struct Modeshift {
     /// parses the plain line.
     pub name: String,
     pub value: String,
+    /// FlexInput's own (`ZR,GYRO_SENS:0`), as [`Binding::rank`]: against another
+    /// held chord's modeshift of the same setting, the lower rank wins.
+    pub rank: Option<u32>,
+}
+
+/// How strongly a chord line holds against another chord line for the same
+/// button or setting: any rank beats none, and a lower rank beats a higher one.
+/// Equal standing falls to JSM's own rule, the chord pressed last.
+pub(crate) fn standing(rank: Option<u32>) -> u64 {
+    match rank {
+        None => 0,
+        Some(r) => 1 + u64::from(u32::MAX - r),
+    }
 }
 
 /// The settings in force this tick, once the held chords have had their say.
@@ -185,28 +215,35 @@ pub fn resolve_with(cfg: &Compiled, sticky: &[(String, String)], chords: &[Btn])
     if cfg.modeshifts.is_empty() {
         return r;
     }
-    for &chord in chords {
-        for ms in cfg.modeshifts.iter().filter(|m| m.chord == chord) {
-            apply_setting(
-                &ms.name,
-                &ms.value,
-                ms.support,
-                Knobs {
-                    timings: &mut r.timings,
-                    settings: &mut r.settings,
-                    aim: &mut r.aim,
-                    pad: &mut r.pad,
-                    motion: &mut r.motion,
-                    touch: &mut r.touch,
-                    fb: &mut r.fb,
-                    cc: &mut r.cc,
-                    midi: &mut r.midi,
-                },
-            );
-            if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
-                if side != Side::Right { r.stick_mode_chorded[0] = true; }
-                if side != Side::Left { r.stick_mode_chorded[1] = true; }
-            }
+    // Applied weakest first, so whatever has the last word is applied last: by
+    // standing (a rank over none, a lower rank over a higher), then — JSM's own
+    // rule, and all there is when nothing is ranked — the chord pressed last.
+    // A stable sort, so one chord's lines keep the order they were written in.
+    let mut order: Vec<(usize, &Modeshift)> = Vec::new();
+    for (pos, &chord) in chords.iter().enumerate() {
+        order.extend(cfg.modeshifts.iter().filter(|m| m.chord == chord).map(|m| (pos, m)));
+    }
+    order.sort_by_key(|&(pos, ms)| (standing(ms.rank), pos));
+    for (_, ms) in order {
+        apply_setting(
+            &ms.name,
+            &ms.value,
+            ms.support,
+            Knobs {
+                timings: &mut r.timings,
+                settings: &mut r.settings,
+                aim: &mut r.aim,
+                pad: &mut r.pad,
+                motion: &mut r.motion,
+                touch: &mut r.touch,
+                fb: &mut r.fb,
+                cc: &mut r.cc,
+                midi: &mut r.midi,
+            },
+        );
+        if let Support::Analog(AnalogId::StickMode(side)) = ms.support {
+            if side != Side::Right { r.stick_mode_chorded[0] = true; }
+            if side != Side::Left { r.stick_mode_chorded[1] = true; }
         }
     }
     r
@@ -697,10 +734,14 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
         return command_line(line, out, tabs, ports);
     };
     let (lhs, rhs) = (lhs.trim(), rhs.trim());
-    let Some((first, combo)) = split_combo(lhs) else {
-        return LineInfo::of(LineStatus::Error(
-            "this line doesn't look like a command".into(),
-        ));
+    let (first, combo, marks) = match split_combo(lhs) {
+        Ok(v) => v,
+        Err(Some(why)) => return LineInfo::of(LineStatus::Error(why)),
+        Err(None) => {
+            return LineInfo::of(LineStatus::Error(
+                "this line doesn't look like a command".into(),
+            ))
+        }
     };
 
     // `button,SETTING = value` — a modeshift.
@@ -709,6 +750,13 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
             if *op != ',' {
                 return LineInfo::of(LineStatus::Error(
                     "only a chord (`button,SETTING`) can change a setting".into(),
+                ));
+            }
+            if marks.first_wait.is_some() || marks.second_wait.is_some() {
+                return LineInfo::of(LineStatus::Error(
+                    "a modeshift has no press to wait for — `~` goes on a chorded binding \
+                     (`ZR~40,E = …`); a rank (`:0`) works here"
+                        .into(),
                 ));
             }
             let chord = match button_named(&first, ports) {
@@ -720,13 +768,16 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
                 Ok(r) => r,
                 Err(e) => return LineInfo::of(LineStatus::Error(e)),
             };
-            return modeshift_line(chord, second, &rhs, support, out);
+            return modeshift_line(chord, second, &rhs, support, out, marks.rank);
         }
     }
 
     // `SETTING = value`.
     if combo.is_none() {
         if let Some(support) = setting_support(&first) {
+            if marks.any() {
+                return LineInfo::of(LineStatus::Error(NOT_A_CHORD_MARK.into()));
+            }
             let rhs = match settle_button_value(support, rhs, ports) {
                 Ok(r) => r,
                 Err(e) => return LineInfo::of(LineStatus::Error(e)),
@@ -736,8 +787,12 @@ fn compile_line(raw: &str, n: usize, out: &mut Compiled, tabs: Tabs, ports: Port
     }
 
     // Everything else is a binding.
-    binding_line(&first, combo, rhs, n, out, tabs, ports)
+    binding_line(&first, combo, marks, rhs, n, out, tabs, ports)
 }
+
+/// A rank or a wait anywhere but a chord line.
+const NOT_A_CHORD_MARK: &str =
+    "a rank (`:0`) or a wait (`~40`) only goes on a chord line — `ZR,E:0 = …`, `ZR,E~40 = …`";
 
 // ── line kinds ───────────────────────────────────────────────────────────────
 
@@ -1041,6 +1096,7 @@ fn modeshift_line(
     rhs: &str,
     support: Support,
     out: &mut Compiled,
+    rank: Option<u32>,
 ) -> LineInfo {
     let mut t = out.timings;
     let mut a = out.settings;
@@ -1078,16 +1134,27 @@ fn modeshift_line(
         },
     );
     // A setting a later phase owns says so, and the modeshift waits with it.
+    let mut info = info;
     if matches!(info.status, LineStatus::Ok) {
         out.modeshifts.push(Modeshift {
             chord,
             support,
             name: name.to_string(),
             value: rhs.to_string(),
+            rank,
         });
+        if let Some(r) = rank {
+            info.notes.push(format!(
+                "{FLEXINPUT_OWN}: rank {r} — while another held chord also changes `{name}`, \
+                 the lower rank wins, whichever was pressed last"
+            ));
+        }
     }
     info
 }
+
+/// The front of every note on a line using a mark JSM hasn't got.
+const FLEXINPUT_OWN: &str = "FlexInput's own (JoyShockMapper won't load this line)";
 
 /// Apply one `SETTING = value` line to a set of settings. The same code serves a
 /// plain line (writing the config's base settings) and a modeshift (writing a
@@ -1149,9 +1216,11 @@ pub(crate) fn apply_setting(name: &str, rhs: &str, support: Support, k: Knobs<'_
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn binding_line(
     first: &str,
     combo: Option<(char, String)>,
+    marks: Marks,
     rhs: &str,
     line: usize,
     out: &mut Compiled,
@@ -1188,6 +1257,20 @@ fn binding_line(
             }
         }
     };
+    // Ranks and waits order chords against each other; nothing else stacks.
+    if marks.any() {
+        match trigger {
+            Trigger::Chord { .. } => {}
+            Trigger::Simple(_) => return LineInfo::of(LineStatus::Error(NOT_A_CHORD_MARK.into())),
+            Trigger::Double(_) | Trigger::Sim(..) | Trigger::Diag(..) => {
+                return LineInfo::of(LineStatus::Error(
+                    "a rank (`:0`) or a wait (`~40`) only goes on a chord (`ZR,E`), not on a \
+                     double, simultaneous or diagonal press"
+                        .into(),
+                ))
+            }
+        }
+    }
 
     let (steps, notes) = match parse_mapping(rhs, tabs, ports) {
         Ok(v) => v,
@@ -1233,6 +1316,9 @@ fn binding_line(
     // Recalibrating mid-game is the device card's job here, so a binding that
     // asks for it still runs — it just doesn't recalibrate.
     let mut notes = notes;
+    if let (true, Trigger::Chord { chord, btn }) = (marks.any(), trigger) {
+        notes.push(marks_note(chord, btn, marks));
+    }
     // A button JSM (or its fork) names that nothing on our bus reports. The binding
     // compiles — the name is real — but it can never fire, and the line says why.
     for btn in [
@@ -1335,6 +1421,9 @@ fn binding_line(
             trigger,
             steps: steps.clone(),
             line,
+            rank: marks.rank,
+            chord_wait: marks.first_wait,
+            btn_wait: marks.second_wait,
         });
         LineStatus::Ok
     };
@@ -1438,36 +1527,161 @@ pub(crate) fn button_reaches(btn: Btn, available: &HashSet<String>) -> bool {
 
 // ── the left-hand side ───────────────────────────────────────────────────────
 
-/// Split a left-hand side into its first token and an optional combo operator
-/// plus second token. JSM allows exactly one operator per line, and `+` / `-`
-/// are button names themselves, so a token is an optional sign followed by word
-/// characters (JSM's `[+-]?\w*`).
-fn split_combo(lhs: &str) -> Option<(String, Option<(char, String)>)> {
-    let bytes: Vec<char> = lhs.chars().collect();
+/// FlexInput's own marks on a left-hand side, which JSM's grammar hasn't got:
+///
+/// ```text
+/// ZR,E:0 = …      the line's rank: against another held chord binding E, the
+///                 lower rank wins whatever order they went down in
+/// ZR~40,E = …     ZR's own binding waits up to 40 ms for E, and is skipped if
+///                 E comes — `~` sits on the button that waits
+/// ZR,E~40 = …     E waits up to 40 ms for ZR, so ZR landing just after it
+///                 still makes the chord
+/// ```
+///
+/// Only a chord line may carry one (a modeshift: the rank only); everywhere else
+/// the line says so. A token never holds `~` or `:` (see [`read_token`]), so
+/// neither can be mistaken for part of a name.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+struct Marks {
+    /// `:N` after the whole left-hand side.
+    rank: Option<u32>,
+    /// `~N` after the first token, in seconds.
+    first_wait: Option<f32>,
+    /// `~N` after the second token, in seconds.
+    second_wait: Option<f32>,
+}
+
+impl Marks {
+    fn any(&self) -> bool {
+        self.rank.is_some() || self.first_wait.is_some() || self.second_wait.is_some()
+    }
+}
+
+/// What a chord line's marks do, in words, for the note on its line.
+fn marks_note(chord: Btn, btn: Btn, marks: Marks) -> String {
+    let (c, b) = (chord.name(), btn.name());
+    let ms = |s: f32| (s * 1000.0).round() as u32;
+    let mut what = Vec::new();
+    if let Some(r) = marks.rank {
+        what.push(format!(
+            "rank {r} — while another held chord also binds {b}, the lower rank wins, whichever \
+             was pressed last"
+        ));
+    }
+    if let Some(w) = marks.first_wait {
+        what.push(format!(
+            "{c}'s own binding waits up to {} ms for {b}, and is skipped for that press if {b} comes",
+            ms(w)
+        ));
+    }
+    if let Some(w) = marks.second_wait {
+        what.push(format!(
+            "{b} waits up to {} ms for {c}, so {c} pressed just after {b} still makes this chord",
+            ms(w)
+        ));
+    }
+    format!("{FLEXINPUT_OWN}: {}", what.join("; "))
+}
+
+/// The longest a `~` may wait. JSM's own windows are 50 and 150 ms; a wait is
+/// latency on every press that doesn't become the chord, so a second is far past
+/// anything useful and most likely a typo.
+const MAX_CHORD_WAIT_MS: f32 = 1000.0;
+
+fn skip_ws(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && chars[*i].is_whitespace() {
+        *i += 1;
+    }
+}
+
+/// A `~` wait at `i`, if there is one: milliseconds, `ms` optional. `Ok(None)`
+/// with `i` unmoved when the next thing isn't a `~`.
+fn read_wait(chars: &[char], i: &mut usize) -> Result<Option<f32>, Option<String>> {
+    let mut j = *i;
+    skip_ws(chars, &mut j);
+    if chars.get(j) != Some(&'~') {
+        return Ok(None);
+    }
+    j += 1;
+    skip_ws(chars, &mut j);
+    let mut num = String::new();
+    while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+        num.push(chars[j]);
+        j += 1;
+    }
+    if chars.get(j).is_some_and(|c| c.eq_ignore_ascii_case(&'m'))
+        && chars.get(j + 1).is_some_and(|c| c.eq_ignore_ascii_case(&'s'))
+    {
+        j += 2;
+    }
+    *i = j;
+    let wants = || {
+        Some(format!(
+            "a wait is 1 to {MAX_CHORD_WAIT_MS} milliseconds after the `~` — `ZR,E~40` waits up \
+             to 40 ms"
+        ))
+    };
+    match num.parse::<f32>() {
+        Ok(v) if v >= 1.0 && v <= MAX_CHORD_WAIT_MS => Ok(Some(v / 1000.0)),
+        _ => Err(wants()),
+    }
+}
+
+/// A `:` rank at `i` (which is on the `:`).
+fn read_rank(chars: &[char], i: &mut usize) -> Result<u32, Option<String>> {
+    *i += 1;
+    skip_ws(chars, i);
+    let mut num = String::new();
+    while *i < chars.len() && chars[*i].is_ascii_digit() {
+        num.push(chars[*i]);
+        *i += 1;
+    }
+    num.parse::<u32>().map_err(|_| {
+        Some("a rank is a whole number after the `:` — `ZR,E:0` is the highest".to_string())
+    })
+}
+
+/// Split a left-hand side into its first token, an optional combo operator plus
+/// second token, and FlexInput's [`Marks`]. JSM allows exactly one operator per
+/// line, and `+` / `-` are button names themselves, so a token is an optional
+/// sign followed by word characters (JSM's `[+-]?\w*`).
+///
+/// `Err(None)` is a line that doesn't look like anything; `Err(Some(why))` one
+/// whose shape is right but whose mark is wrong, and says how.
+fn split_combo(lhs: &str) -> Result<(String, Option<(char, String)>, Marks), Option<String>> {
+    let chars: Vec<char> = lhs.chars().collect();
     let mut i = 0;
-    let first = read_token(&bytes, &mut i)?;
-    while i < bytes.len() && bytes[i].is_whitespace() {
-        i += 1;
+    let mut marks = Marks::default();
+    let first = read_token(&chars, &mut i).ok_or(None)?;
+    marks.first_wait = read_wait(&chars, &mut i)?;
+    skip_ws(&chars, &mut i);
+    match chars.get(i) {
+        None => return Ok((first, None, marks)),
+        // A rank on a lone button: no chord to rank, which the caller says.
+        Some(':') => {
+            marks.rank = Some(read_rank(&chars, &mut i)?);
+            skip_ws(&chars, &mut i);
+            return if i < chars.len() { Err(None) } else { Ok((first, None, marks)) };
+        }
+        Some(_) => {}
     }
-    if i >= bytes.len() {
-        return Some((first, None));
-    }
-    let op = bytes[i];
+    let op = chars[i];
     if !matches!(op, ',' | '+' | '*') {
-        return None;
+        return Err(None);
     }
     i += 1;
-    while i < bytes.len() && bytes[i].is_whitespace() {
-        i += 1;
+    let second = read_token(&chars, &mut i).ok_or(None)?;
+    // The second button's wait and the line's rank, in either order, once each.
+    loop {
+        skip_ws(&chars, &mut i);
+        match chars.get(i) {
+            None => break,
+            Some('~') if marks.second_wait.is_none() => marks.second_wait = read_wait(&chars, &mut i)?,
+            Some(':') if marks.rank.is_none() => marks.rank = Some(read_rank(&chars, &mut i)?),
+            Some(_) => return Err(None),
+        }
     }
-    let second = read_token(&bytes, &mut i)?;
-    while i < bytes.len() && bytes[i].is_whitespace() {
-        i += 1;
-    }
-    if i < bytes.len() {
-        return None;
-    }
-    Some((first, Some((op, second))))
+    Ok((first, Some((op, second)), marks))
 }
 
 fn read_token(chars: &[char], i: &mut usize) -> Option<String> {

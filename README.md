@@ -152,7 +152,8 @@ State is shared via `Arc<RwLock<T>>` and `Arc<Mutex<T>>` with careful lock hiera
   the gyro additions of its fork
   [evan1mclean/JSM_custom_curve](https://github.com/evan1mclean/JSM_custom_curve)
   (MIT), followed as of commit `0ace2da`. No JSM code is linked in; the module is
-  a Rust port written against their source and documentation.
+  a Rust port written against their source and documentation. How it differs
+  from JoyShockMapper is in [docs/JSM_CONFIG.md](docs/JSM_CONFIG.md).
 - DualSense adaptive-trigger effect byte layouts follow John "Nielk1" Klein's
   [TriggerEffectGenerator](https://gist.github.com/Nielk1/6d54cc2c00d2201ccb8c2720ad7538db)
   (MIT), the encoder JoyShockMapper uses.

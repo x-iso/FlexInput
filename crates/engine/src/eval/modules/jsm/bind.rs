@@ -15,12 +15,17 @@
 //! On top of that a press has to decide WHICH binding it belongs to: the top of
 //! the chord stack, a double press, a simultaneous or diagonal pair, or the
 //! button's own binding. That decision happens once, when the button goes down
-//! (except for a simultaneous press, which waits out its window first).
+//! (except for a simultaneous press, which waits out its window first, and a
+//! chord line's `~` wait, FlexInput's own, which can hold it back too).
+//!
+//! The top of the stack is JSM's rule: of the held chords binding the button,
+//! the one pressed last. A chord line's rank (`ZR,E:0`, FlexInput's own) goes
+//! over that — see [`standing`] — and with no ranks it is JSM's rule exactly.
 
 use std::collections::{HashMap, HashSet};
 
 use super::names::{Btn, GyroAction, Out};
-use super::parse::{ActionMod, Binding, Compiled, EventMod, Timings, Trigger};
+use super::parse::{standing, ActionMod, Binding, Compiled, EventMod, Timings, Trigger};
 
 /// A moment on the runtime's clock, in seconds since the config was compiled.
 ///
@@ -45,10 +50,19 @@ enum Role {
     Idle,
     /// Down, waiting to see whether a simultaneous partner joins in time.
     WaitSim { until: Secs },
+    /// Down, its binding held back by a chord line's `~` (FlexInput's own):
+    /// either a chord that could still come and win it (`ZR,E~40` — E waits for
+    /// ZR), or its own binding waiting to see whether it gets used as a chord
+    /// (`ZR~40,E` — ZR waits for E). How long is worked out again each tick from
+    /// when it went down (`BtnRun::since`), in `settle`.
+    WaitChord,
     /// Down and driving press `usize`.
     Active(usize),
     /// Down, but another button's pair press (simultaneous or diagonal) owns it.
     Follower(usize),
+    /// Down, its own binding skipped: it was used as a chord inside the time
+    /// its `~` gave it (`ZR~40,E`). Nothing more until it lets go.
+    Spent,
 }
 
 impl Default for Role {
@@ -59,6 +73,9 @@ impl Default for Role {
 struct BtnRun {
     down: bool,
     role: Role,
+    /// When it last went down. A `~` wait counts from here, and so does the
+    /// press it ends up starting — a tap held back for a chord is still a tap.
+    since: Secs,
     /// Until when a press of this button would be its double press. Set as a
     /// press of its own binding ends, JSM's way: a tap counts the window from
     /// its release (it is held back for that long, `pending_tap`), a press held
@@ -211,7 +228,7 @@ impl Runtime {
             && self.timed.is_empty()
             && self.toggles.is_empty()
             && self.buttons.values().all(|r| {
-                r.pending_tap.is_none() && !matches!(r.role, Role::WaitSim { .. })
+                r.pending_tap.is_none() && !matches!(r.role, Role::WaitSim { .. } | Role::WaitChord)
             })
     }
 
@@ -287,7 +304,15 @@ impl Runtime {
         for &b in &watched {
             let expired = matches!(self.buttons[&b].role, Role::WaitSim { until } if until <= self.t);
             if expired {
-                self.resolve(b, cfg, timings);
+                self.settle(b, cfg, timings);
+            }
+        }
+        // ── a press held back for a chord: done once the chord has come or its
+        // wait is over. After the presses, so a chord button that went down this
+        // tick counts.
+        for &b in &watched {
+            if matches!(self.buttons[&b].role, Role::WaitChord) {
+                self.settle(b, cfg, timings);
             }
         }
         // ── a tap held back for a double press that never came
@@ -313,6 +338,7 @@ impl Runtime {
         {
             let run = self.buttons.entry(b).or_default();
             run.down = true;
+            run.since = self.t;
         }
         if is_chord_button(cfg, b) && !self.chords.contains(&b) {
             self.chords.push(b);
@@ -324,7 +350,7 @@ impl Runtime {
         if repeat {
             if let Some(i) = find(cfg, |t| matches!(t, Trigger::Double(x) if *x == b)) {
                 self.buttons.entry(b).or_default().pending_tap = None;
-                self.start(i, b, None, cfg, timings);
+                self.start(i, b, None, self.t, cfg, timings);
                 return;
             }
         }
@@ -335,52 +361,117 @@ impl Runtime {
             let ready = matches!(self.buttons.get(&partner).map(|r| r.role), Some(Role::WaitSim { .. }));
             if ready {
                 self.take_over(partner);
-                self.start(i, b, Some(partner), cfg, timings);
+                self.start(i, b, Some(partner), self.t, cfg, timings);
                 return;
             }
             self.buttons.entry(b).or_default().role = Role::WaitSim { until: self.t + Secs::from(timings.sim) };
             return;
         }
-        self.resolve(b, cfg, timings);
+        self.settle(b, cfg, timings);
+    }
+
+    /// Pick the binding for a button that is down and not waiting on a partner —
+    /// unless a chord line's `~` says to hold it back a little longer, in which
+    /// case it waits (`Role::WaitChord`) and is asked again next tick. With no
+    /// `~` anywhere this is [`Self::resolve`], straight away: JSM's own timing.
+    fn settle(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
+        let (since, was_waiting) = {
+            let run = &self.buttons[&b];
+            (run.since, matches!(run.role, Role::WaitChord))
+        };
+        let waited = self.t - since;
+        if waited < own_wait(cfg, b) || self.chord_could_still_win(b, cfg, waited) {
+            self.buttons.entry(b).or_default().role = Role::WaitChord;
+            return;
+        }
+        // Held back for a chord, the press still starts where the button went
+        // down, so its hold time and tap are measured as if it hadn't waited.
+        let at = if was_waiting { since } else { self.t };
+        self.resolve_at(b, at, cfg, timings);
+    }
+
+    /// Is a chord line `~`-waiting for a chord button that isn't down yet, and
+    /// would win the press if it came now? (`ZR,E~40`: E pressed alone waits up
+    /// to 40 ms for ZR.) A chord arriving now would be the newest, so it beats
+    /// what's held at an equal rank and loses only to a better-ranked one.
+    fn chord_could_still_win(&self, b: Btn, cfg: &Compiled, waited: Secs) -> bool {
+        let now = self.best_chord(b, cfg).map(|(i, _)| standing(cfg.bindings[i].rank));
+        cfg.bindings.iter().any(|x| {
+            let Trigger::Chord { chord, btn } = x.trigger else { return false };
+            let Some(w) = x.btn_wait else { return false };
+            btn == b
+                && chord != b
+                && waited < Secs::from(w)
+                && !self.chords.contains(&chord)
+                && now.is_none_or(|s| standing(x.rank) >= s)
+        })
+    }
+
+    /// The chord binding `b` takes from what's held right now, and its chord:
+    /// the best-standing one, and of those the chord pressed last — JSM's rule,
+    /// the top of the stack, when nothing is ranked.
+    fn best_chord(&self, b: Btn, cfg: &Compiled) -> Option<(usize, Btn)> {
+        let mut best: Option<(usize, Btn, u64)> = None;
+        // Oldest first, so a later chord of equal standing takes over.
+        for &chord in &self.chords {
+            if chord == b { continue; }
+            let Some(i) = find(cfg, |t| matches!(t, Trigger::Chord { chord: c, btn }
+                if *c == chord && *btn == b)) else { continue };
+            let s = standing(cfg.bindings[i].rank);
+            if best.is_none_or(|(_, _, bs)| s >= bs) {
+                best = Some((i, chord, s));
+            }
+        }
+        best.map(|(i, chord, _)| (i, chord))
     }
 
     /// Pick the binding for a button that is down and not waiting on a partner.
     fn resolve(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
+        self.resolve_at(b, self.t, cfg, timings);
+    }
+
+    /// [`Self::resolve`], the press starting at `at` rather than now.
+    fn resolve_at(&mut self, b: Btn, at: Secs, cfg: &Compiled, timings: &Timings) {
         // A diagonal partner already pressing releases its own binding and the
         // pair takes over — no window, either order.
         if let Some((i, partner)) = diag_partner(cfg, b) {
             if self.buttons.get(&partner).is_some_and(|r| matches!(r.role, Role::Active(_))) {
                 self.take_over(partner);
-                self.start(i, b, Some(partner), cfg, timings);
+                self.start(i, b, Some(partner), at, cfg, timings);
                 return;
             }
         }
-        // The top of the chord stack wins, then the button's own binding.
-        for &chord in self.chords.iter().rev() {
-            if chord == b { continue; }
-            if let Some(i) = find(cfg, |t| matches!(t, Trigger::Chord { chord: c, btn }
-                if *c == chord && *btn == b))
-            {
-                self.start(i, b, None, cfg, timings);
-                return;
+        // The best held chord wins, then the button's own binding.
+        if let Some((i, chord)) = self.best_chord(b, cfg) {
+            // `ZR~40,E`: ZR's own binding was waiting to see whether it would be
+            // used as a chord, and E has come in time — so it never fires.
+            if let Some(w) = cfg.bindings[i].chord_wait {
+                let pressed = self.buttons.get(&b).map_or(self.t, |r| r.since);
+                if let Some(run) = self.buttons.get_mut(&chord) {
+                    if matches!(run.role, Role::WaitChord) && pressed < run.since + Secs::from(w) {
+                        run.role = Role::Spent;
+                    }
+                }
             }
+            self.start(i, b, None, at, cfg, timings);
+            return;
         }
         if let Some(i) = find(cfg, |t| matches!(t, Trigger::Simple(x) if *x == b)) {
-            self.start(i, b, None, cfg, timings);
+            self.start(i, b, None, at, cfg, timings);
             return;
         }
         self.buttons.entry(b).or_default().role = Role::Idle;
     }
 
-    fn start(&mut self, binding: usize, owner: Btn, partner: Option<Btn>, cfg: &Compiled, timings: &Timings) {
+    fn start(&mut self, binding: usize, owner: Btn, partner: Option<Btn>, at: Secs, cfg: &Compiled, timings: &Timings) {
         let idx = self.presses.len();
         self.presses.push(Press {
             binding,
             owner,
             partner,
-            start: self.t,
+            start: at,
             hold_fired: false,
-            turbo_next: self.t + Secs::from(timings.hold),
+            turbo_next: at + Secs::from(timings.hold),
             held: Vec::new(),
             ended: false,
         });
@@ -418,7 +509,25 @@ impl Runtime {
                 self.finish_press(i, b, cfg, timings);
                 return;
             }
-            Role::Idle => return,
+            // Released while held back for a chord: it was a press of whatever
+            // it would have been with the chords held now, over already. Its keys
+            // go down and straight back up within this tick, before anything
+            // reads them — so they're handed on as a tap's pulse, or a quick tap
+            // of a held-back `ZR = PS_R2` would never reach the game at all.
+            Role::WaitChord => {
+                let since = self.buttons[&b].since;
+                self.resolve_at(b, since, cfg, timings);
+                let Some(Role::Active(i)) = self.buttons.get(&b).map(|r| r.role) else { return; };
+                self.buttons.entry(b).or_default().role = Role::Idle;
+                let held = self.presses.get(i).map(|p| p.held.clone()).unwrap_or_default();
+                self.finish_press(i, b, cfg, timings);
+                for pin in held {
+                    self.timed.push(Timed { pin, until: self.t + TAP_HOLD });
+                }
+                return;
+            }
+            // Used as a chord, its own binding never started: nothing to end.
+            Role::Spent | Role::Idle => return,
         };
         self.finish_press(idx, b, cfg, timings);
         // Releasing one half of a pair hands the other half its own binding,
@@ -590,6 +699,18 @@ impl Runtime {
 
 fn find(cfg: &Compiled, pred: impl Fn(&Trigger) -> bool) -> Option<usize> {
     cfg.bindings.iter().position(|b| pred(&b.trigger))
+}
+
+/// How long a chord button's own binding waits to see whether it gets used as a
+/// chord: the longest `~` on its side of a chord line (`ZR~40,E`), 0 for none.
+fn own_wait(cfg: &Compiled, b: Btn) -> Secs {
+    cfg.bindings
+        .iter()
+        .filter_map(|x| match x.trigger {
+            Trigger::Chord { chord, .. } if chord == b => x.chord_wait,
+            _ => None,
+        })
+        .fold(0.0, |a, w| a.max(Secs::from(w)))
 }
 
 /// A button that other bindings — or settings — hang off while it is held.
