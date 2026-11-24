@@ -20,6 +20,8 @@ pub struct Monitor {
     pub origin: [i32; 2],
     pub size: [i32; 2],
     pub primary: bool,
+    /// Its display scale (1.0 = 100%): what Windows sizes windows on it by.
+    pub scale: f32,
 }
 
 impl Monitor {
@@ -89,6 +91,32 @@ pub fn overlay_monitor() -> Option<Monitor> {
 /// The chosen monitor in `list`, else the primary.
 fn pick<'a>(list: &'a [Monitor], chosen: Option<&str>) -> Option<&'a Monitor> {
     list.iter().find(|m| chosen == Some(m.id.as_str())).or_else(|| list.iter().find(|m| m.primary))
+}
+
+/// How big the overlay monitor is in its own points, at egui's `zoom`: the size of the
+/// screen an overlay over it lays out in. `None` where monitors can't be listed.
+pub fn overlay_screen_points(zoom: f32) -> Option<egui::Vec2> {
+    overlay_monitor().map(|m| screen_points(&m, zoom))
+}
+
+/// Whether a window placed at `pos` (100% points, as a window's place is kept) would have its
+/// title bar on a monitor - else it opens wherever the system puts a new one, not off every
+/// screen. True where monitors can't be listed.
+pub fn on_a_monitor(pos: [f32; 2]) -> bool {
+    let list = list();
+    list.is_empty() || list.iter().any(|m| holds(m, pos))
+}
+
+/// Whether `m` holds a window's title bar at `pos` (100% points, which Windows scales by the
+/// monitor's own scale).
+fn holds(m: &Monitor, pos: [f32; 2]) -> bool {
+    let at = [(pos[0] + 40.0) * m.scale, (pos[1] + 10.0) * m.scale];
+    (0..2).all(|k| at[k] >= m.origin[k] as f32 && at[k] < (m.origin[k] + m.size[k]) as f32)
+}
+
+fn screen_points(m: &Monitor, zoom: f32) -> egui::Vec2 {
+    let ppp = (m.scale * zoom).max(0.1);
+    egui::vec2(m.size[0] as f32, m.size[1] as f32) / ppp
 }
 
 /// Where a new overlay viewport goes and how big, in the main window's points: over the
@@ -275,6 +303,7 @@ fn enumerate() -> Vec<Monitor> {
     use windows_sys::core::BOOL;
     use windows_sys::Win32::Foundation::{LPARAM, RECT};
     use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 
     const MONITORINFOF_PRIMARY: u32 = 1;
 
@@ -290,11 +319,14 @@ fn enumerate() -> Vec<Monitor> {
                 let r = mi.monitorInfo.rcMonitor;
                 let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
                 let id = String::from_utf16_lossy(&mi.szDevice[..n]).trim_start_matches(r"\\.\").to_string();
+                let (mut dx, mut dy) = (96u32, 96u32);
+                let dpi = if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) == 0 && dx > 0 { dx } else { 96 };
                 out.push(Monitor {
                     id,
                     origin: [r.left, r.top],
                     size: [r.right - r.left, r.bottom - r.top],
                     primary: mi.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+                    scale: dpi as f32 / 96.0,
                 });
             }
         }
@@ -322,8 +354,8 @@ mod tests {
     #[test]
     fn the_overlays_cover_the_chosen_monitor_while_it_is_there() {
         let list = [
-            Monitor { id: "DISPLAY1".into(), origin: [0, 0], size: [1920, 1080], primary: true },
-            Monitor { id: "DISPLAY2".into(), origin: [1920, 0], size: [2560, 1440], primary: false },
+            Monitor { id: "DISPLAY1".into(), origin: [0, 0], size: [1920, 1080], primary: true, scale: 1.0 },
+            Monitor { id: "DISPLAY2".into(), origin: [1920, 0], size: [2560, 1440], primary: false, scale: 1.25 },
         ];
         let id = |chosen: Option<&str>| pick(&list, chosen).map(|m| m.id.as_str());
         assert_eq!(id(Some("DISPLAY2")), Some("DISPLAY2"));
@@ -331,6 +363,9 @@ mod tests {
         assert_eq!(id(Some("DISPLAY3")), Some("DISPLAY1"), "a monitor gone away falls back");
         assert_eq!(list[1].describe(), "Display 2: 2560×1440");
         assert_eq!(list[0].describe(), "Display 1: 1920×1080, primary");
+        // The screen an overlay lays out in: the monitor in its own points, egui's zoom too.
+        assert_eq!(screen_points(&list[1], 1.0), egui::vec2(2048.0, 1152.0));
+        assert_eq!(screen_points(&list[0], 1.5), egui::vec2(1280.0, 720.0));
     }
 }
 

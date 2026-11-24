@@ -164,6 +164,27 @@ impl FlexInputApp {
             .clamp(settings::OVERLAY_FPS_MIN, settings::OVERLAY_FPS_MAX)
     }
 
+    /// The info overlay's own window, while it shows in one instead of over the screen
+    /// (Settings → Pin & overlays): its background, and where it was last.
+    pub(crate) fn overlay_window(&self) -> Option<crate::overlay::OverlayWindow> {
+        let [r, g, b] = self.settings.overlay_window_bg;
+        self.settings.overlay_in_window.then(|| crate::overlay::OverlayWindow {
+            bg: egui::Color32::from_rgb(r, g, b),
+            rect: self.settings.overlay_window_rect,
+        })
+    }
+
+    /// Keep where the overlay window is (`[x, y, w, h]`, 100% points), for it to open
+    /// there again.
+    pub(crate) fn keep_overlay_window_rect(&mut self, rect: [f32; 4]) {
+        let moved = self.settings.overlay_window_rect
+            .is_none_or(|was| was.iter().zip(rect).any(|(a, b)| (a - b).abs() > 1.0));
+        if moved {
+            self.settings.overlay_window_rect = Some(rect);
+            self.settings_dirty = true;
+        }
+    }
+
     /// Serialize the current tab set to workspace.json. No-op if the user
     /// has not opted in to workspace persistence.
     pub(crate) fn save_workspace_now(&self) {

@@ -31,6 +31,14 @@
 //!   (`wgpu_integration::render_immediate_viewport`), so the app's opaque
 //!   `clear_color` never paints over the overlay.
 //!
+//! **In a window** (Settings → Pin & overlays): the same overlay in an ordinary
+//! window of its own - in the taskbar, under whatever is in front, never
+//! click-through - filled with a background colour, for a stream's capture (OBS)
+//! to take and key out instead of the overlay covering the game. It shows the
+//! layout made for the screen, scaled to fit the window (`fit_screen`), so the
+//! layout is the one edited either way and lines up with the game when the
+//! capture is stretched over it.
+//!
 //! Visible/edit state lives in ctx temp-data slots (same pattern as the
 //! see-through eye toggle) so the title-bar buttons can flip them without
 //! threading `&mut FlexInputApp` through the title-bar renderer.
@@ -49,6 +57,103 @@ pub const OVERLAY_EDIT_KEY: &str = "fxi_overlay_edit";
 /// keys on transparent + skip-taskbar, not the title — the title is only
 /// cosmetic, but stays unique for debuggability).
 const OVERLAY_WINDOW_TITLE: &str = "FlexInput Overlay";
+
+/// Title of the overlay shown in a window of its own: what a capture (OBS) finds it by.
+/// Not [`OVERLAY_WINDOW_TITLE`], which [`with_overlay_not_topmost`] finds to put back on top.
+const OVERLAY_OWN_WINDOW_TITLE: &str = "FlexInput Info Overlay";
+
+/// The info overlay in a window of its own instead of over the screen (Settings → Pin &
+/// overlays): what it takes from the settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlayWindow {
+    /// Its background: the colour a capture keys out.
+    pub bg: egui::Color32,
+    /// Where it was last and how big inside: `[x, y, w, h]` in 100% points.
+    pub rect: Option<[f32; 4]>,
+}
+
+/// How the overlay window shows the screen, for Settings to say: the share of the screen's
+/// pixels it draws it with (1.0 = as many) and the screen's size in pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WindowFit {
+    pub shown: f32,
+    pub screen_px: egui::Vec2,
+}
+
+/// The size (and place, when it's on a monitor) the overlay window opened with, in 100%
+/// points: kept while it's open, since a builder following the saved place would move and
+/// resize the window under the user's own drag.
+type WindowOpened = ([f32; 2], Option<[f32; 2]>);
+
+fn in_window_id() -> egui::Id { egui::Id::new("fxi_overlay_in_window") }
+fn passthrough_applied_id() -> egui::Id { egui::Id::new("fxi_overlay_passthrough_applied") }
+fn window_opened_id() -> egui::Id { egui::Id::new("fxi_overlay_window_opened") }
+fn window_fit_id() -> egui::Id { egui::Id::new("fxi_overlay_window_fit") }
+fn window_actual_size_id() -> egui::Id { egui::Id::new("fxi_overlay_window_actual_size") }
+
+/// How the open overlay window shows the screen; `None` while it isn't open.
+pub(crate) fn overlay_window_fit(ctx: &egui::Context) -> Option<WindowFit> {
+    ctx.data(|d| d.get_temp(window_fit_id()))
+}
+
+/// Size the open overlay window to the screen's pixels, so it shows it at 100%.
+pub(crate) fn request_overlay_window_actual_size(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(window_actual_size_id(), true));
+}
+
+/// Where a screen of `screen` points goes in a window's inside `win`: as large as fits,
+/// its shape kept, centred - the window's background fills the rest.
+pub(crate) fn fit_screen(win: egui::Rect, screen: egui::Vec2) -> egui::emath::TSTransform {
+    let scale = (win.width() / screen.x.max(1.0)).min(win.height() / screen.y.max(1.0)).max(0.01);
+    let at = win.min + (win.size() - screen * scale) * 0.5;
+    egui::emath::TSTransform::new(at.to_vec2(), scale)
+}
+
+/// The overlay window's builder: titled for a capture to find, opening where it was last
+/// (when that is still on a monitor) at the size it had, half the screen the first time.
+fn own_window_builder(ctx: &egui::Context, w: OverlayWindow, screen: egui::Vec2) -> egui::ViewportBuilder {
+    let zoom = ctx.zoom_factor().max(0.1);
+    let kept: Option<WindowOpened> = ctx.data(|d| d.get_temp(window_opened_id()));
+    let (size, pos) = kept.unwrap_or_else(|| {
+        let opened = match w.rect {
+            Some([x, y, wd, ht]) => ([wd, ht], crate::monitors::on_a_monitor([x, y]).then_some([x, y])),
+            None => ([screen.x * 0.5 * zoom, screen.y * 0.5 * zoom], None),
+        };
+        ctx.data_mut(|d| d.insert_temp(window_opened_id(), opened));
+        opened
+    });
+    let builder = egui::ViewportBuilder::default()
+        .with_app_id(crate::APP_ID)
+        .with_title(OVERLAY_OWN_WINDOW_TITLE)
+        .with_inner_size(egui::vec2(size[0], size[1]) / zoom)
+        .with_min_inner_size([160.0, 90.0])
+        .with_active(false);
+    match pos {
+        Some([x, y]) => builder.with_position(egui::pos2(x, y) / zoom),
+        None => builder,
+    }
+}
+
+/// Where the overlay window is and how big inside, `[x, y, w, h]` in 100% points - `None`
+/// while minimized, mid-drag, or not yet sized.
+fn own_window_rect(vctx: &egui::Context) -> Option<[f32; 4]> {
+    let (outer, inner, minimized) = vctx.input(|i| {
+        let v = i.viewport();
+        (v.outer_rect, v.inner_rect, v.minimized)
+    });
+    if minimized == Some(true) || vctx.input(|i| i.pointer.any_down()) {
+        return None;
+    }
+    let zoom = vctx.zoom_factor();
+    let (outer, inner) = (outer?, inner?);
+    let r = [outer.min.x * zoom, outer.min.y * zoom, inner.width() * zoom, inner.height() * zoom];
+    (r[2] >= 100.0 && r[3] >= 60.0).then_some(r)
+}
+
+/// Whether the info overlay shows in a window of its own (as last shown).
+pub fn overlay_in_window(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(in_window_id())).unwrap_or(false)
+}
 
 
 fn visible_id() -> egui::Id { egui::Id::new(OVERLAY_VISIBLE_KEY) }
@@ -198,10 +303,12 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
         btn_size,
         egui::Button::selectable(on, egui::RichText::new("▣").size(crate::settings::ui_size(14.0))),
     );
-    let hover = if on {
-        "Overlay: ON — click to hide.\nA transparent, click-through layer over the whole screen.\nWorks over borderless/windowed games (not exclusive fullscreen)."
-    } else {
-        "Overlay: OFF — click to show the info overlay.\nA transparent, click-through layer over the whole screen.\nWorks over borderless/windowed games (not exclusive fullscreen)."
+    let in_window = overlay_in_window(ui.ctx());
+    let hover = match (on, in_window) {
+        (true, false) => "Overlay: ON — click to hide.\nA transparent, click-through layer over the whole screen.\nWorks over borderless/windowed games (not exclusive fullscreen).",
+        (false, false) => "Overlay: OFF — click to show the info overlay.\nA transparent, click-through layer over the whole screen.\nWorks over borderless/windowed games (not exclusive fullscreen).",
+        (true, true) => "Overlay window: OPEN — click to close it.\nThe info overlay in a window of its own, for a stream's capture to take.\nSettings → Pin & overlays.",
+        (false, true) => "Overlay window: CLOSED — click to open the info overlay's window.\nThe info overlay in a window of its own, for a stream's capture to take.\nSettings → Pin & overlays.",
     };
     if resp.on_hover_text(hover).clicked() {
         set_overlay_visible(ui.ctx(), !on);
@@ -224,7 +331,7 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
         // surface (latched by the vendored egui-wgpu when surface creation
         // falls back to an opaque alpha mode) — the overlay composites as an
         // opaque sheet. Warn right next to the toggle.
-        if eframe::egui_wgpu::winit::TRANSPARENCY_UNSUPPORTED
+        if !in_window && eframe::egui_wgpu::winit::TRANSPARENCY_UNSUPPORTED
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             ui.label(egui::RichText::new("⚠").size(crate::settings::ui_size(14.0)).color(egui::Color32::from_rgb(240, 180, 60)))
@@ -241,15 +348,40 @@ pub fn render_overlay_toggle(ui: &mut egui::Ui, bar_h: f32) {
 /// Show the overlay viewport (call once per frame from `FlexInputApp::update`,
 /// after the sub-patch editors). No-op while hidden.
 pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
-    if !overlay_visible(ctx) {
-        crate::monitors::overlay_closed(ctx, "info");
+    // Over the screen, or in a window of its own (Settings). Each has its own viewport, so
+    // a switch closes the one and opens the other afresh.
+    let window = app.overlay_window();
+    let visible = overlay_visible(ctx);
+    let which = if window.is_some() { "info_window" } else { "info" };
+    crate::monitors::overlay_closed(ctx, if window.is_some() { "info" } else { "info_window" });
+    ctx.data_mut(|d| {
+        d.insert_temp(in_window_id(), window.is_some());
+        if window.is_none() || !visible {
+            d.remove::<WindowOpened>(window_opened_id());
+            d.remove::<WindowFit>(window_fit_id());
+            d.remove::<bool>(window_actual_size_id());
+        }
+        // A screen overlay opens click-through (its builder's), whatever was applied to
+        // the last one.
+        if window.is_some() || !visible {
+            d.remove::<bool>(passthrough_applied_id());
+        }
+    });
+    if !visible {
+        crate::monitors::overlay_closed(ctx, which);
         return;
     }
-    let frames_open = crate::monitors::overlay_frames_open(ctx, "info");
+    let frames_open = crate::monitors::overlay_frames_open(ctx, which);
 
     // Cover the monitor picked in the header (`crate::monitors`), the primary
     // until one is; the viewport puts itself exactly there once open.
     let (overlay_pos, monitor_size) = crate::monitors::overlay_geometry(ctx);
+    // The screen the layout is laid out for: the window shows that monitor's, in its own
+    // points, scaled to fit.
+    let screen = match window {
+        Some(_) => crate::monitors::overlay_screen_points(ctx.zoom_factor()).unwrap_or(monitor_size),
+        None => monitor_size,
+    };
 
     let edit = overlay_edit(ctx);
     // Live repaint cadence — the user's `overlay_fps` setting, NOT the low
@@ -282,8 +414,8 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             let n = overlay_layout.items.len() as f32;
             let cascade = (n % 8.0) * 28.0;
             let pos = [
-                (monitor_size.x - init_size[0]) * 0.5 + cascade,
-                (monitor_size.y - init_size[1]) * 0.5 + cascade,
+                (screen.x - init_size[0]) * 0.5 + cascade,
+                (screen.y - init_size[1]) * 0.5 + cascade,
             ];
             overlay_layout.items.push(crate::canvas::node::LayoutItem::Module(
                 crate::canvas::node::ExposedModule {
@@ -317,6 +449,40 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         }
     }
 
+    let mut exit_edit = false;
+
+    if let Some(w) = window {
+        let mut close = false;
+        let mut rect = None;
+        let builder = own_window_builder(ctx, w, screen);
+        let screen_px = crate::monitors::overlay_monitor().map(|m| egui::vec2(m.size[0] as f32, m.size[1] as f32));
+        let viewport_id = egui::ViewportId::from_hash_of("fxi_overlay_window");
+        crate::monitors::with_settle_passes(ctx, which, frames_open, || ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
+            // Never moved into place, so every frame shows; the first is laid out until its
+            // pinned rows settle.
+            let _ = crate::monitors::settle_overlay_frame(vctx, which, frames_open, false);
+            close = vctx.input(|i| i.viewport().close_requested());
+            rect = own_window_rect(vctx);
+            if edit && !pick && vctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                exit_edit = true;
+            }
+            show_window_contents(
+                vctx, w.bg, screen, screen_px, edit, pick, tab_snarl, overlay_layout, live_signals, &panic_shortcut, &mut exit_edit,
+            );
+        }));
+        if close {
+            set_overlay_visible(ctx, false);
+        }
+        if let Some(r) = rect {
+            app.keep_overlay_window_rect(r);
+        }
+        if exit_edit {
+            set_overlay_edit(ctx, false);
+        }
+        ctx.request_repaint_after(frame_interval);
+        return;
+    }
+
     let viewport_id = egui::ViewportId::from_hash_of("fxi_overlay");
     let builder = egui::ViewportBuilder::default()
         .with_app_id(crate::APP_ID)
@@ -331,8 +497,6 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
         .with_has_shadow(false)
         .with_position(overlay_pos)
         .with_inner_size(monitor_size);
-
-    let mut exit_edit = false;
 
     crate::monitors::with_settle_passes(ctx, "info", frames_open, || ctx.show_viewport_immediate(viewport_id, builder, |vctx, _class| {
         // Self-correct geometry from INSIDE the viewport: the builder size was
@@ -401,7 +565,7 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
             edit && !pick
         };
 
-        let pt_id = egui::Id::new("fxi_overlay_passthrough_applied");
+        let pt_id = passthrough_applied_id();
         let want_passthrough = if edit && !pick { !interactive } else { true };
         let applied: Option<bool> = vctx.data(|d| d.get_temp(pt_id));
         if applied != Some(want_passthrough) {
@@ -435,27 +599,11 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
                     return;
                 }
 
-                if edit {
-                    // Faint dim so edit mode reads as a distinct state.
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(48));
-                    if overlay_layout.items.is_empty() {
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Overlay is empty — right-click for decorations,\nor use “Add element” to pin module UI here.",
-                            crate::settings::ui_font(15.0),
-                            egui::Color32::from_rgba_unmultiplied(220, 235, 255, 220),
-                        );
-                    }
-                }
-
-                crate::canvas::overlay_body::show_overlay_body(
-                    ui, rect, tab_snarl, overlay_layout, edit,
-                    live_signals, &panic_shortcut,
-                );
+                overlay_contents(ui, rect, tab_snarl, overlay_layout, edit, live_signals, &panic_shortcut, true);
 
                 if edit {
-                    overlay_edit_toolbar(ui, rect, tab_snarl, overlay_layout, &mut exit_edit);
+                    let below = crate::canvas::viewer::tab_row_h(overlay_layout.layout_tabs.len());
+                    overlay_edit_toolbar(ui, below, tab_snarl, overlay_layout, &mut exit_edit);
                 }
             });
     }));
@@ -468,6 +616,106 @@ pub fn show_overlay(app: &mut FlexInputApp, ctx: &egui::Context) {
     // context (immediate viewports render with the parent; egui keeps the
     // earliest requested deadline, so the bg throttle can't override this).
     ctx.request_repaint_after(frame_interval);
+}
+
+/// The overlay window's inside: its background, and on it the screen's layout (`screen`, its
+/// points; `screen_px` its pixels, where known) scaled to fit - or, picking, the pick frame -
+/// with the edit toolbar over it.
+#[allow(clippy::too_many_arguments)]
+fn show_window_contents(
+    vctx: &egui::Context,
+    bg: egui::Color32,
+    screen: egui::Vec2,
+    screen_px: Option<egui::Vec2>,
+    edit: bool,
+    pick: bool,
+    tab_snarl: &mut egui_snarl::Snarl<crate::canvas::NodeData>,
+    overlay_layout: &mut crate::canvas::OverlayLayout,
+    live_signals: &std::collections::HashMap<(String, String), flexinput_core::Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    exit_edit: &mut bool,
+) {
+    egui::CentralPanel::default()
+        .frame(egui::Frame::NONE.fill(bg))
+        .show(vctx, |ui| {
+            let win = ui.max_rect();
+            let to_window = fit_screen(win, screen);
+            publish_window_fit(vctx, screen, screen_px, to_window.scaling);
+            if pick {
+                paint_pick_frame(ui, win);
+                return;
+            }
+            // The screen's layout on a layer of its own, scaled onto the window - its input
+            // too. An area rather than a sublayer, so a pin's own layer nests one deep, as
+            // over the screen.
+            let full = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
+            let layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("fxi_overlay_window_body"));
+            vctx.set_transform_layer(layer, to_window);
+            egui::Area::new(layer.id)
+                .order(layer.order)
+                .fixed_pos(egui::Pos2::ZERO)
+                .constrain(false)
+                .movable(false)
+                .interactable(true)
+                .show(vctx, |ui| {
+                    ui.expand_to_include_rect(full);
+                    let mut body = ui.new_child(egui::UiBuilder::new().max_rect(full));
+                    body.set_clip_rect(full);
+                    overlay_contents(&mut body, full, tab_snarl, overlay_layout, edit, live_signals, panic_shortcut, false);
+                });
+            if edit {
+                let row = crate::canvas::viewer::tab_row_h(overlay_layout.layout_tabs.len());
+                let below = (to_window * egui::pos2(0.0, row)).y - win.min.y;
+                overlay_edit_toolbar(ui, below, tab_snarl, overlay_layout, exit_edit);
+            }
+        });
+}
+
+/// What the overlay shows on its screen `rect`: the layout, live or edited - and edited while
+/// empty, how to fill it. `dim` shades the screen while editing, so the mode reads apart
+/// (not where the background is the colour a capture keys out).
+#[allow(clippy::too_many_arguments)]
+fn overlay_contents(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    tab_snarl: &mut egui_snarl::Snarl<crate::canvas::NodeData>,
+    overlay_layout: &mut crate::canvas::OverlayLayout,
+    edit: bool,
+    live_signals: &std::collections::HashMap<(String, String), flexinput_core::Signal>,
+    panic_shortcut: &crate::app::PanicShortcut,
+    dim: bool,
+) {
+    if edit {
+        if dim {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(48));
+        }
+        if overlay_layout.items.is_empty() {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Overlay is empty — right-click for decorations,\nor use “Add element” to pin module UI here.",
+                crate::settings::ui_font(15.0),
+                egui::Color32::from_rgba_unmultiplied(220, 235, 255, 220),
+            );
+        }
+    }
+    crate::canvas::overlay_body::show_overlay_body(
+        ui, rect, tab_snarl, overlay_layout, edit, live_signals, panic_shortcut,
+    );
+}
+
+/// Tell Settings how the overlay window shows the screen (`scale`: its points onto the
+/// window's), and take a request to show it at 100%: the window's inside resized to the
+/// screen's pixels.
+fn publish_window_fit(vctx: &egui::Context, screen: egui::Vec2, screen_px: Option<egui::Vec2>, scale: f32) {
+    let ppp = vctx.pixels_per_point().max(0.1);
+    let screen_px = screen_px.unwrap_or(screen * ppp);
+    let shown = screen.x * scale * ppp / screen_px.x.max(1.0);
+    vctx.data_mut(|d| d.insert_temp(window_fit_id(), WindowFit { shown, screen_px }));
+    if vctx.data_mut(|d| d.remove_temp::<bool>(window_actual_size_id())).unwrap_or(false) {
+        // The letterbox goes with it: the window takes the screen's shape.
+        vctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(screen_px / ppp));
+    }
 }
 
 /// Pick-state visuals: a pulsing amber border frame hugging the screen edge
@@ -513,16 +761,15 @@ pub(crate) fn paint_pick_frame(ui: &mut egui::Ui, rect: egui::Rect) {
 }
 
 /// Floating toolbar shown top-center in edit mode: Done, Add element, and the
-/// shared layout tools (snap grid, decoration adders, inspector strip).
+/// shared layout tools (snap grid, decoration adders, inspector strip). `below`: how far
+/// down the window the overlay's row of tabs ends (0 without one), the toolbar under it.
 fn overlay_edit_toolbar(
     ui: &mut egui::Ui,
-    rect: egui::Rect,
+    below: f32,
     tab_snarl: &mut egui_snarl::Snarl<crate::canvas::NodeData>,
     overlay_layout: &mut crate::canvas::OverlayLayout,
     exit_edit: &mut bool,
 ) {
-    // Under the overlay's row of tabs, where it has one.
-    let below = crate::canvas::viewer::tab_row_h(overlay_layout.layout_tabs.len());
     let area = egui::Area::new(egui::Id::new("fxi_overlay_toolbar"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0 + below))
@@ -576,7 +823,6 @@ fn overlay_edit_toolbar(
     // window interactive while the cursor is over it (its size isn't known
     // until laid out here).
     ui.ctx().data_mut(|d| d.insert_temp(toolbar_rect_id(), area_resp.response.rect));
-    let _ = rect;
 }
 
 #[cfg(test)]
@@ -619,7 +865,7 @@ mod toolbar_shots {
                 let out = ctx.run(raw, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let mut exit = false;
-                        overlay_edit_toolbar(ui, screen, &mut snarl, &mut layout, &mut exit);
+                        overlay_edit_toolbar(ui, 0.0, &mut snarl, &mut layout, &mut exit);
                     });
                 });
                 shot.absorb(&out.textures_delta);
@@ -674,7 +920,8 @@ mod toolbar_shots {
                         ui, screen, &mut snarl, &mut layout, true, &Default::default(), &panic,
                     );
                     let mut exit = false;
-                    overlay_edit_toolbar(ui, screen, &mut snarl, &mut layout, &mut exit);
+                    let below = crate::canvas::viewer::tab_row_h(layout.layout_tabs.len());
+                    overlay_edit_toolbar(ui, below, &mut snarl, &mut layout, &mut exit);
                 });
             });
             shot.absorb(&out.textures_delta);
@@ -746,5 +993,135 @@ mod first_frame_tests {
         let (first, settled) = first_and_settled(true);
         assert!((first.min - settled.min).length() < 0.5 && (first.size() - settled.size()).length() < 0.5,
             "the first frame's row at {first:?}, settled at {settled:?}");
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use crate::canvas::node::{LayoutDecoration, LayoutItem};
+
+    const BG: egui::Color32 = egui::Color32::from_rgb(0, 255, 0);
+    const FILL: [u8; 4] = [40, 120, 255, 255];
+
+    /// A 1920 × 1080 screen's layout holding one rectangle at (600, 500), 300 × 160.
+    fn layout() -> crate::canvas::OverlayLayout {
+        let mut layout = crate::canvas::OverlayLayout::default();
+        layout.items.push(LayoutItem::Deco(LayoutDecoration::Rect {
+            tab: 0,
+            pos: [600.0, 500.0],
+            size: [300.0, 160.0],
+            fill: FILL,
+            fill_gradient: None,
+            stroke: [0; 4],
+            stroke_px: 0.0,
+            corner_radius: 0.0,
+            anchor: Default::default(),
+        }));
+        layout
+    }
+
+    /// Run the overlay window's inside - 960 × 600, showing a 1920 × 1080 screen - over
+    /// `frames`, each frame's events in turn; the last frame's shapes.
+    fn run(
+        ctx: &egui::Context,
+        layout: &mut crate::canvas::OverlayLayout,
+        edit: bool,
+        frames: Vec<Vec<egui::Event>>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let mut snarl: egui_snarl::Snarl<crate::canvas::NodeData> = egui_snarl::Snarl::new();
+        let win = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
+        let panic = crate::app::PanicShortcut::default();
+        let mut shapes = Vec::new();
+        for (t, events) in frames.into_iter().enumerate() {
+            let raw = egui::RawInput { screen_rect: Some(win), time: Some(t as f64 / 30.0), events, ..Default::default() };
+            let out = ctx.run(raw, |ctx| {
+                let mut exit = false;
+                super::show_window_contents(
+                    ctx, BG, egui::vec2(1920.0, 1080.0), None, edit, false,
+                    &mut snarl, layout, &Default::default(), &panic, &mut exit,
+                );
+            });
+            shapes = out.shapes;
+        }
+        shapes
+    }
+
+    /// Where the rectangles filled as `pick` says lie together, in the window.
+    fn filled(shapes: &[egui::epaint::ClippedShape], pick: impl Fn(egui::Color32) -> bool + Copy) -> Option<egui::Rect> {
+        fn walk(s: &egui::Shape, pick: impl Fn(egui::Color32) -> bool + Copy, out: &mut Option<egui::Rect>) {
+            match s {
+                egui::Shape::Rect(r) if pick(r.fill) => *out = Some(out.map_or(r.rect, |o| o.union(r.rect))),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, pick, out)),
+                _ => {}
+            }
+        }
+        let mut out = None;
+        shapes.iter().for_each(|c| walk(&c.shape, pick, &mut out));
+        out
+    }
+
+    fn close(a: egui::Rect, b: egui::Rect) -> bool {
+        (a.min - b.min).length() < 1.0 && (a.max - b.max).length() < 1.0
+    }
+
+    fn press(at: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+    }
+
+    // A screen as large as fits, its shape kept, centred: the rest is the background.
+    #[test]
+    fn a_screen_fits_a_window_whole_and_centred() {
+        let win = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0));
+        let t = super::fit_screen(win, egui::vec2(1920.0, 1080.0));
+        assert!((t.scaling - 0.5).abs() < 1e-6, "{t:?}");
+        assert_eq!(t * egui::pos2(0.0, 0.0), egui::pos2(0.0, 30.0));
+        assert_eq!(t * egui::pos2(1920.0, 1080.0), egui::pos2(960.0, 570.0));
+        let tall = super::fit_screen(egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(400.0, 1000.0)), egui::vec2(1920.0, 1080.0));
+        assert_eq!(tall * egui::pos2(0.0, 0.0), egui::pos2(10.0, 387.5), "a tall window letterboxed above and below");
+    }
+
+    // The window is filled with its colour, and the screen's layout lands in it where the
+    // screen's scaled down puts it - a capture stretched over the game lines it up.
+    #[test]
+    fn the_overlay_window_shows_the_screens_layout_scaled_on_its_colour() {
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut layout = layout();
+        let shapes = run(&ctx, &mut layout, false, vec![vec![]; 3]);
+        let bg = filled(&shapes, |c| c == BG).expect("the background");
+        assert!(close(bg, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 600.0))), "{bg:?}");
+        // (Its colour as a live overlay draws it, a little see-through.)
+        let item = filled(&shapes, |c| c != BG && c.a() > 0 && c.b() > c.r()).expect("the rectangle");
+        let want = egui::Rect::from_min_size(egui::pos2(300.0, 280.0), egui::vec2(150.0, 80.0));
+        assert!(close(item, want), "drawn at {item:?}, want {want:?}");
+        let fit = super::overlay_window_fit(&ctx).expect("published");
+        assert!((fit.shown - 0.5).abs() < 1e-3 && fit.screen_px == egui::vec2(1920.0, 1080.0), "{fit:?}");
+    }
+
+    // Edited in the window, the pointer is brought into the screen's layout: a click on the
+    // rectangle where the window shows it selects it, and a marquee dragged in the window
+    // catches it where the window shows it (not where the window's own points would be).
+    #[test]
+    fn the_overlay_window_is_edited_where_it_shows_the_layout() {
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut layout = layout();
+        let on = egui::pos2(375.0, 320.0);
+        run(&ctx, &mut layout, true, vec![
+            vec![], vec![egui::Event::PointerMoved(on)], vec![press(on, true)], vec![press(on, false)], vec![],
+        ]);
+        assert_eq!(layout.selected_items, vec![0], "a click on it in the window");
+
+        let ctx = egui::Context::default();
+        crate::app::fonts::setup_fonts(&ctx);
+        let mut layout = self::layout();
+        let (from, to) = (egui::pos2(150.0, 180.0), egui::pos2(305.0, 285.0));
+        let mid = from + (to - from) * 0.5;
+        run(&ctx, &mut layout, true, vec![
+            vec![], vec![egui::Event::PointerMoved(from)], vec![press(from, true)],
+            vec![egui::Event::PointerMoved(mid)], vec![egui::Event::PointerMoved(to)],
+            vec![press(to, false)], vec![],
+        ]);
+        assert_eq!(layout.selected_items, vec![0], "a marquee ending on it in the window");
     }
 }

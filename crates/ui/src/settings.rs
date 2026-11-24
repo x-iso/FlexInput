@@ -649,6 +649,19 @@ pub struct AppSettings {
     /// OVERLAY_FPS_MIN..=MAX.
     #[serde(default = "default_overlay_fps")]
     pub overlay_fps: u32,
+    /// Show the info overlay in a window of its own instead of over the screen: an ordinary
+    /// window (not on top, not click-through) filled with `overlay_window_bg`, for a stream's
+    /// capture (OBS) to take and key out, so the game itself stays uncovered. Its layout is
+    /// the one over the screen, scaled to fit the window.
+    #[serde(default)]
+    pub overlay_in_window: bool,
+    /// The overlay window's background: the colour a capture keys out.
+    #[serde(default = "default_overlay_window_bg")]
+    pub overlay_window_bg: [u8; 3],
+    /// Where the overlay window was and how big inside: `[x, y, w, h]` in 100% points
+    /// (as `window_pos` / `window_size`). `None` until it has been opened.
+    #[serde(default)]
+    pub overlay_window_rect: Option<[f32; 4]>,
     /// The monitor the overlays cover (and a calibration's screenshot is taken of), by
     /// device name (`DISPLAY2`); `None` = the primary. Picked in the header.
     #[serde(default)]
@@ -1015,6 +1028,9 @@ pub const OVERLAY_FPS_MIN: u32 = 10;
 pub const OVERLAY_FPS_MAX: u32 = 144;
 pub const OVERLAY_FPS_DEFAULT: u32 = 60;
 fn default_overlay_fps() -> u32 { OVERLAY_FPS_DEFAULT }
+/// The overlay window's background unless chosen: chroma-key green.
+pub const OVERLAY_WINDOW_BG_DEFAULT: [u8; 3] = [0, 255, 0];
+fn default_overlay_window_bg() -> [u8; 3] { OVERLAY_WINDOW_BG_DEFAULT }
 fn default_overlay_shortcut() -> PinShortcut {
     // Ctrl+Shift+O — "overlay"; clear of the pin (Ctrl+Shift+P) and panic
     // (Ctrl+Backtick) defaults.
@@ -1119,6 +1135,9 @@ impl Default for AppSettings {
             overlay_shortcut: default_overlay_shortcut(),
             edit_overlay_shortcut: default_edit_overlay_shortcut(),
             overlay_fps: OVERLAY_FPS_DEFAULT,
+            overlay_in_window: false,
+            overlay_window_bg: OVERLAY_WINDOW_BG_DEFAULT,
+            overlay_window_rect: None,
             overlay_monitor: None,
             config_overlay_visible: false,
             config_overlay_shortcut: default_config_overlay_shortcut(),

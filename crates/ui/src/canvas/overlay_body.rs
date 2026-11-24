@@ -103,6 +103,12 @@ fn overlay_tab_row(ui: &mut egui::Ui, row: egui::Rect, overlay: &mut OverlayLayo
     }
 }
 
+/// From the screen's points to those `ui` lays out in: the same unless the overlay is drawn
+/// scaled (into its own window), where the pointer's place has to be brought into the layout's.
+fn from_global(ui: &egui::Ui) -> egui::emath::TSTransform {
+    ui.ctx().layer_transform_from_global(ui.layer_id()).unwrap_or(egui::emath::TSTransform::IDENTITY)
+}
+
 /// The part of an overlay's screen `full` its layout fills: beneath its row of tabs, where it
 /// has two or more. What the overlay's items are positioned in, and anchored to.
 pub(crate) fn overlay_layout_rect(full: egui::Rect, overlay: &OverlayLayout) -> egui::Rect {
@@ -306,7 +312,7 @@ pub(crate) fn show_overlay_body(
         }
         let start: Option<[f32; 2]> = ui.ctx().data(|d| d.get_temp(marquee_key));
         if let Some(start) = start {
-            let cur = ui.ctx().input(|i| i.pointer.latest_pos());
+            let cur = ui.ctx().input(|i| i.pointer.latest_pos()).map(|p| from_global(ui) * p);
             if bg.dragged_by(egui::PointerButton::Primary) {
                 if let Some(p) = cur {
                     let r = egui::Rect::from_two_pos(egui::pos2(start[0], start[1]), p);
@@ -868,7 +874,7 @@ pub(crate) fn show_overlay_body(
         }
         // While picking a target, outline the element under the cursor.
         if anchor_pick_armed(ui.ctx()).is_some() {
-            if let Some(c) = ui.ctx().pointer_hover_pos() {
+            if let Some(c) = ui.ctx().pointer_hover_pos().map(|p| from_global(ui) * p) {
                 let local = [c.x - origin.x, c.y - origin.y];
                 if let Some(i) = items.iter().enumerate().rev().find_map(|(i, it)| (shown[i] && it.hit_test(local)).then_some(i)) {
                     let (p, s) = resolve_layout_rect(&items, i, authored, cur);

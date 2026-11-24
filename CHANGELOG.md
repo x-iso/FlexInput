@@ -7,6 +7,15 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Added
 
+- **The info overlay in a window of its own, for streaming.** Settings → Pin & overlays →
+  Info overlay → In a window shows it in an ordinary window instead of over the screen: in
+  the taskbar, under whatever is in front, never click-through, and filled with a colour you
+  pick (chroma-key green to start) for OBS to key out - so the overlay is on the stream
+  without covering the game on your own screen. The window holds the layout made for the
+  screen, scaled to fit it, so a Window Capture stretched over the game lines it up; Settings
+  says how much of the screen's pixels it shows it with, and Make it 100% sizes it to them.
+  It opens where it was, at the size it had, and is edited in it as over the screen.
+
 - **Audio Stream Haptics on a Steam Controller's trackpads.** A Trackpads row (off, low
   band, high band) makes the trackpads two more channels: each plays the chosen band, under
   or over the crossover, as a tone of its own at that band's pitch and its side's loudness,

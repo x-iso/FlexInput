@@ -1185,6 +1185,55 @@ impl FlexInputApp {
             }
         });
         form_note(ui, "How smoothly pinned elements animate on the overlay. Higher = smoother glow, a bit more CPU/GPU while the overlay is shown.");
+
+        form_row(ui, "Info overlay", "Where the info overlay shows. Over the screen: a transparent, click-through layer over everything, the game included. In a window: an ordinary window of its own, for a stream's capture to take instead of it covering the game.", |ui| {
+            let mut in_window = self.settings.overlay_in_window;
+            ui.selectable_value(&mut in_window, false, "Over the screen");
+            ui.selectable_value(&mut in_window, true, "In a window");
+            if in_window != self.settings.overlay_in_window {
+                self.settings.overlay_in_window = in_window;
+                *dirty = true;
+            }
+        });
+        if !self.settings.overlay_in_window {
+            form_note(ui, "In a window, the overlay stays off the game: capture the window in OBS and key out its background instead.");
+            return;
+        }
+        form_row(ui, "Window background", "The colour filling the overlay window around its widgets: the one to key out in the capture.", |ui| {
+            let [r, g, b] = self.settings.overlay_window_bg;
+            let mut c = egui::Color32::from_rgb(r, g, b);
+            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                self.settings.overlay_window_bg = [c.r(), c.g(), c.b()];
+                *dirty = true;
+            }
+            if ui.add_enabled(self.settings.overlay_window_bg != settings::OVERLAY_WINDOW_BG_DEFAULT, egui::Button::new("Reset")).clicked() {
+                self.settings.overlay_window_bg = settings::OVERLAY_WINDOW_BG_DEFAULT;
+                *dirty = true;
+            }
+        });
+        match crate::overlay::overlay_window_fit(ui.ctx()) {
+            Some(fit) => {
+                let pct = fit.shown * 100.0;
+                let (w, h) = (fit.screen_px.x * fit.shown, fit.screen_px.y * fit.shown);
+                form_column(ui, |ui| ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!(
+                        "Shows the screen at {pct:.0}%: {w:.0} × {h:.0} of its {:.0} × {:.0} pixels.",
+                        fit.screen_px.x, fit.screen_px.y,
+                    )).size(crate::settings::ui_size(FORM_NOTE_PT)).color(crate::settings::tinted_gray(170)));
+                    if (fit.shown - 1.0).abs() > 0.005
+                        && ui.button("Make it 100%")
+                            .on_hover_text("Size the window's inside to the screen's pixels, so the capture takes the overlay as sharp as it is over the game.")
+                            .clicked()
+                    {
+                        crate::overlay::request_overlay_window_actual_size(ui.ctx());
+                    }
+                }));
+            }
+            None => {
+                form_status(ui, "The window opens with the info overlay: ▣ in the title bar, or its shortcut.", crate::settings::tinted_gray(170));
+            }
+        }
+        form_note(ui, "It holds the overlay laid out for the whole screen, scaled to fit, so stretched over the game in the capture it lines up. In OBS: a Window Capture of “FlexInput Info Overlay” (Windows 10 capture method, which takes it behind the game too) with a Color Key filter on this colour.");
     }
 
     fn settings_controllers(&mut self, ui: &mut egui::Ui, dirty: &mut bool) {
