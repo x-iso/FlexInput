@@ -246,6 +246,9 @@ tab, and a quoted file name finds the tab of that name.
   into the text.
 - **A trigger threshold of 0 starts at 2%.** JoyShockMapper's default of 0 means "the
   slightest press", which on a trigger resting a hair above zero would read as held for good.
+- **A press let go during a wait lasts a tap's length.** That covers the simultaneous-press
+  window and a chord wait. JoyShockMapper lets the key go on its next poll; here it stays down
+  for 40 ms, so a quick press always reaches the game.
 
 ## What the module doesn't run
 

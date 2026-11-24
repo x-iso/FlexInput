@@ -29,6 +29,18 @@ All notable changes to FlexInput are documented here. This project adheres to
   turning a stick, `ORIENT`), how tabs and layers behave, and every JSM setting and command
   the module leaves to another part of FlexInput or doesn't run yet, with the reason.
 
+### Fixed
+
+- **JSM: a quick press of a button with a simultaneous binding reaches the game.** With
+  `L = SHIFT` beside `L+R = Q`, letting go of L inside `SIM_PRESS_WINDOW` started L's own
+  binding and ended it in the same instant, so Shift never went down at all. It goes down for
+  a tap's length now. A tap binding (`L = A B`) already tapped.
+
+- **JSM: waiting out the simultaneous window doesn't delay a hold.** A button with a
+  simultaneous binding started its press when the window ran out rather than when it went
+  down, so its hold came 50 ms late and a press let go between 150 and 200 ms counted as a
+  tap. Hold and tap are measured from the press, as in JSM.
+
 ## [0.18.1] - 2026-11-24
 
 ### Added

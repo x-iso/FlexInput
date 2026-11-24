@@ -1391,6 +1391,60 @@ fn a_lone_press_survives_the_simultaneous_window() {
     );
 }
 
+// Let go inside the window, a button is still a press of its own binding, and
+// one that reaches the game. JSM moves it to a press and lets it go on its next
+// poll; here a key that went down and up inside one tick would never reach an
+// output at all, so it lasts a tap's length.
+#[test]
+fn a_press_let_go_inside_the_simultaneous_window_is_still_seen() {
+    let mut r = Rig::new("L = SHIFT\nR = E\nL+R = Q");
+    r.set(Btn::L, true);
+    r.ticks(2);
+    r.set(Btn::L, false);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..3 {
+        seen.extend(r.tick());
+    }
+    assert!(seen.contains("key_shift"), "L's own binding, briefly: {seen:?}");
+    assert!(!seen.contains("key_q"), "R never came: {seen:?}");
+    assert!(!r.ticks(10).contains("key_shift"), "and over");
+}
+
+// The same with a tap: let go inside the window, the press was a tap.
+#[test]
+fn a_tap_let_go_inside_the_simultaneous_window_taps() {
+    let mut r = Rig::new("L = A B\nR = E\nL+R = Q");
+    r.set(Btn::L, true);
+    r.ticks(2);
+    r.set(Btn::L, false);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..6 {
+        seen.extend(r.tick());
+    }
+    assert!(seen.contains("key_a") && !seen.contains("key_b"), "{seen:?}");
+}
+
+// Waiting out the window doesn't move where the press began: its hold comes
+// 150 ms from the button going down, as in JSM — whose state machine keeps the
+// press time through the wait — not 150 ms from the window running out.
+#[test]
+fn a_press_held_past_the_simultaneous_window_keeps_its_hold_time() {
+    let mut r = Rig::new("L = A B\nR = E\nL+R = Q");
+    r.set(Btn::L, true);
+    assert!(!r.seen_within(14, "key_b"), "no hold before 150 ms");
+    assert!(r.seen_within(4, "key_b"), "the hold by ~170 ms, not ~200");
+    r.set(Btn::L, false);
+    assert!(!r.ticks(5).contains("key_a"), "a hold is no tap");
+
+    // And one let go between the window and the hold time is a tap.
+    let mut r = Rig::new("L = A B\nR = E\nL+R = Q");
+    r.set(Btn::L, true);
+    let held = r.seen_within(12, "key_b");
+    r.set(Btn::L, false);
+    assert!(!held, "no hold inside 120 ms");
+    assert!(r.seen_within(3, "key_a"), "a tap");
+}
+
 // A diagonal takes over from the button already pressing, and hands back when
 // one of the two is released.
 #[test]

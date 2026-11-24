@@ -375,19 +375,17 @@ impl Runtime {
     /// case it waits (`Role::WaitChord`) and is asked again next tick. With no
     /// `~` anywhere this is [`Self::resolve`], straight away: JSM's own timing.
     fn settle(&mut self, b: Btn, cfg: &Compiled, timings: &Timings) {
-        let (since, was_waiting) = {
-            let run = &self.buttons[&b];
-            (run.since, matches!(run.role, Role::WaitChord))
-        };
+        let since = self.buttons[&b].since;
         let waited = self.t - since;
         if waited < own_wait(cfg, b) || self.chord_could_still_win(b, cfg, waited) {
             self.buttons.entry(b).or_default().role = Role::WaitChord;
             return;
         }
-        // Held back for a chord, the press still starts where the button went
-        // down, so its hold time and tap are measured as if it hadn't waited.
-        let at = if was_waiting { since } else { self.t };
-        self.resolve_at(b, at, cfg, timings);
+        // Held back for a simultaneous partner or a chord, the press still
+        // starts where the button went down, so its hold time and tap are
+        // measured as if it hadn't waited. JSM's does the same: its press time
+        // is set as the button goes down, and the sim wait leaves it alone.
+        self.resolve_at(b, since, cfg, timings);
     }
 
     /// Is a chord line `~`-waiting for a chord button that isn't down yet, and
@@ -499,22 +497,15 @@ impl Runtime {
         let (idx, pair_partner) = match role {
             Role::Active(i) => (i, self.presses.get(i).and_then(|p| p.partner)),
             Role::Follower(i) => (i, self.presses.get(i).map(|p| p.owner)),
-            // Released while still waiting for a partner: the button's own
-            // binding never started, so resolve it now and let it end at once
-            // (a quick tap of a button that has a simultaneous binding).
-            Role::WaitSim { .. } => {
-                self.resolve(b, cfg, timings);
-                let Some(Role::Active(i)) = self.buttons.get(&b).map(|r| r.role) else { return; };
-                self.buttons.entry(b).or_default().role = Role::Idle;
-                self.finish_press(i, b, cfg, timings);
-                return;
-            }
-            // Released while held back for a chord: it was a press of whatever
-            // it would have been with the chords held now, over already. Its keys
-            // go down and straight back up within this tick, before anything
-            // reads them — so they're handed on as a tap's pulse, or a quick tap
-            // of a held-back `ZR = PS_R2` would never reach the game at all.
-            Role::WaitChord => {
+            // Released while still waiting, for a simultaneous partner or for a
+            // chord: its binding never started, so it starts now — as what it
+            // would have been with the chords held now — and is over already.
+            // Its keys go down and straight back up within this tick, before
+            // anything reads them, so they're handed on as a tap's pulse: else a
+            // quick press of `L = SHIFT` beside `L+R = Q` never reached the game.
+            // (JSM moves the button to a press and lets it go on its next poll,
+            // so its key is down for one poll; here it would be down for none.)
+            Role::WaitSim { .. } | Role::WaitChord => {
                 let since = self.buttons[&b].since;
                 self.resolve_at(b, since, cfg, timings);
                 let Some(Role::Active(i)) = self.buttons.get(&b).map(|r| r.role) else { return; };
