@@ -31,6 +31,18 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **3DOF to 2D: Orient no longer spirals up or down as you turn round.** The gyro's turn axis
+  and the accelerometer's down never quite agree, so a turn about the vertical read partly as
+  pitch. An accelerometer reading 0.02 g to one side, or a gyro set a degree askew against
+  it, took the pointer about 3° down on every half turn (up, turning the other way), while
+  the 3D preview, held level by gravity, stayed put. While the pad moves, Orient's pitch now
+  comes back onto the preview's, by up to a tenth of each move, so the error can't build up.
+  A still pad's pointer still never moves, and the heading is left as the gyro has it. A fast
+  turn of your whole body, the pad out in front of you, stops climbing too (12° up on a half
+  turn at 200°/s); a slower one can dip the pointer a few degrees for a moment, as it dips
+  the preview, because the outward pull reads as a tilt. JSM Config's `GYRO_SPACE = ORIENT`
+  gets the same.
+
 - **JSM: a quick press of a button with a simultaneous binding reaches the game.** With
   `L = SHIFT` beside `L+R = Q`, letting go of L inside `SIM_PRESS_WINDOW` started L's own
   binding and ended it in the same instant, so Shift never went down at all. It goes down for

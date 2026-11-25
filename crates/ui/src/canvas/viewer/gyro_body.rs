@@ -136,7 +136,7 @@ pub(crate) fn show_gyro_3dof_body(
         "Roll turns X and pitch turns Y — for a grip that steers by rolling.",
         "JoyShockMapper's PLAYER_TURN: turning about gravity is X, however the pad\nis held (yaw and roll both count, up to how fast the pad is turning), and\nY is the pad's own pitch. Forgiving of how you hold it.",
         "JoyShockMapper's WORLD_TURN: turning about gravity is X, and Y is pitch\nmeasured level with the world, faded out as the pad goes onto its side.",
-        "Follows where the pad's nose points: X is how fast its heading changes,\nY its elevation, so adding them up lands where it points whatever path it\ntook. Twisting the pad about its nose does nothing. Above 70° up or\ndown the heading stops speeding up (straight up it has none).",
+        "Follows where the pad's nose points: X is how fast its heading changes,\nY its elevation, so adding them up lands where it points whatever path it\ntook. Twisting the pad about its nose does nothing. Above 75° up or\ndown the heading stops speeding up (straight up it has none). While\nthe pad moves, Y is held level with gravity, so turning round doesn't\nspiral it up or down; a still pad's pointer never moves.",
     ];
     /// The same choices in the Steering row, which adds the turns up into a wheel's angle.
     /// JoyShockMapper has nothing like it (its lean steering, LEFT_STEER_X, is a tilt read off

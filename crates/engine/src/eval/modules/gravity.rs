@@ -184,6 +184,16 @@ const ORIENT_PAYBACK: f32 = 0.3;
 /// camera's rather than pull it across.
 const ORIENT_PAYBACK_GIVE_UP: f32 = 60.0;
 
+/// How much of the way onto the level the camera's pitch comes, as a share of how far the
+/// nose moves: each degree the nose moves brings the camera's pitch up to this many degrees
+/// nearer the pitch the pad's orientation has (held to gravity). The gyro's turn axis and
+/// the accelerometer's down are never quite the same - an accelerometer that reads 0.02 g
+/// to the side, or a gyro set a degree askew on the board - and a turn about the real
+/// vertical reads, against gravity, as part pitch: about 3° on a half turn, more on every
+/// turn after. Bigger than that leak, so it never builds up; small, so it moves the pointer
+/// only a little past where the gyro took it, and only while the pad moves.
+const ORIENT_LEVEL_SHARE: f32 = 0.1;
+
 /// How many `f32`s [`OrientCamera::store`] writes.
 pub(crate) const ORIENT_CAMERA_LEN: usize = 10;
 
@@ -215,6 +225,12 @@ pub(crate) const ORIENT_CAMERA_LEN: usize = 10;
 /// measured in is held to gravity (`GravityFusion::orientation`), but bringing it
 /// back after the gyro drifted turns the frame, not the camera, so a still pad's
 /// pointer stays still.
+///
+/// Only the pitch is brought back, and only while the pad moves: a turn about the real
+/// vertical, which the gyro and the accelerometer never quite agree on, reads as part
+/// pitch, and the camera added it up - a few degrees down (or up) on every half turn,
+/// where the pad's own orientation, held to gravity, stayed level. Each move now brings
+/// the camera's pitch a share of the way onto the orientation's ([`ORIENT_LEVEL_SHARE`]).
 ///
 /// What the heading's cap near a pole holds back is given back below it: the camera
 /// carries along the look it would have without the cap (`trail`, turned by the nose's
@@ -321,9 +337,11 @@ impl OrientCamera {
     }
 
     /// One tick: the pad at `q_prev` (as it was before this tick's reading) turned
-    /// by `gyro_dps` for `dt`. Returns how far the heading and the pitch moved,
-    /// degrees, and whether the camera has just started (and moved nowhere).
-    pub fn step(&mut self, q_prev: Quat, gyro_dps: Vec3, dt: f32, hold: Option<Quat>) -> (f32, f32, bool) {
+    /// by `gyro_dps` for `dt`, and `q_held` as it is after the reading, held to
+    /// gravity (the level the pitch is brought back onto). Returns how far the heading
+    /// and the pitch moved, degrees, and whether the camera has just started (and moved
+    /// nowhere).
+    pub fn step(&mut self, q_prev: Quat, q_held: Quat, gyro_dps: Vec3, dt: f32, hold: Option<Quat>) -> (f32, f32, bool) {
         if !self.valid {
             self.aim_at(q_prev, hold);
             return (0.0, 0.0, true);
@@ -353,8 +371,42 @@ impl OrientCamera {
         if self.theta.abs() > 90.0 {
             self.turn_over();
         }
-        let (pay_psi, pay_theta) = self.pay_back(trail, moved.length().to_degrees());
-        (d_psi + pay_psi, d_theta + pay_theta, false)
+        let moved = moved.length().to_degrees();
+        let (pay_psi, pay_theta) = self.pay_back(trail, moved);
+        let lvl_theta = self.level(nose(q_held, hold), moved);
+        (d_psi + pay_psi, d_theta + pay_theta + lvl_theta, false)
+    }
+
+    /// Below the cap, the pitch a share of the nose's move (`moved`, degrees) of the way
+    /// onto the pitch of `held` - the nose of the orientation held to gravity, in the
+    /// world - measured along the camera's own up. The look without the cap is tilted
+    /// with it, so the cap's payback doesn't pull the pitch back. Returns how far the
+    /// pitch moved.
+    fn level(&mut self, held: Vec3, moved: f32) -> f32 {
+        let (st, ct) = self.theta.to_radians().sin_cos();
+        if ct <= ORIENT_COS_CAP || moved <= 0.0 {
+            return 0.0;
+        }
+        let (sp, cp) = self.psi.to_radians().sin_cos();
+        let l = self.frame * look(self.psi, self.theta);
+        let up = self.frame * Vec3::new(-st * cp, -st * sp, -ct);
+        let ahead = held.dot(l);
+        if ahead <= 0.0 {
+            return 0.0;
+        }
+        let gap = held.dot(up).atan2(ahead).to_degrees();
+        let cap = ORIENT_LEVEL_SHARE * moved;
+        let d = gap.clamp(-cap, cap);
+        if d == 0.0 {
+            return 0.0;
+        }
+        self.theta += d;
+        // More pitch is a turn about the camera's level right.
+        let right = self.frame * Vec3::new(-sp, cp, 0.0);
+        if self.trail.length_squared() > 0.5 {
+            self.trail = (Quat::from_axis_angle(right, d.to_radians()) * self.trail).normalize();
+        }
+        d
     }
 
     /// Below the cap, a share of the nose's move (`moved`, degrees) of the way onto the look
@@ -558,7 +610,7 @@ mod tests {
             let (g, a) = reading(q, w);
             let before = f.orientation();
             f.update(g, Some(a), DT);
-            cam.step(before, g, DT, None);
+            cam.step(before, f.orientation(), g, DT, None);
             assert!(cam.theta.abs() < 70.0, "the wobble stays under the cap: {}", cam.theta);
         }
         let apart = cam.trail.angle_between(cam.world_look()).to_degrees();

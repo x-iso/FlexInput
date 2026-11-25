@@ -163,8 +163,9 @@ It's the same rotation as the Gyro to Stick Rotation module.
 ### Gyro spaces and axes
 
 - **`GYRO_SPACE = ORIENT`:** the camera follows where the controller's nose points, so it ends
-  up where the pad points whatever path it took to get there. It's the same as the 3DOF to
-  2D module's Orient.
+  up where the pad points whatever path it took to get there. While the pad moves, its pitch
+  is held level with gravity, so turning round doesn't spiral the camera up or down. It's the
+  same as the 3DOF to 2D module's Orient.
 - **`LOCAL_AXIS_OFFSET`:** with `GYRO_SPACE = LOCAL`, sets how far your neutral hold is
   pitched from lying flat, and measures yaw and roll about that hold. It's modelled on Steam
   Input's local-space pitch offset.

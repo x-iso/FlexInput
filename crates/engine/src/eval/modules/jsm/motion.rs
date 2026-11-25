@@ -139,10 +139,10 @@ impl Motion {
         // Down in the gyro's (F, R, -U) basis; then into JSM's (R, U, F).
         let before = self.gravity.orientation();
         let down = self.gravity.update(gyro_dps, accel, dt);
-        // The camera follows the nose by the gyro's turn alone, in the frame gravity
-        // holds (`OrientCamera`): over the top it carries on, and gravity's own
-        // corrections never move it.
-        let (d_psi, d_theta, _) = self.camera.step(before, gyro_dps, dt, None);
+        // The camera follows the nose by the gyro's turn, in the frame gravity holds
+        // (`OrientCamera`): over the top it carries on, and gravity only brings its
+        // pitch back, a share of each move, never while the pad is still.
+        let (d_psi, d_theta, _) = self.camera.step(before, self.gravity.orientation(), gyro_dps, dt, None);
         let orient = if dt > 0.0 { glam::Vec2::new(d_psi, d_theta) / dt } else { glam::Vec2::ZERO };
         let Some(d) = down else {
             return Gravity { orient, ..Gravity::default() };

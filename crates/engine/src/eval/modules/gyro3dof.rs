@@ -536,9 +536,11 @@ pub(crate) fn compute_gyro_3dof(
             // A camera kept looking where the nose points (`OrientCamera`): the gyro's own
             // turn of the pad this tick, taken along the camera's up and its level right.
             // Over the top the pitch carries on, upside down with the pad; gravity holds
-            // the frame the move is measured in, and never moves the camera itself.
+            // the frame the move is measured in, and while the pad moves brings the
+            // camera's pitch back onto the pad's by a share of the move (a turn about the
+            // vertical otherwise spirals it down or up), never its heading.
             let mut cam = OrientCamera::load(&state.aux_f32[ORIENT_AUX..]);
-            let (d_psi, d_theta, fresh) = cam.step(pad_q_before, gyro_dps, dt, hold);
+            let (d_psi, d_theta, fresh) = cam.step(pad_q_before, pad_q, gyro_dps, dt, hold);
             cam.store(&mut state.aux_f32[ORIENT_AUX..]);
             if fresh {
                 // The heading's zero: here, until a Reset.
@@ -1856,6 +1858,11 @@ mod aim_tests {
         st: NodeState,
         p: HashMap<String, Value>,
         out: Vec<Option<Signal>>,
+        /// What a real pad's sensors get wrong, none by default: added to the
+        /// accelerometer (canonical, in g), and the gyro's axes turned against the
+        /// accelerometer's (canonical).
+        accel_bias: Vec3,
+        gyro_skew: Quat,
     }
 
     impl Pad {
@@ -1865,15 +1872,23 @@ mod aim_tests {
             for (k, v) in params {
                 p.insert((*k).into(), v.clone());
             }
-            let mut pad = Pad { q: Quat::IDENTITY, st: NodeState::default(), p, out: Vec::new() };
+            let mut pad = Pad {
+                q: Quat::IDENTITY,
+                st: NodeState::default(),
+                p,
+                out: Vec::new(),
+                accel_bias: Vec3::ZERO,
+                gyro_skew: Quat::IDENTITY,
+            };
             pad.hold_still(0.5);
             pad
         }
 
         fn tick(&mut self, w_body_dps: Vec3, reset: bool) {
             // Gyro: (forward, right, down), ±1 = 2000 °/s. Accel: up, (forward, left, up).
+            let w_body_dps = self.gyro_skew * w_body_dps;
             let g = Vec3::new(w_body_dps.x, -w_body_dps.y, -w_body_dps.z) / 2000.0;
-            let up = self.q.inverse() * Vec3::Z;
+            let up = self.q.inverse() * Vec3::Z + self.accel_bias;
             let f = |v: f32| Some(Signal::Float(v));
             let inputs = vec![None, Some(Signal::Bool(reset)), f(g.x), f(g.y), f(g.z), f(up.x), f(up.y), f(up.z)];
             self.out = compute_gyro_3dof(&inputs, &mut self.st, &self.p, &BusMap::default(), &BusMap::default(), DT);
@@ -2284,6 +2299,40 @@ mod aim_tests {
         let (shown, real) = (roll(v), roll(pad.q));
         assert!(real > 15.0, "the pad is rolled: {real}");
         assert!((shown - real).abs() < 1.0, "shown {shown}, really {real}");
+    }
+
+    // A turn about the world's up that the sensors don't quite agree on - an accelerometer
+    // reading 0.02 g to the side, or a gyro set a degree askew against it - reads as part
+    // pitch: a half turn took Orient's pointer 2.6-3.6° down (up, turned the other way),
+    // as it takes World's, while the pad's own orientation, held to gravity, stayed level.
+    // Orient's pitch now comes back onto it as the pad turns; still after, it stays put.
+    #[test]
+    fn orient_keeps_level_through_a_turn_the_sensors_disagree_on() {
+        let skewed = [
+            (Vec3::new(0.0, 0.02, 0.0), Quat::IDENTITY),
+            (Vec3::ZERO, Quat::from_rotation_x(1f32.to_radians())),
+        ];
+        for (bias, skew) in skewed {
+            for deg in [180.0_f32, -180.0] {
+                let turned = |axis: &str| {
+                    let mut pad = Pad::new(&[("axis", json!(axis))]);
+                    pad.accel_bias = bias;
+                    pad.gyro_skew = skew;
+                    pad.turn(NOSE_UP, 25.0, 200.0);
+                    pad.hold_still(1.5);
+                    let y0 = pad.aim().1;
+                    pad.turn_world(deg, 90.0);
+                    (pad.aim().1 - y0, pad)
+                };
+                let (world, _) = turned("world");
+                assert!(world.abs() > 2.0, "World keeps JSM's maths and the leak: {world} ({bias:?}, {deg}°)");
+                let (orient, mut pad) = turned("orient");
+                assert!(orient.abs() < 0.3, "Orient's pitch moved {orient}° on a {deg}° turn ({bias:?})");
+                let at = pad.aim();
+                pad.hold_still(3.0);
+                assert!(near(pad.aim(), at, 0.01), "a still pad's pointer moved: {at:?} -> {:?}", pad.aim());
+            }
+        }
     }
 
     // Panic mode's reset (`request_gyro_reset` sets `reset_request`) is a Reset:
