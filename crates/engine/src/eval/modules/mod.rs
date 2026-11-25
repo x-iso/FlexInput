@@ -64,6 +64,17 @@ pub use rws::{
 // shares the rotation itself.
 pub use stick_rotation::*;
 pub(crate) use touch_zones::*;
+// The trackball's friction and haptic tick card keys, which the zone's body edits.
+pub use touch_zones::{TZ_FRICTION_KEY, TZ_TICK_DENSITY_KEY, TZ_TICK_KEY, TZ_TICK_SOFT_KEY};
+mod trackball;
+// The friction's and the tick density's ranges are the bodies' too.
+pub use trackball::{
+    TRACKBALL_FRICTION_DEFAULT, TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN, TRACKBALL_TICK_DENSITY_DEFAULT,
+    TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN,
+};
+pub(crate) use trackball::{
+    flick_follow, motion_travel, pad_motion, trackball_let_go, trackball_roll, trackball_tick, BALL_SLOTS, FLICK_SLOTS,
+};
 // `shared` carries `pin_is_analog_input`, which the UI reads through
 // `flexinput_engine::eval::` — so this glob stays public.
 pub use shared::*;

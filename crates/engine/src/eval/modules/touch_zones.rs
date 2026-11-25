@@ -3,6 +3,20 @@
 
 use super::*;
 
+/// A Trackball-mode zone's friction (`trackball::TRACKBALL_FRICTION_*`), stored on
+/// the zone's cards like `tp_mode`. Trackball mode is Touchpad mode whose pointer
+/// (and stick) rolls on when the finger lifts while moving, until a finger lands
+/// on the zone again.
+pub const TZ_FRICTION_KEY: &str = "friction";
+/// A Touchpad- or Trackball-mode zone's haptic ticks as the pointer moves, while
+/// the finger moves it and while its ball rolls: their strength, 0..1, 0 (or
+/// none) for off. Stored on the zone's cards like `tp_mode`.
+pub const TZ_TICK_KEY: &str = "tick";
+/// How many of those ticks go a pad's width (`TRACKBALL_TICK_DENSITY_*`), and
+/// their softness, 0..1 (0 = the pad's own click).
+pub const TZ_TICK_DENSITY_KEY: &str = "tick_density";
+pub const TZ_TICK_SOFT_KEY: &str = "tick_soft";
+
 /// Evaluate a Touch Zones node in MAPPING mode — shared by the top-level and
 /// sub-patch loops. Resolves each active finger to its zone (per field), then
 /// applies every mapping card, publishing bus overrides into
@@ -44,7 +58,19 @@ pub(crate) fn eval_touch_zones_map_node(
     // Resolve which zone each active finger occupies, per field, keeping local
     // coords — identical to the ports-mode arm in compute_node.
     let split = snap.params.get("field_mode").and_then(|v| v.as_str()) == Some("split");
-    const SLOTS_PER: usize = 13; // per-finger aux: 0-8 as below, 9-10 = prev-frame pos (touchpad), 11-12 = trackball stick accumulator
+    // Per-finger aux: 0-8 as below, 9-10 = prev-frame pos (touchpad), 11-12 =
+    // the finger's motion (`trackball::pad_motion`), 13-15 = the ball a flick let
+    // go [vx, vy, rolling], 16-17 = the zone it rolls in [field, zone], 18 = the
+    // travel toward the next haptic tick, 19 = the pad the ticks play on (+1),
+    // then the flick the finger may lift with (`trackball::flick_follow`) and its
+    // ticks going out (`area_haptic_pulses`).
+    const BALL_AT: usize = 13;
+    const BALL_ZONE_AT: usize = BALL_AT + BALL_SLOTS;
+    const TRAVEL_AT: usize = BALL_ZONE_AT + 2;
+    const PAD_AT: usize = TRAVEL_AT + 1;
+    const FLICK_AT: usize = PAD_AT + 1;
+    const PULSE_AT: usize = FLICK_AT + FLICK_SLOTS;
+    const SLOTS_PER: usize = PULSE_AT + HAPTIC_PULSE_SLOTS;
     // Zones the user marked "hold": once a gesture STARTS in one, that finger
     // stays attributed to it for the whole touch even if it slides into a
     // neighbour — so the neighbour doesn't also fire ("hold zone" option). Only
@@ -175,10 +201,12 @@ pub(crate) fn eval_touch_zones_map_node(
     //              value (adaptive_for above) — the pre-existing behaviour.
     //   percard  → each card uses its OWN `adaptive` value (centre recomputed from
     //              the finger's landing point, per card, in the card loop below).
-    //   touchpad → the MOUSE output tracks the finger's frame-to-frame delta (a
-    //              laptop-touchpad feel); stick/scroll keep using deflection.
+    //   touchpad → the mouse and stick outputs track the finger's motion (a
+    //              laptop-touchpad feel); scroll keeps using deflection.
+    //   trackball → touchpad, and lifted while moving the motion rolls on and
+    //              slows by the zone's friction until a finger lands on it again.
     // PER-ZONE mode: read from the zone's first card's `tp_mode` (stored like
-    // `adaptive`), default "synced". Each zone picks its own synced/percard/touchpad.
+    // `adaptive`), default "synced". Each zone picks its own mode.
     let mode_for = |field: usize, zone: usize| -> String {
         cards.iter().filter(|c|
             c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
@@ -201,6 +229,33 @@ pub(crate) fn eval_touch_zones_map_node(
             .unwrap_or_else(|| node_mouse_speed.unwrap_or(1.0))
             .clamp(0.1, 10.0)
     };
+    // A Trackball-mode zone's friction; None for any other mode.
+    let friction_for = |field: usize, zone: usize| -> Option<f32> {
+        if mode_for(field, zone) != "trackball" {
+            return None;
+        }
+        Some(cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get(TZ_FRICTION_KEY).and_then(|v| v.as_f64()).map(|v| v as f32))
+            .unwrap_or(TRACKBALL_FRICTION_DEFAULT)
+            .clamp(TRACKBALL_FRICTION_MIN, TRACKBALL_FRICTION_MAX))
+    };
+    // A Touchpad- or Trackball-mode zone's haptic ticks; None while off or in
+    // any other mode.
+    let tick_for = |field: usize, zone: usize| -> Option<TickSet> {
+        if !matches!(mode_for(field, zone).as_str(), "touchpad" | "trackball") {
+            return None;
+        }
+        let num = |key: &str| cards.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64 &&
+            c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get(key).and_then(|v| v.as_f64()));
+        TickSet::read(num(TZ_TICK_KEY), num(TZ_TICK_DENSITY_KEY), num(TZ_TICK_SOFT_KEY))
+    };
+    let pads = haptic_pads(snap);
+    // Each finger's tick due this tick.
+    let mut ticks: [Option<[f32; HAPTIC_BUMP]>; 2] = [None, None];
     // Adaptive centre from a landing point + zone rect (both-axes rule, matching the
     // touchdown capture): landing inside the inner region → relative centre, else
     // the zone's geometric centre. Used to recompute a per-card centre.
@@ -260,9 +315,11 @@ pub(crate) fn eval_touch_zones_map_node(
                 // frame's delta is 0 (no pointer jump on touchdown).
                 ns.aux_f32[base + 9] = ux;
                 ns.aux_f32[base + 10] = uy;
-                // Fresh touch → stick trackball starts centred.
+                // Fresh touch → stick trackball starts centred, and the ticks
+                // count from here.
                 ns.aux_f32[base + 11] = 0.0;
                 ns.aux_f32[base + 12] = 0.0;
+                ns.aux_f32[base + TRAVEL_AT] = 0.0;
             } else if ns.aux_f32[base + 5] < 0.5 {
                 let dx = ux - ns.aux_f32[base + 1];
                 let dy = uy - ns.aux_f32[base + 2];
@@ -295,19 +352,32 @@ pub(crate) fn eval_touch_zones_map_node(
             let (dpx, dpy) = (ux - ns.aux_f32[base + 9], uy - ns.aux_f32[base + 10]);
             ns.aux_f32[base + 9] = ux;
             ns.aux_f32[base + 10] = uy;
-            // Stick trackball: leaky integrator of the finger delta (+Y up). Decays
-            // toward centre each tick, so it self-centres when the finger stops and
-            // its steady value ≈ finger speed (deltas sum, immune to sensor aliasing).
-            // The accumulator is bounded so the return-to-centre lag stays tiny.
-            const STICK_DECAY: f32 = 0.82;
-            const STICK_ACC_GAIN: f32 = 3.2;
-            ns.aux_f32[base + 11] =
-                (ns.aux_f32[base + 11] * STICK_DECAY + dpx * STICK_ACC_GAIN).clamp(-1.5, 1.5);
-            ns.aux_f32[base + 12] =
-                (ns.aux_f32[base + 12] * STICK_DECAY + (-dpy) * STICK_ACC_GAIN).clamp(-1.5, 1.5);
-            stick_by_zone.insert((field, sz),
-                (ns.aux_f32[base + 11].clamp(-1.0, 1.0), ns.aux_f32[base + 12].clamp(-1.0, 1.0)));
+            // The finger's motion (+Y up, `trackball::pad_motion`): it follows the
+            // finger's speed and settles when the finger stops, the same at any
+            // processing rate.
+            let motion = pad_motion(&mut ns.aux_f32[base + 11..base + 13], (dpx, -dpy), dt);
+            stick_by_zone.insert((field, sz), motion);
+            // The flick it may lift with (+Y up, as the motion).
+            flick_follow(&mut ns.aux_f32[base + FLICK_AT..base + PULSE_AT], (ux, -uy), !prev_active, dt);
+            // Its ticks, on the trackpad it's on.
+            let pad = area_haptic_pad(&pads, ["touch1", "touch2"][finger], dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
+            ns.aux_f32[base + PAD_AT] = pad;
+            if let Some(t) = tick_for(field, sz)
+                .filter(|t| trackball_tick(&mut ns.aux_f32[base + TRAVEL_AT], dpx.hypot(dpy), t.density))
+            {
+                ticks[finger] = Some(t.bump(pad));
+            }
         } else {
+            // Lifted: a Trackball zone lets its ball go at the finger's flick.
+            if prev_active {
+                let (f, z) = (ns.aux_f32[base + 3], ns.aux_f32[base + 4]);
+                if friction_for(f as usize, z as usize).is_some() {
+                    let (head, flick) = ns.aux_f32[base..base + PULSE_AT].split_at_mut(FLICK_AT);
+                    trackball_let_go(&mut head[BALL_AT..BALL_ZONE_AT], flick);
+                    ns.aux_f32[base + BALL_ZONE_AT] = f;
+                    ns.aux_f32[base + BALL_ZONE_AT + 1] = z;
+                }
+            }
             ns.aux_f32[base] = 0.0;
             ns.aux_f32[base + 11] = 0.0;
             ns.aux_f32[base + 12] = 0.0;
@@ -320,12 +390,51 @@ pub(crate) fn eval_touch_zones_map_node(
         }
     }
 
+    // The balls rolling, ticking as they go: a finger on a ball's zone catches it,
+    // and a zone no longer in Trackball mode stops its ball.
+    let mut rolling: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+    for finger in 0..2 {
+        let base = finger * slots_per;
+        let at = (ns.aux_f32[base + BALL_ZONE_AT] as usize, ns.aux_f32[base + BALL_ZONE_AT + 1] as usize);
+        let ball = &mut ns.aux_f32[base + BALL_AT..base + BALL_ZONE_AT];
+        if ball[2] == 0.0 {
+            continue;
+        }
+        let caught = zone_hit.contains_key(&at) || stick_by_zone.contains_key(&at);
+        match friction_for(at.0, at.1).filter(|_| !caught) {
+            Some(friction) => {
+                if let Some((vx, vy)) = trackball_roll(ball, friction, dt) {
+                    let e = rolling.entry(at).or_insert((0.0, 0.0));
+                    e.0 += vx;
+                    e.1 += vy;
+                    let moved = motion_travel((vx, vy), dt);
+                    if let Some(t) = tick_for(at.0, at.1)
+                        .filter(|t| trackball_tick(&mut ns.aux_f32[base + TRAVEL_AT], moved, t.density))
+                    {
+                        ticks[finger] = Some(t.bump(ns.aux_f32[base + PAD_AT]));
+                    }
+                }
+            }
+            None => ball.fill(0.0),
+        }
+    }
+    // Each finger's ticks go out on its trackpad's haptic pin, one after another.
+    let min_secs = haptic_min_secs();
+    for finger in 0..2 {
+        let pulse = &mut ns.aux_f32[finger * slots_per + PULSE_AT..(finger + 1) * slots_per];
+        let new: Vec<[f32; HAPTIC_BUMP]> = ticks[finger].filter(|_| haptic_queue_empty(pulse)).into_iter().collect();
+        if let Some(bump) = area_haptic_pulses(&new, pulse, min_secs, dt) {
+            play_haptic_bump(collector_sigs, &pads, &dev_id, ["touch1", "touch2"][finger], bump);
+        }
+    }
+
     for (i, card) in cards.iter().enumerate() {
         let field = card.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let zone = card.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         // This card's zone mode governs how its analog deflection is derived.
         let zmode = mode_for(field, zone);
-        let touchpad = zmode == "touchpad";
+        // Trackball mode is Touchpad mode whose ball rolls on after a lift.
+        let touchpad = zmode == "touchpad" || zmode == "trackball";
         let percard = zmode == "percard";
         // Per-zone pointer/scroll speed (see mouse_speed_for).
         let mouse_speed = mouse_speed_for(field, zone);
@@ -398,8 +507,10 @@ pub(crate) fn eval_touch_zones_map_node(
         // it 0.1–10× from there. This is INDEPENDENT of the mouse-velocity path (its
         // TZ_TRACKBALL_BASE), so amplifying the stick doesn't speed up the pointer.
         const TZ_STICK_GAIN: f32 = 8.0;
+        // The finger's motion, or the ball it let go still rolling.
+        let tp_motion = stick_by_zone.get(&(field, zone)).or_else(|| rolling.get(&(field, zone))).copied();
         let tp_stick = if touchpad {
-            stick_by_zone.get(&(field, zone)).map(|&(x, y)| {
+            tp_motion.map(|(x, y)| {
                 let g = TZ_STICK_GAIN * mouse_speed;
                 ((x * g).clamp(-1.0, 1.0), (y * g).clamp(-1.0, 1.0))
             })
@@ -480,7 +591,7 @@ pub(crate) fn eval_touch_zones_map_node(
                     // ratio (tunable; the per-zone mouse_speed multiplies it further).
                     const TZ_TRACKBALL_BASE: f32 = 1.0;
                     let vel = if touchpad {
-                        stick_by_zone.get(&(field, zone)).map(|&(vx, vy)| {
+                        tp_motion.map(|(vx, vy)| {
                             let g = mouse_speed * TZ_TRACKBALL_BASE;
                             (vx * g, vy * g)
                         })

@@ -2129,6 +2129,121 @@ mod trigger_tests {
         assert!(sx.abs() < 1e-2 && sy.abs() < 1e-2, "still finger → velocity decays to ~0 (got {sx},{sy})");
     }
 
+    /// A Trackball zone lifted while moving keeps the pointer going the same way,
+    /// slowing down until it stops, longer for a faster swipe and shorter with
+    /// more friction; a finger landing on the zone catches it at once. In Touchpad
+    /// mode the pointer stops on lift.
+    #[test]
+    fn touch_zones_trackball_rolls_on_after_a_lift() {
+        const DT: f32 = 0.0005;
+        let zone = |mode: &str, friction: f32| {
+            let mut n = empty_node(1, "module.touch_zones");
+            n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+            n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+            n.params.insert("col_edges".into(), serde_json::json!([]));
+            n.params.insert("row_edges".into(), serde_json::json!([]));
+            n.params.insert("zone_maps".into(), serde_json::json!([
+                {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":mode,
+                 TZ_FRICTION_KEY: friction},
+            ]));
+            n
+        };
+        let input = |down: bool, px: f32| {
+            let mut m: BusMap = BusMap::default();
+            m.insert(("pad".into(), "touch1_active".into()), Signal::Bool(down));
+            m.insert(("pad".into(), "touch1_x".into()), Signal::Float(px));
+            m.insert(("pad".into(), "touch1_y".into()), Signal::Float(0.0));
+            m
+        };
+        let mouse_x = |c: &BusMap| match c.get(&("touchmap:1".to_string(), "mouse".to_string())) {
+            Some(Signal::Vec2(v)) => Some(v.x),
+            _ => None,
+        };
+        // A swipe right at a steady pace (`step` of the bus's -1..1 every 4 ms),
+        // then lifted; the pointer's speed tick by tick after the lift, with a
+        // finger down again on the ticks `down` says.
+        let after_lift = |n: &NodeSnap, step: f32, down: &dyn Fn(usize) -> bool| {
+            let mut state = HashMap::new();
+            let mut px = -0.9;
+            for k in 0..200 {
+                if k % 8 == 0 { px += step; }
+                let mut c = BusMap::default();
+                eval_touch_zones_map_node(n, 1, &input(true, px), &mut c, &mut state, DT);
+            }
+            (0..20_000).map(|k| {
+                let mut c = BusMap::default();
+                eval_touch_zones_map_node(n, 1, &input(down(k), px), &mut c, &mut state, DT);
+                mouse_x(&c).unwrap_or(0.0)
+            }).collect::<Vec<f32>>()
+        };
+        let lifted = |_: usize| false;
+        let rolls_for = |v: &[f32]| v.iter().filter(|v| **v > 0.0).count() as f32 * DT;
+
+        // 0.02 a report is 2.5 pad widths a second, 0.06 is 7.5: flicks.
+        let rolled = after_lift(&zone("trackball", 3.0), 0.02, &lifted);
+        assert!(rolled[0] > 0.01, "lifted moving: it rolls on the same way ({})", rolled[0]);
+        assert!(rolled.windows(2).all(|w| w[1] <= w[0] + 1e-6), "slowing down, never speeding up");
+        let slow = rolls_for(&rolled);
+        assert!(slow > 0.2 && slow < 5.0, "it stops: {slow}s");
+        let fast = rolls_for(&after_lift(&zone("trackball", 3.0), 0.06, &lifted));
+        assert!(fast > slow + 0.5, "a faster swipe rolls longer: {slow}s, {fast}s");
+        let rough = rolls_for(&after_lift(&zone("trackball", 9.0), 0.06, &lifted));
+        assert!(rough < fast / 2.0, "more friction stops it sooner: {fast}s, {rough}s");
+        let aimed = after_lift(&zone("trackball", 3.0), 0.004, &lifted);
+        assert!(aimed.iter().all(|v| *v == 0.0), "slower than a flick, nothing rolls");
+
+        let caught = after_lift(&zone("trackball", 3.0), 0.02, &|k| k >= 100);
+        assert!(caught[99] > 0.0 && caught[100..].iter().all(|v| *v == 0.0), "a finger on the zone catches it");
+        // Touched to stop it, a finger lifted again without moving sets nothing rolling.
+        let tapped = after_lift(&zone("trackball", 3.0), 0.06, &|k| (100..300).contains(&k));
+        assert!(tapped[300..].iter().all(|v| *v == 0.0), "a tap stops it for good");
+
+        let plain = after_lift(&zone("touchpad", 3.0), 0.02, &lifted);
+        assert!(plain.iter().all(|v| *v == 0.0), "Touchpad mode: the pointer stops on lift");
+    }
+
+    /// A Touchpad-mode zone with ticks on ticks each finger's own trackpad as it
+    /// moves the pointer; with them off, nothing.
+    #[test]
+    fn touch_zones_tick_each_fingers_trackpad() {
+        let zone = |tick: f32| {
+            let mut n = empty_node(1, "module.touch_zones");
+            n.params.insert("zone_mode".into(), Value::String("mapping".into()));
+            n.params.insert("field_mode".into(), Value::String("split".into()));
+            n.params.insert("_automap_device_id".into(), Value::String("pad".into()));
+            n.params.insert("zone_maps".into(), serde_json::json!([
+                {"f":0,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":"touchpad", TZ_TICK_KEY: tick},
+                {"f":1,"z":0,"in":["tz_touch"],"out":["mouse"],"mode":"analog","tp_mode":"touchpad", TZ_TICK_KEY: tick},
+            ]));
+            n
+        };
+        // The right trackpad (touch 2) swiped 0.6 of its width in 150 ms.
+        let rises = |n: &NodeSnap| {
+            let mut state = HashMap::new();
+            let (mut was, mut rises) = ([false; 2], [0; 2]);
+            let mut px = -0.6;
+            for k in 0..300 {
+                if k % 4 == 0 { px += 0.016; }
+                let mut m: BusMap = BusMap::default();
+                m.insert(("pad".into(), "touch2_active".into()), Signal::Bool(true));
+                m.insert(("pad".into(), "touch2_x".into()), Signal::Float(px));
+                m.insert(("pad".into(), "touch2_y".into()), Signal::Float(0.0));
+                let mut c = BusMap::default();
+                eval_touch_zones_map_node(n, 1, &m, &mut c, &mut state, 0.0005);
+                for (i, pin) in ["tp_l_click", "tp_r_click"].iter().enumerate() {
+                    let up = c.get_pin(&format!("{FEEDBACK_INJECT}pad"), pin).is_some();
+                    if up && !was[i] { rises[i] += 1; }
+                    was[i] = up;
+                }
+            }
+            rises
+        };
+        let [left, right] = rises(&zone(0.5));
+        assert_eq!(left, 0, "not the other trackpad's");
+        assert!((10..=13).contains(&right), "a tick a twentieth of the pad: {right}");
+        assert_eq!(rises(&zone(0.0)), [0, 0], "ticks off");
+    }
+
     // A zone can carry BOTH an analog (tz_touch) card and a click (tz_click) card;
     // clicking must still fire the click mapping while the analog output runs.
     #[test]
@@ -7543,27 +7658,134 @@ mod area_mapper_tests {
     use flexinput_core::area::{AreaLayout, BorderRef, DigitalMode, Gradient, Phase};
     use serde_json::json;
 
+    /// A disc and nine rings, each 0.1 across.
+    fn thin_rings() -> AreaLayout {
+        let mut l = AreaLayout::circle_rings(0.1);
+        for k in 2..10 {
+            l.add_edge(k as f32 * 0.1, false);
+        }
+        l
+    }
+
+    /// The cells along the +X axis, from the centre out.
+    fn ring_ids(l: &AreaLayout) -> Vec<u32> {
+        (0..10).map(|k| l.locate_id(0.05 + 0.1 * k as f32, 0.0)).collect()
+    }
+
+    /// A point that jumps over several rings between two reports crosses each of
+    /// them, in order, and back again on the way in.
     #[test]
-    fn a_border_counts_as_crossed_once_the_point_has_settled_past_it() {
-        let mut st = [0.0; 3];
-        let dt = 0.004;
-        assert_eq!(area_border_crossed(Some(1), &mut st, dt), None, "landing isn't crossing");
-        assert_eq!(area_border_crossed(Some(1), &mut st, dt), None);
-        for _ in 0..2 {
-            assert_eq!(area_border_crossed(Some(2), &mut st, dt), None, "not settled yet");
+    fn a_jump_over_rings_crosses_each_of_them() {
+        let l = thin_rings();
+        let ids = ring_ids(&l);
+        let locate = |x: f32, y: f32| Some(l.locate_id(x, y));
+        let mut st = [0.0; HAPTIC_LAYER_SLOTS];
+        let at = |x: f32| Some(Vec2::new(x, 0.0));
+        assert!(area_border_crossings(at(0.05), locate, &mut st).is_empty(), "landing isn't crossing");
+        let out: Vec<(u32, u32)> = ids.windows(2).map(|w| (w[0], w[1])).collect();
+        assert_eq!(area_border_crossings(at(0.95), locate, &mut st), out);
+        assert!(area_border_crossings(at(0.95), locate, &mut st).is_empty(), "once");
+        let back: Vec<(u32, u32)> = ids.windows(2).rev().map(|w| (w[1], w[0])).collect();
+        assert_eq!(area_border_crossings(at(0.05), locate, &mut st), back);
+    }
+
+    /// A reading wobbling on a border crosses it once; getting clear of it on
+    /// either side counts from there, and lifting forgets the cell.
+    #[test]
+    fn a_wobble_on_a_border_crosses_it_once() {
+        let l = thin_rings();
+        let ids = ring_ids(&l);
+        let locate = |x: f32, y: f32| Some(l.locate_id(x, y));
+        let mut st = [0.0; HAPTIC_LAYER_SLOTS];
+        let at = |x: f32| Some(Vec2::new(x, 0.0));
+        area_border_crossings(at(0.45), locate, &mut st);
+        assert_eq!(area_border_crossings(at(0.505), locate, &mut st), [(ids[4], ids[5])]);
+        for k in 0..50 {
+            let x = if k % 2 == 0 { 0.495 } else { 0.505 };
+            assert!(area_border_crossings(at(x), locate, &mut st).is_empty(), "wobble {k}");
         }
-        assert_eq!(area_border_crossed(Some(2), &mut st, dt), Some((1, 2)));
-        assert_eq!(area_border_crossed(Some(2), &mut st, dt), None, "once");
-        // Jitter on the border never settles.
-        for _ in 0..10 {
-            assert_eq!(area_border_crossed(Some(3), &mut st, dt), None);
-            assert_eq!(area_border_crossed(Some(2), &mut st, dt), None);
+        // Back inside, past the wobble: the crossing it held back counts now.
+        assert!(area_border_crossings(at(0.495), locate, &mut st).is_empty());
+        assert_eq!(area_border_crossings(at(0.47), locate, &mut st), [(ids[5], ids[4])]);
+        assert!(area_border_crossings(None, locate, &mut st).is_empty());
+        assert!(area_border_crossings(at(0.75), locate, &mut st).is_empty(), "landing elsewhere");
+    }
+
+    /// Bumps that come faster than one pulse each go out one after another, the pin
+    /// dropping between them; a lone bump keeps the pulse's full length.
+    #[test]
+    fn bumps_in_a_row_each_get_a_pulse_of_their_own() {
+        let mut st = [0.0; HAPTIC_PULSE_SLOTS];
+        let bump = |s: f32| [s, 0.0, 0.0, 0.0, 0.0];
+        let (dt, min) = (0.0005, 0.003);
+        let mut levels = Vec::new();
+        let mut new = vec![bump(0.25), bump(0.5), bump(0.75)];
+        for _ in 0..200 {
+            levels.push(area_haptic_pulses(&new, &mut st, min, dt).map(|b| b[0]));
+            new.clear();
         }
-        // Lifting forgets the cell, so landing elsewhere crosses nothing.
-        assert_eq!(area_border_crossed(None, &mut st, dt), None);
-        for _ in 0..5 {
-            assert_eq!(area_border_crossed(Some(7), &mut st, dt), None);
+        let mut rises = Vec::new();
+        for w in levels.windows(2) {
+            if w[0].is_none() && w[1].is_some() {
+                rises.push(w[1].unwrap());
+            }
         }
+        if levels[0].is_some() {
+            rises.insert(0, levels[0].unwrap());
+        }
+        assert_eq!(rises, [0.25, 0.5, 0.75]);
+        let up = levels.iter().filter(|l| l.is_some()).count() as f32 * dt;
+        assert!((up - (2.0 * min + HAPTIC_PULSE_SECS)).abs() < 0.002, "up {up}s");
+
+        // More than the queue holds: the extra ones are dropped.
+        let mut st = [0.0; HAPTIC_PULSE_SLOTS];
+        let many = vec![bump(1.0); HAPTIC_QUEUE + 4];
+        let mut rises = 0;
+        let mut was = false;
+        let mut new = many.clone();
+        for _ in 0..2000 {
+            let up = area_haptic_pulses(&new, &mut st, min, dt).is_some();
+            new.clear();
+            if up && !was {
+                rises += 1;
+            }
+            was = up;
+        }
+        assert_eq!(rises, HAPTIC_QUEUE);
+    }
+
+    /// A finger swiped fast across the rings gives a bump on the pad for every
+    /// ring it crosses: each one a rise of the click pin.
+    #[test]
+    fn a_fast_swipe_bumps_for_every_ring() {
+        let l = thin_rings();
+        let mut n = with_layout(mapper(json!([])), &l);
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+        let all: serde_json::Map<String, Value> = l.cell_ids().into_iter()
+            .map(|id| (id.to_string(), json!(0.5))).collect();
+        n.params.insert(AREA_CELL_HAPTICS_PARAM.into(), Value::Object(all));
+        let key = (format!("{FEEDBACK_INJECT}{PAD}"), "tp_l_click".to_string());
+        let mut state = HashMap::new();
+        let mut rises = 0;
+        let mut was = false;
+        // Centre to the rim in 40 ms, a touch report every 4 ms, then held there.
+        let reports = 10;
+        for k in 0..400 {
+            // The bus's touch point is the area's centred point (+Y up).
+            let r = 0.05 + 0.9 * ((k / 4) as f32 / reports as f32).min(1.0);
+            let mut m = BusMap::default();
+            let mut put = |pin: &str, s: Signal| { m.insert((PAD.to_string(), pin.to_string()), s); };
+            put("touch1_active", Signal::Bool(true));
+            put("touch1_x", Signal::Float(r));
+            put("touch1_y", Signal::Float(0.0));
+            let (c, _) = run(&n, &m, &mut state);
+            let up = c.contains_key(&key);
+            if up && !was {
+                rises += 1;
+            }
+            was = up;
+        }
+        assert_eq!(rises, 9, "one bump per ring crossed");
     }
 
     /// Behind a Combiner, a touchpad's crossing reaches the pad being touched, and
@@ -7936,6 +8158,181 @@ mod area_mapper_tests {
         // Outside the cell: nothing written, the bus's own values stand.
         let (c, _) = run(&n, &stick(dir(0.0, 0.8)), &mut HashMap::new());
         assert_eq!(bus(&c, "mouse"), None);
+    }
+
+    /// A touchpad's cell in Touchpad mode moves the mouse by the finger's motion
+    /// (still finger, still mouse); in Trackball mode a lift while moving rolls it
+    /// on and down to a stop, longer with less friction; Relative stays the point.
+    #[test]
+    fn a_touchpad_cell_moves_the_mouse_by_motion_and_rolls_on() {
+        // A disc and a ring: the swipe stays in the ring's right half.
+        let layout = AreaLayout::circle_rings(0.3);
+        let ring = layout.locate_id(0.6, 0.0);
+        let node = |motion: &str, friction: f32| {
+            let mut n = with_layout(mapper(json!([{ "z": ring, "out": ["mouse"] }])), &layout);
+            n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+            n.params.insert(AREA_MOTION_PARAM.into(), json!(motion));
+            n.params.insert(AREA_FRICTION_PARAM.into(), json!(friction));
+            n
+        };
+        let touch = |down: bool, y: f32| {
+            let mut m = BusMap::default();
+            m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.6));
+            m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(y));
+            m.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(down));
+            m
+        };
+        let mouse = |c: &BusMap| match bus(c, "mouse") { Some(Signal::Vec2(v)) => Some(v), _ => None };
+        // Up the ring's right side at a steady pace (`step` of the bus's -1..1 a
+        // touch report, one every 4 ms), held still for `rest` ticks, then lifted:
+        // the mouse while moving, while still, and tick by tick after the lift.
+        let swipe = |n: &NodeSnap, step: f32, rest: usize| {
+            let mut st = HashMap::new();
+            let mut y = -0.4;
+            let mut moving = Vec2::ZERO;
+            for k in 0..100 {
+                if k % 4 == 0 { y += step; }
+                let (c, _) = run(n, &touch(true, y), &mut st);
+                if k >= 50 { moving += mouse(&c).unwrap_or_default() / 50.0; }
+            }
+            for _ in 0..rest {
+                run(n, &touch(true, y), &mut st);
+            }
+            let after: Vec<f32> = (0..10_000).map(|_| {
+                let (c, _) = run(n, &touch(false, y), &mut st);
+                mouse(&c).map_or(0.0, |v| v.y)
+            }).collect();
+            let mut still = Vec2::ZERO;
+            let mut st2 = HashMap::new();
+            for _ in 0..100 {
+                let (c, _) = run(n, &touch(true, 0.0), &mut st2);
+                still = mouse(&c).unwrap_or_default();
+            }
+            (moving, after, still)
+        };
+        // 0.032 a report: 4 pad widths a second, a flick; 0.004: half of one.
+        let (flick, aim) = (0.032, 0.004);
+
+        let (moving, after, still) = swipe(&node("touchpad", 3.0), flick, 0);
+        assert!(moving.y > 0.05 && moving.x.abs() < 1e-4, "follows the swipe up: {moving:?}");
+        assert!(still.length() < 1e-4, "a still finger moves nothing: {still:?}");
+        assert!(after.iter().all(|v| *v == 0.0), "Touchpad: nothing after the lift");
+
+        let (moving_tb, rolled, _) = swipe(&node("trackball", 3.0), flick, 0);
+        assert!((moving_tb - moving).length() < 1e-5, "Trackball moves like Touchpad while down");
+        assert!(rolled[0] > 0.8 * moving.y, "lifted, it rolls on as fast: {} vs {}", rolled[0], moving.y);
+        assert!(rolled.windows(2).all(|w| w[1] <= w[0] + 1e-7), "slowing down");
+        let rolls = rolled.iter().filter(|v| **v > 0.0).count();
+        assert!(rolls > 300 && rolls < 10_000, "and stops: {rolls} ticks");
+        let (_, slick, _) = swipe(&node("trackball", 1.0), flick, 0);
+        assert!(slick.iter().filter(|v| **v > 0.0).count() > rolls * 2, "less friction rolls longer");
+        let (_, aimed, _) = swipe(&node("trackball", 3.0), aim, 0);
+        assert!(aimed.iter().all(|v| *v == 0.0), "a slow lift lets nothing roll");
+        let (_, stopped, _) = swipe(&node("trackball", 3.0), flick, 50);
+        assert!(stopped.iter().all(|v| *v == 0.0), "nor one that stopped first");
+
+        let (rel, _, rel_still) = swipe(&node("relative", 3.0), aim, 0);
+        assert!((rel_still - Vec2::new(0.6, 0.0) * 0.03).length() < 1e-4, "Relative: the point: {rel_still:?}");
+        assert!(rel.x > 0.0, "{rel:?}");
+    }
+
+    /// An Area Mapper there only for its haptics (one cell, no cards, the touchpad
+    /// passing on) ticks as the finger moves; twice the density ticks twice as
+    /// often; with softness each tick carries the soft tone, without it none.
+    #[test]
+    fn a_haptics_only_area_ticks_by_its_density_and_softness() {
+        let one_cell = json!({"shape":"circle","edges":[],"bands":[{"cuts":[],"cells":[0]}]});
+        let swipe = |extra: &[(&str, Value)]| {
+            let mut n = mapper(json!([]));
+            n.params.insert(AREA_LAYOUT_PARAM.into(), one_cell.clone());
+            n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+            n.params.insert(AREA_PASS_SOURCE_PARAM.into(), json!(true));
+            n.params.insert(AREA_MOTION_PARAM.into(), json!("touchpad"));
+            n.params.insert(AREA_TICK_PARAM.into(), json!(0.5));
+            for (k, v) in extra {
+                n.params.insert(k.to_string(), v.clone());
+            }
+            let key = (format!("{FEEDBACK_INJECT}{PAD}"), "tp_l_click".to_string());
+            let tone = format!("{FEEDBACK_CLICK_TONE}{PAD}");
+            let mut st = HashMap::new();
+            let (mut y, mut rises, mut was, mut softs) = (-0.6f32, 0, false, Vec::new());
+            // 0.6 of the pad's width in 150 ms.
+            for k in 0..150 {
+                if k % 4 == 0 { y += 0.032; }
+                let mut m = BusMap::default();
+                m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.0));
+                m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(y));
+                m.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(true));
+                let (c, _) = run(&n, &m, &mut st);
+                let up = c.contains_key(&key);
+                if up && !was { rises += 1; }
+                was = up;
+                if let Some(s) = c.get_pin(&tone, &"tp_l_click_soft") { softs.push(s.as_float()); }
+            }
+            (rises, softs)
+        };
+        let (plain, no_tone) = swipe(&[]);
+        assert!((10..=13).contains(&plain), "20 a pad width: {plain}");
+        assert!(no_tone.is_empty(), "the pad's own click: {no_tone:?}");
+        let (dense, _) = swipe(&[(AREA_TICK_DENSITY_PARAM, json!(40.0))]);
+        assert!((21..=25).contains(&dense), "40 a pad width: {dense}");
+        let (_, soft) = swipe(&[(AREA_TICK_SOFT_PARAM, json!(0.6))]);
+        assert!(!soft.is_empty() && soft.iter().all(|s| (*s - 0.6).abs() < 1e-6), "{soft:?}");
+    }
+
+    /// Ticks on: a touchpad cell's motion ticks the pad's haptic pin as the finger
+    /// moves the mouse, a tick per twentieth of the pad, and the ball ticks on as it
+    /// rolls, ever further apart, until it stops; a still finger ticks nothing.
+    #[test]
+    fn a_trackball_ticks_as_it_moves_and_rolls() {
+        let layout = AreaLayout::circle_rings(0.3);
+        let ring = layout.locate_id(0.6, 0.0);
+        let mut n = with_layout(mapper(json!([{ "z": ring, "out": ["mouse"] }])), &layout);
+        n.params.insert(AREA_INPUT_PARAM.into(), json!("touch1"));
+        n.params.insert(AREA_MOTION_PARAM.into(), json!("trackball"));
+        n.params.insert(AREA_TICK_PARAM.into(), json!(0.4));
+        let touch = |down: bool, y: f32| {
+            let mut m = BusMap::default();
+            m.insert((PAD.to_string(), "touch1_x".to_string()), Signal::Float(0.6));
+            m.insert((PAD.to_string(), "touch1_y".to_string()), Signal::Float(y));
+            m.insert((PAD.to_string(), "touch1_active".to_string()), Signal::Bool(down));
+            m
+        };
+        let key = (format!("{FEEDBACK_INJECT}{PAD}"), "tp_l_click".to_string());
+        let mut st = HashMap::new();
+        // Each tick's pin level, the swipe (0.6 of a pad width: 12 ticks, in 150 ms),
+        // a still finger, then the swipe again and a lift.
+        let mut levels = Vec::new();
+        let mut y = -0.6;
+        let mut go = |down: bool, y: f32, levels: &mut Vec<f32>| {
+            let (c, _) = run(&n, &touch(down, y), &mut st);
+            levels.push(c.get(&key).map_or(0.0, |s| s.as_float()));
+        };
+        for k in 0..150 {
+            if k % 4 == 0 { y += 0.032; }
+            go(true, y, &mut levels);
+        }
+        let rises = |l: &[f32]| l.windows(2).filter(|w| w[0] == 0.0 && w[1] > 0.0).count();
+        let swiped = rises(&levels);
+        assert!((10..=13).contains(&swiped), "a tick a twentieth of the pad: {swiped}");
+        assert!(levels.iter().all(|v| *v == 0.0 || (*v - 0.4).abs() < 1e-6), "at the set strength");
+        levels.clear();
+        for _ in 0..300 { go(true, y, &mut levels); }
+        assert_eq!(rises(&levels[50..]), 0, "a still finger ticks nothing");
+
+        levels.clear();
+        for k in 0..100 {
+            if k % 4 == 0 { y -= 0.032; }
+            go(true, y, &mut levels);
+        }
+        levels.clear();
+        for _ in 0..5000 { go(false, y, &mut levels); }
+        let ups: Vec<usize> = levels.windows(2).enumerate()
+            .filter(|(_, w)| w[0] == 0.0 && w[1] > 0.0).map(|(i, _)| i).collect();
+        assert!(ups.len() >= 4, "the ball ticks as it rolls: {ups:?}");
+        let gaps: Vec<usize> = ups.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] + 2 >= g[0]), "further apart as it slows: {gaps:?}");
+        assert!(*ups.last().unwrap() < 4000, "and stop with it: {ups:?}");
     }
 
     #[test]

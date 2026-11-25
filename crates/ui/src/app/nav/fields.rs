@@ -3186,6 +3186,28 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
                     fs.push(f!("Pressure", v(crate::canvas::area_body::AREA_CELL_PRESSURE, 0.0, 1.0, 0.0,
                         FixedScaled { coarse: 5.0, factor: 100.0 })));
                 }
+                // A touchpad's motion mode, a Trackball's friction, and the
+                // motion's haptic ticks.
+                if input.starts_with("touch") {
+                    use flexinput_engine::eval as ev;
+                    fs.push(f!("Motion", Enum{key:ev::AREA_MOTION_PARAM,opts:ev::AREA_MOTIONS}));
+                    let motion = crate::canvas::area_body::area_motion(node).0;
+                    if motion == "trackball" {
+                        fs.push(f!("Friction", v(ev::AREA_FRICTION_PARAM, ev::TRACKBALL_FRICTION_MIN,
+                            ev::TRACKBALL_FRICTION_MAX, ev::TRACKBALL_FRICTION_DEFAULT, Fixed(0.5))));
+                    }
+                    if motion != "relative" {
+                        fs.push(f!("Ticks", v(ev::AREA_TICK_PARAM, 0.0, 1.0, 0.0,
+                            FixedScaled { coarse: 10.0, factor: 100.0 })));
+                        // While on, their density and softness.
+                        if crate::canvas::area_body::area_tick(node) > 0.0 {
+                            fs.push(f!("Density", v(ev::AREA_TICK_DENSITY_PARAM, ev::TRACKBALL_TICK_DENSITY_MIN,
+                                ev::TRACKBALL_TICK_DENSITY_MAX, ev::TRACKBALL_TICK_DENSITY_DEFAULT, Fixed(2.0))));
+                            fs.push(f!("Softness", v(ev::AREA_TICK_SOFT_PARAM, 0.0, 1.0, 0.0,
+                                FixedScaled { coarse: 10.0, factor: 100.0 })));
+                        }
+                    }
+                }
                 fs
             }
             // ── Area Mapper "layers" row ── order MUST match `show_area_layer_row`:

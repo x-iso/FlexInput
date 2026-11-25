@@ -643,6 +643,118 @@ pub(crate) fn tz_set_zone_held(snarl: &mut Snarl<NodeData>, node_id: NodeId,
     node.params.insert("hold_zones".into(), Value::Array(list));
 }
 
+/// A number stored on zone `(field, zone)`'s cards like `tp_mode`: its first
+/// card's that has one.
+fn tz_zone_num(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize, key: &str) -> Option<f32> {
+    snarl.get_node(node_id)
+        .and_then(|n| n.params.get("zone_maps").and_then(|v| v.as_array()))
+        .and_then(|a| a.iter().filter(|c|
+            c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == field as u64
+                && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == zone as u64)
+            .find_map(|c| c.get(key).and_then(|v| v.as_f64())))
+        .map(|v| v as f32)
+}
+
+/// Set a number on every card of zone `(field, zone)`.
+fn tz_set_zone_num(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize, key: &str, v: f32) {
+    let Some(cards) = snarl.get_node_mut(node_id)
+        .and_then(|n| n.params.get_mut("zone_maps"))
+        .and_then(|v| v.as_array_mut()) else { return };
+    for c in cards.iter_mut() {
+        let f = c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let z = c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if let Some(o) = c.as_object_mut().filter(|_| f == field && z == zone) {
+            o.insert(key.into(), Value::from(v as f64));
+        }
+    }
+}
+
+/// Zone `(field, zone)`'s Trackball friction. Stored on the zone's cards like
+/// `tp_mode`.
+pub(crate) fn tz_zone_friction(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize) -> f32 {
+    use flexinput_engine::eval::{TRACKBALL_FRICTION_DEFAULT, TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN, TZ_FRICTION_KEY};
+    tz_zone_num(snarl, node_id, field, zone, TZ_FRICTION_KEY)
+        .unwrap_or(TRACKBALL_FRICTION_DEFAULT)
+        .clamp(TRACKBALL_FRICTION_MIN, TRACKBALL_FRICTION_MAX)
+}
+
+/// Set zone `(field, zone)`'s Trackball friction on every card of the zone.
+pub(crate) fn tz_set_zone_friction(snarl: &mut Snarl<NodeData>, node_id: NodeId,
+    field: usize, zone: usize, friction: f32)
+{
+    use flexinput_engine::eval::{TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN, TZ_FRICTION_KEY};
+    let friction = (friction.clamp(TRACKBALL_FRICTION_MIN, TRACKBALL_FRICTION_MAX) * 10.0).round() / 10.0;
+    tz_set_zone_num(snarl, node_id, field, zone, TZ_FRICTION_KEY, friction);
+}
+
+/// Zone `(field, zone)`'s haptic tick strength (Touchpad / Trackball), 0..1,
+/// 0 for off.
+pub(crate) fn tz_zone_tick(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize) -> f32 {
+    tz_zone_num(snarl, node_id, field, zone, flexinput_engine::eval::TZ_TICK_KEY).unwrap_or(0.0).clamp(0.0, 1.0)
+}
+
+/// Set zone `(field, zone)`'s haptic tick strength on every card of the zone,
+/// to whole percent.
+pub(crate) fn tz_set_zone_tick(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize, tick: f32) {
+    let tick = (tick.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    tz_set_zone_num(snarl, node_id, field, zone, flexinput_engine::eval::TZ_TICK_KEY, tick);
+}
+
+/// Zone `(field, zone)`'s haptic ticks a pad width.
+pub(crate) fn tz_zone_tick_density(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize) -> f32 {
+    use flexinput_engine::eval::{TRACKBALL_TICK_DENSITY_DEFAULT as D, TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN,
+        TZ_TICK_DENSITY_KEY};
+    tz_zone_num(snarl, node_id, field, zone, TZ_TICK_DENSITY_KEY).unwrap_or(D)
+        .clamp(TRACKBALL_TICK_DENSITY_MIN, TRACKBALL_TICK_DENSITY_MAX)
+}
+
+/// Set zone `(field, zone)`'s haptic ticks a pad width, whole.
+pub(crate) fn tz_set_zone_tick_density(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize, d: f32) {
+    use flexinput_engine::eval::{TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN, TZ_TICK_DENSITY_KEY};
+    let d = d.clamp(TRACKBALL_TICK_DENSITY_MIN, TRACKBALL_TICK_DENSITY_MAX).round();
+    tz_set_zone_num(snarl, node_id, field, zone, TZ_TICK_DENSITY_KEY, d);
+}
+
+/// Zone `(field, zone)`'s haptic tick softness, 0..1.
+pub(crate) fn tz_zone_tick_soft(snarl: &Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize) -> f32 {
+    tz_zone_num(snarl, node_id, field, zone, flexinput_engine::eval::TZ_TICK_SOFT_KEY).unwrap_or(0.0).clamp(0.0, 1.0)
+}
+
+/// Set zone `(field, zone)`'s haptic tick softness, to whole percent.
+pub(crate) fn tz_set_zone_tick_soft(snarl: &mut Snarl<NodeData>, node_id: NodeId, field: usize, zone: usize, soft: f32) {
+    let soft = (soft.clamp(0.0, 1.0) * 100.0).round() / 100.0;
+    tz_set_zone_num(snarl, node_id, field, zone, flexinput_engine::eval::TZ_TICK_SOFT_KEY, soft);
+}
+
+/// The ticks control's hover text, shared by both modules' bodies.
+pub(crate) const TRACKBALL_TICK_TIP: &str = "A haptic tick on the trackpad every time the finger or a rolling Trackball goes a little way: the faster it goes, the faster the ticks, like a Steam Controller's trackpad as a mouse. Their strength; off at 0. A pad without trackpad haptics feels a short rumble instead.";
+
+/// The tick density's hover text, shared by both modules' bodies.
+pub(crate) const TRACKBALL_TICK_DENSITY_TIP: &str = "How many ticks the finger or the ball gives going the pad's width: more is finer, fewer spreads them out. Past a speed they come as fast as the pad can play them.";
+
+/// The tick softness's hover text, shared by both modules' bodies.
+pub(crate) const TRACKBALL_TICK_SOFT_TIP: &str = "At 0 each tick is the pad's own click, sharp. Above 0 it is a short tone that fades in and out by this much, rounder and softer the higher it goes.";
+
+/// Trackball friction's hover text, shared by both modules' bodies.
+pub(crate) const TRACKBALL_FRICTION_TIP: &str = "How fast the ball slows down after a flick: it loses this much speed every second, and more while it's fast. At 3 a gentle flick stops almost at once and a hard one rolls on for a second or two; it always comes to a stop. Lifting slowly, or after stopping your finger, rolls nothing.";
+
+/// A ticks control's text: off at 0, else a percent.
+pub(crate) fn tick_text(pct: f64) -> String {
+    if pct <= 0.0 { "off".into() } else { format!("{pct:.0}%") }
+}
+
+/// Reads what [`tick_text`] writes, a bare number too.
+pub(crate) fn tick_parse(s: &str) -> Option<f64> {
+    let s = s.trim().trim_end_matches('%').trim();
+    if s.eq_ignore_ascii_case("off") { Some(0.0) } else { s.parse().ok() }
+}
+
+/// A zone mode that follows the finger's motion: Touchpad, and Trackball (which
+/// rolls on after a lift).
+pub(crate) fn tz_mode_follows_motion(tp_mode: &str) -> bool {
+    matches!(tp_mode, "touchpad" | "trackball")
+}
+
 /// A full-size interactive response-curve editor for a zone's analog output,
 /// shown in the CARD ROW (below the pad) where there's room — the tiny on-zone
 /// graph is a read-only preview. Behaves like the Response Curve module's graph:
@@ -3067,7 +3179,7 @@ pub(crate) fn render_touch_zone_cards(
     let mut mode_rect: Option<egui::Rect> = None;
     // The buttons share the card's width, each as wide as the others - the Remapper's action
     // row - less what the zone's analog controls at the right end take.
-    let show_speed = has_mouse_card || (has_analog_card && tp_mode == "touchpad");
+    let show_speed = has_mouse_card || (has_analog_card && tz_mode_follows_motion(&tp_mode));
     let reserved = if area_mode {
         104.0
     } else {
@@ -3243,6 +3355,7 @@ pub(crate) fn render_touch_zone_cards(
                     let label = match tp_mode.as_str() {
                         "percard" => "⌖ Per-card",
                         "touchpad" => "⌖ Touchpad",
+                        "trackball" => "⌖ Trackball",
                         _ => "⌖ Synced",
                     };
                     let mut chosen: Option<&str> = None;
@@ -3253,8 +3366,9 @@ pub(crate) fn render_touch_zone_cards(
                             if ui.selectable_label(tp_mode == "synced", "Synced (top card drives all)").clicked() { chosen = Some("synced"); }
                             if ui.selectable_label(tp_mode == "percard", "Per-card (each independent)").clicked() { chosen = Some("percard"); }
                             if ui.selectable_label(tp_mode == "touchpad", "Touchpad (finger motion)").clicked() { chosen = Some("touchpad"); }
+                            if ui.selectable_label(tp_mode == "trackball", "Trackball (finger motion, rolls on)").clicked() { chosen = Some("trackball"); }
                         });
-                    let mode_resp = cb.response.on_hover_text("How a zone's analog deflection is derived. Synced: every card in a zone uses the top card's relative/absolute setting. Per-card: each card uses its own. Touchpad: the mouse pointer follows the finger's motion like a laptop touchpad (stick/scroll still use deflection). Gamepad: focus it and cycle with LT/RT.");
+                    let mode_resp = cb.response.on_hover_text("How a zone's analog deflection is derived. Synced: every card in a zone uses the top card's relative/absolute setting. Per-card: each card uses its own. Touchpad: the mouse pointer and a stick follow the finger's motion like a laptop touchpad (scroll still uses deflection). Trackball: as Touchpad, and a flick (lifting your finger while it moves fast) keeps the pointer rolling, slowing down by the zone's friction; touch the zone to stop it. Gamepad: focus it and cycle with up/down.");
                     mode_rect = Some(mode_resp.rect);
                     if let Some(m) = chosen {
                         // Write the mode onto every card of the SELECTED zone.
@@ -3276,9 +3390,71 @@ pub(crate) fn render_touch_zone_cards(
             });
         }
     });
-    // Order MUST match nav_tz_action_items: mode, mouse_speed, hold.
+    // Row 3, under the analog controls of a zone following the finger's motion:
+    // its haptic ticks (with their density and softness while on), and a
+    // Trackball's friction (how fast the ball a flick lets go slows down),
+    // right-aligned.
+    let (mut tick_rect, mut friction_rect): (Option<egui::Rect>, Option<egui::Rect>) = (None, None);
+    let (mut density_rect, mut soft_rect): (Option<egui::Rect>, Option<egui::Rect>) = (None, None);
+    if tz_mode_follows_motion(&tp_mode) && has_analog_card && !area_mode && !menu_mode {
+        use flexinput_engine::eval::{TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN, TRACKBALL_TICK_DENSITY_MAX,
+            TRACKBALL_TICK_DENSITY_MIN};
+        let mut friction = tz_zone_friction(snarl, node_id, sel_f, sel_z);
+        let mut tick = tz_zone_tick(snarl, node_id, sel_f, sel_z) as f64 * 100.0;
+        let mut density = tz_zone_tick_density(snarl, node_id, sel_f, sel_z);
+        let mut soft = tz_zone_tick_soft(snarl, node_id, sel_f, sel_z) * 100.0;
+        ui.allocate_ui_with_layout(
+            egui::vec2(TZ_CARD_W, 26.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+            ui.spacing_mut().interact_size.y = 26.0;
+            if tp_mode == "trackball" {
+                let dv = ui.add(egui::DragValue::new(&mut friction)
+                        .speed(0.02).range(TRACKBALL_FRICTION_MIN..=TRACKBALL_FRICTION_MAX).fixed_decimals(1)
+                        .prefix("friction "))
+                    .on_hover_text(format!("{TRACKBALL_FRICTION_TIP} Gamepad: focus it and change with up/down."));
+                friction_rect = Some(dv.rect);
+                if dv.changed() {
+                    tz_set_zone_friction(snarl, node_id, sel_f, sel_z, friction);
+                }
+            }
+            if tick > 0.0 {
+                let dv = ui.add(egui::DragValue::new(&mut soft)
+                        .speed(0.5).range(0.0..=100.0).fixed_decimals(0).prefix("soft ").suffix("%"))
+                    .on_hover_text(format!("{TRACKBALL_TICK_SOFT_TIP} Gamepad: focus it and change with up/down."));
+                soft_rect = Some(dv.rect);
+                if dv.changed() {
+                    tz_set_zone_tick_soft(snarl, node_id, sel_f, sel_z, soft / 100.0);
+                }
+                let dv = ui.add(egui::DragValue::new(&mut density)
+                        .speed(0.1).range(TRACKBALL_TICK_DENSITY_MIN..=TRACKBALL_TICK_DENSITY_MAX).fixed_decimals(0)
+                        .prefix("density "))
+                    .on_hover_text(format!("{TRACKBALL_TICK_DENSITY_TIP} Gamepad: focus it and change with up/down."));
+                density_rect = Some(dv.rect);
+                if dv.changed() {
+                    tz_set_zone_tick_density(snarl, node_id, sel_f, sel_z, density);
+                }
+            }
+            let dv = ui.add(egui::DragValue::new(&mut tick)
+                    .speed(0.5).range(0.0..=100.0)
+                    .custom_formatter(|v, _| tick_text(v))
+                    .custom_parser(tick_parse)
+                    .prefix("ticks "))
+                .on_hover_text(format!("{TRACKBALL_TICK_TIP} Gamepad: focus it and change with up/down."));
+            tick_rect = Some(dv.rect);
+            if dv.changed() {
+                tz_set_zone_tick(snarl, node_id, sel_f, sel_z, tick as f32 / 100.0);
+            }
+        });
+    }
+    // Order MUST match nav_tz_action_items: mode, mouse_speed, tick, tick_density,
+    // tick_soft, friction, hold.
     if let Some(r) = mode_rect { act_rects.push(r); }
     if let Some(r) = mouse_rect { act_rects.push(r); }
+    if let Some(r) = tick_rect { act_rects.push(r); }
+    if let Some(r) = density_rect { act_rects.push(r); }
+    if let Some(r) = soft_rect { act_rects.push(r); }
+    if let Some(r) = friction_rect { act_rects.push(r); }
     if let Some(r) = hold_rect { act_rects.push(r); }
     // Publish the action-button rects (scope "zone_maps") so the gamepad-nav
     // overlay rings the focused button + can scroll it into view — same channel
@@ -3511,7 +3687,7 @@ pub(crate) fn render_touch_zone_cards(
                     // Rel.-center visibility/edit rules (mirror the engine): hidden in
                     // Touchpad mode; swipe + Per-card + the Synced TOP card edit it;
                     // Synced NON-top cards show it GRAYED as "driven by first card".
-                    let adaptive = if tp_mode == "touchpad" {
+                    let adaptive = if tz_mode_follows_motion(&tp_mode) {
                         None
                     } else if is_swipe || tp_mode == "percard" {
                         Some(AdaptiveRow { value: own, editable: true, driven: false })

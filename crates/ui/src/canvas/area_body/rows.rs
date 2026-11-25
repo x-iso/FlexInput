@@ -91,6 +91,10 @@ pub(super) fn options(
     let mut pass = n.params.get(AREA_PASS_SOURCE_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
     let mut touched = n.params.get(AREA_CELL_TOUCH).and_then(|v| v.as_bool()).unwrap_or(false);
     let overlay = n.params.get(AREA_OVERLAY_PARAM).and_then(|v| v.as_str()).unwrap_or("off").to_string();
+    let (motion, mut friction) = area_motion(n);
+    let mut tick = area_tick(n) * 100.0;
+    let (mut density, soft) = area_tick_feel(n);
+    let mut soft = soft * 100.0;
     let cell = selected_cell(n, &area_layout(n));
     let stick = !current.starts_with("touch");
     let touch_pin = area_touch_pin(&current);
@@ -180,7 +184,6 @@ pub(super) fn options(
         }
         rects.push(cells[4]);
     }
-    publish_nav_field_rects(ui, node_id, &rects);
 
     // The presets, and when the area shows over the game and where.
     let mut mins = vec![96.0, 180.0];
@@ -208,6 +211,70 @@ pub(super) fn options(
             crate::menu_overlay::request_menu_edit(ui.ctx(), outer_uid, node_id.0);
         }
     }
+
+    // A touchpad: what its point gives a cell's whole-stick and mouse outputs, a
+    // Trackball's friction and the motion's haptic ticks. Gamepad fields after
+    // the first row's.
+    if !stick {
+        use flexinput_engine::eval::{AREA_FRICTION_PARAM, AREA_MOTION_PARAM, AREA_TICK_DENSITY_PARAM, AREA_TICK_PARAM,
+            AREA_TICK_SOFT_PARAM, TRACKBALL_FRICTION_DEFAULT, TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN,
+            TRACKBALL_TICK_DENSITY_DEFAULT, TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN};
+        let words = ["relative", "touchpad", "trackball"];
+        let seg_w = words.iter().map(|t| word_w(ui, t)).fold(0.0, f32::max) * words.len() as f32;
+        let mut mins = vec![seg_w];
+        if motion == "trackball" {
+            mins.push(120.0);
+        }
+        if motion != "relative" {
+            mins.push(110.0);
+            if tick > 0.0 {
+                mins.extend([120.0, 110.0]);
+            }
+        }
+        let cells = pill_bands(ui, w, &mins);
+        if let Some(m) = cr::segmented(ui, cells[0], &motion.as_str(), &[
+            ("relative", "relative", AREA_MOTION_TIPS[0]),
+            ("touchpad", "touchpad", AREA_MOTION_TIPS[1]),
+            ("trackball", "trackball", AREA_MOTION_TIPS[2]),
+        ], ("area_motion_seg", node_id.0)) {
+            set.push((AREA_MOTION_PARAM, json!(m)));
+        }
+        rects.push(cells[0]);
+        if motion == "trackball" {
+            if pill(ui, node_id, "area_friction", cells[1], "friction", &mut friction, |v| format!("{v:.1}"),
+                TRACKBALL_FRICTION_MIN..=TRACKBALL_FRICTION_MAX, 0.02, AREA_FRICTION_TIP, TRACKBALL_FRICTION_DEFAULT)
+            {
+                set.push((AREA_FRICTION_PARAM, json!((friction * 10.0).round() / 10.0)));
+            }
+            rects.push(cells[1]);
+        }
+        if motion != "relative" {
+            let at = if motion == "trackball" { 2 } else { 1 };
+            if pill(ui, node_id, "area_tick", cells[at], "ticks", &mut tick, |v| crate::canvas::viewer::tick_text(v as f64),
+                0.0..=100.0, 0.5, crate::canvas::viewer::TRACKBALL_TICK_TIP, 0.0)
+            {
+                set.push((AREA_TICK_PARAM, json!(tick.round() / 100.0)));
+            }
+            rects.push(cells[at]);
+            // While on, how dense and how soft the ticks are.
+            if tick > 0.0 {
+                if pill(ui, node_id, "area_tick_density", cells[at + 1], "density", &mut density, |v| format!("{v:.0}"),
+                    TRACKBALL_TICK_DENSITY_MIN..=TRACKBALL_TICK_DENSITY_MAX, 0.1,
+                    crate::canvas::viewer::TRACKBALL_TICK_DENSITY_TIP, TRACKBALL_TICK_DENSITY_DEFAULT)
+                {
+                    set.push((AREA_TICK_DENSITY_PARAM, json!(density.round())));
+                }
+                rects.push(cells[at + 1]);
+                if pill(ui, node_id, "area_tick_soft", cells[at + 2], "soft", &mut soft, |v| format!("{v:.0}%"),
+                    0.0..=100.0, 0.5, crate::canvas::viewer::TRACKBALL_TICK_SOFT_TIP, 0.0)
+                {
+                    set.push((AREA_TICK_SOFT_PARAM, json!(soft.round() / 100.0)));
+                }
+                rects.push(cells[at + 2]);
+            }
+        }
+    }
+    publish_nav_field_rects(ui, node_id, &rects);
 
     let Some(n) = snarl.get_node_mut(node_id) else { return changed };
     changed |= !set.is_empty();

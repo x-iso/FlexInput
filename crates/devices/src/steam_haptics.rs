@@ -382,13 +382,18 @@ impl TriggerClick {
 
 // ── One-shot click pins ───────────────────────────────────────────────────────
 
+/// Clicks a pin may have waiting for the next polls: a pin rising and falling
+/// again faster than the pad reports (an Area Mapper swipe over thin rings) plays
+/// each rise, one a poll.
+const CLICK_PIN_QUEUE: usize = 3;
+
 /// The `automap::CLICK_TONE_PINS`. A click is due as its pin rises, as strong as it
 /// rose to: a wired button reads 1, full strength. It goes out on the next poll, as
 /// the pins of one pass arrive in no particular order and its shape may be behind it.
 #[derive(Default)]
 struct ClickPins {
     up: [bool; 4],
-    due: [Option<f32>; 4],
+    due: [std::collections::VecDeque<f32>; 4],
     /// Each pin's `[hz, ms, soft]`; no pitch = the pad's plain click.
     tone: [[f32; 3]; 4],
 }
@@ -400,8 +405,8 @@ impl ClickPins {
         for (i, (click, tone)) in CLICK_TONE_PINS.iter().enumerate() {
             if pin == *click {
                 let down = level > CLICK_PIN_MIN;
-                if down && !self.up[i] {
-                    self.due[i] = Some(level);
+                if down && !self.up[i] && self.due[i].len() < CLICK_PIN_QUEUE {
+                    self.due[i].push_back(level);
                 }
                 self.up[i] = down;
                 return true;
@@ -414,11 +419,11 @@ impl ClickPins {
         false
     }
 
-    /// The clicks due now.
+    /// The clicks due now: each pin's oldest waiting one.
     fn take_due(&mut self) -> Vec<Cmd> {
         let mut out = Vec::new();
         for i in 0..self.due.len() {
-            let Some(level) = self.due[i].take() else { continue };
+            let Some(level) = self.due[i].pop_front() else { continue };
             let (side, grip) = (i % 2, i >= 2);
             let gain_db = amp_to_gain_db(level);
             let [hz, ms, soft] = self.tone[i];
@@ -1574,6 +1579,29 @@ mod tests {
         assert_eq!(pins.take_due(),
             [Cmd::TriggerClick { side: 0, gain_db: 0, shape: ClickShape::trigger_default() }]);
         assert!(!pins.set("grip_touch", 100.0), "a setting, not one of these");
+    }
+
+    /// A pin that rises and falls twice between two polls plays both clicks, one a
+    /// poll, and no more wait than the queue holds.
+    #[test]
+    fn click_pins_rising_between_polls_each_play() {
+        let mut pins = ClickPins::default();
+        for level in [0.5, 0.0, 0.25, 0.0] {
+            pins.set("tp_l_click", level);
+        }
+        let plain = |gain_db| [Cmd::PadClick { side: 0, command: COMMAND_CLICK, gain_db }];
+        assert_eq!(pins.take_due(), plain(amp_to_gain_db(0.5)));
+        assert_eq!(pins.take_due(), plain(amp_to_gain_db(0.25)));
+        assert_eq!(pins.take_due(), []);
+        for _ in 0..10 {
+            pins.set("tp_l_click", 1.0);
+            pins.set("tp_l_click", 0.0);
+        }
+        let mut played = 0;
+        while !pins.take_due().is_empty() {
+            played += 1;
+        }
+        assert_eq!(played, CLICK_PIN_QUEUE);
     }
 
     #[test]

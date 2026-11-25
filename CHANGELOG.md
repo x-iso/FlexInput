@@ -29,6 +29,33 @@ All notable changes to FlexInput are documented here. This project adheres to
   turning a stick, `ORIENT`), how tabs and layers behave, and every JSM setting and command
   the module leaves to another part of FlexInput or doesn't run yet, with the reason.
 
+- **Touch Zones: Trackball mode.** Beside Synced, Per-card and Touchpad, a zone can be a
+  trackball: it follows the finger's motion as Touchpad does, and a flick (lifting your finger
+  while it moves fast) keeps the pointer rolling that way at the flick's speed, as a trackball
+  spun and let go would, until you touch the zone again. Lifting slowly, or after stopping
+  your finger, rolls nothing, so aiming and touching the zone to stop the ball leave the
+  pointer where it is. Friction sets how fast it slows down: the speed it loses every second,
+  more while it's fast (0.5–20, 3 to start), so a gentle flick stops almost at once, a hard
+  one rolls on for a second or two, and it always comes to a stop. A stick the zone drives
+  rolls on the same way.
+
+- **Area Mapper: Touchpad and Trackball on a touchpad.** With a touchpad as the input, a row
+  under the presets picks what a cell's whole-stick and mouse outputs take: Relative (where
+  the finger is, as before), Touchpad (the finger's motion, as Touch Zones' Touchpad mode), or
+  Trackball (Touchpad, and a flick rolls on, with its friction, as in Touch Zones). A ball
+  rolls on through the outputs that were moving as the finger lifted, and touching the pad
+  stops it.
+
+- **Haptic ticks for Touchpad and Trackball.** In both modules, Touchpad and Trackball can
+  tick the trackpad as the finger moves, as a Steam Controller's trackpad does as a mouse: a
+  tick every so far the finger goes, and on while a ball rolls, so the ticks come faster the
+  faster it goes and spread out as a ball slows down. Off until you set their strength
+  ("ticks", beside friction); then density sets how many go the pad's width (4–50, 20 to
+  start) and softness turns the pad's sharp click into a rounder tone that fades in and out.
+  An Area Mapper ticks with or without cards, so one there only for its haptics, the
+  touchpad passing on, can give the ticks for a pointer driven elsewhere. A pad without
+  trackpad haptics feels each as a short rumble.
+
 ### Fixed
 
 - **Crashes with a Bluetooth dongle's search running.** The title-bar Bluetooth button looks
@@ -36,6 +63,23 @@ All notable changes to FlexInput are documented here. This project adheres to
   while they have none; two of those looking at the same moment could take the app down,
   in libusb's device list (an abort, or a crash reading a device another search hadn't
   finished setting up). FlexInput lists USB devices one search at a time now.
+
+- **Touch Zones: Touchpad mode moves the pointer at the same speed at any processing rate.**
+  Its motion fell back by a fixed share every engine tick, so the pointer and stick moved
+  faster the lower the rate was, and with output synced to the display the rate follows the
+  game's frame rate. It goes by time now, reading as it did at 500 Hz: at another rate a
+  zone's mouse speed may want retuning.
+
+- **Area Mapper: a fast swipe bumps for every border it crosses.** With a haptic on many
+  rings, swiping faster than slowly skipped most of the bumps. A crossing only counted once
+  the point had stayed in the new cell for 12 ms, so a ring crossed quicker than that gave
+  nothing. A crossing inside the 40 ms of the last bump's pulse kept the pin up, so no new
+  bump went out. And a point that jumped over a ring between two touch reports skipped it.
+  Every border on the point's path counts now, as it's crossed. Bumps that come faster than
+  one pulse each go out one after another, each one short, and a few at most wait. A finger
+  or stick wobbling on a border still gives one bump: the next crossing counts once the point
+  is 1% of the area's width away from the last. A Steam Controller plays two clicks that land
+  between two of its reports one after the other, where it played only one.
 
 - **3DOF to 2D: Orient no longer spirals up or down as you turn round.** The gyro's turn axis
   and the accelerometer's down never quite agree, so a turn about the vertical read partly as

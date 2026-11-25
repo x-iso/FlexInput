@@ -330,6 +330,7 @@ pub(crate) fn spawn_io_thread(
                     None => out_setting.clamp(60, 4000),
                 };
                 flexinput_virtual::set_output_rate(out_setting, out_hz);
+                flexinput_engine::set_output_rate(out_hz);
                 let poll_interval = Duration::from_nanos(1_000_000_000 / poll_hz as u64);
                 let out_interval = Duration::from_nanos(1_000_000_000 / out_hz as u64);
                 // The shorter period: what one pass has to fit in.

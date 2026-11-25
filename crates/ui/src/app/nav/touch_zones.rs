@@ -438,7 +438,9 @@ impl FlexInputApp {
     /// control is appended LAST (matching the right-aligned DragValue), navigable
     /// like a button and nudged with LT/RT. Keeping this identical to the body
     /// keeps the nav glow on the right item.
-    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool, menu: bool, area: bool) -> Vec<&'static str> {
+    pub(crate) fn nav_tz_action_items(phase: &str, has_analog: bool, show_mouse_speed: bool,
+        tick: Option<bool>, friction: bool, menu: bool, area: bool) -> Vec<&'static str>
+    {
         // An Area Mapper cell is triggered like a menu zone (no gesture to
         // demonstrate), plus a trigger picker after the buttons — a VALUE item
         // cycled with up/down, like tp_mode. It has no hold or touchpad mode.
@@ -467,17 +469,24 @@ impl FlexInputApp {
         // `show_speed` gate (a mouse card, or a touchpad-mode stick zone).
         if has_analog { v.push("tp_mode"); }
         if show_mouse_speed { v.push("mouse_speed"); }
+        // A Touchpad / Trackball zone's haptic ticks (`tick`: Some(whether on)),
+        // their density and softness while on, then a Trackball zone's friction:
+        // VALUES like mouse_speed, left to right as the body shows them.
+        if let Some(on) = tick.filter(|_| !menu) {
+            v.push("tick");
+            if on { v.extend(["tick_density", "tick_soft"]); }
+        }
+        if friction && !menu { v.push("friction"); }
         // Hold-zone is a Touch Zones concept; the menu card body omits the Hold
         // checkbox, so the action row must not reserve a slot for it.
         if !menu { v.push("hold"); }
         v
     }
 
-    /// Whether the SELECTED zone is in Touchpad mode (its first card's `tp_mode`).
-    /// Used with `has_analog`/`has_mouse` to mirror the body's mouse-speed gate.
-    pub(crate) fn nav_tz_selected_zone_touchpad(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+    /// The SELECTED zone's mode (its first card's `tp_mode`; "synced" without one).
+    fn nav_tz_selected_zone_mode(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> String {
         let node = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer).and_then(|sp| sp.get_node(inner));
-        let Some(node) = node else { return false; };
+        let Some(node) = node else { return "synced".into(); };
         let sel_f = node.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0);
         let sel_z = node.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0);
         node.params.get("zone_maps").and_then(|v| v.as_array())
@@ -485,7 +494,14 @@ impl FlexInputApp {
                 .filter(|c| c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) == sel_f
                          && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) == sel_z)
                 .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str())))
-            .map(|m| m == "touchpad").unwrap_or(false)
+            .unwrap_or("synced").to_string()
+    }
+
+    /// Whether the SELECTED zone follows the finger's motion (Touchpad or
+    /// Trackball mode). Used with `has_analog`/`has_mouse` to mirror the body's
+    /// mouse-speed gate.
+    pub(crate) fn nav_tz_selected_zone_touchpad(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        crate::canvas::viewer::tz_mode_follows_motion(&self.nav_tz_selected_zone_mode(outer, inner))
     }
 
     /// Mirrors the body's `show_speed`: a mouse card, OR a touchpad-mode stick zone.
@@ -493,6 +509,65 @@ impl FlexInputApp {
         self.nav_tz_has_mouse_card(outer, inner)
             || (self.nav_tz_has_analog_card(outer, inner)
                 && self.nav_tz_selected_zone_touchpad(outer, inner))
+    }
+
+    /// Whether the body shows the SELECTED zone's friction: a Trackball zone (with
+    /// an analog card).
+    pub(crate) fn nav_tz_shows_friction(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> bool {
+        self.nav_tz_has_analog_card(outer, inner) && self.nav_tz_selected_zone_mode(outer, inner) == "trackball"
+    }
+
+    /// Whether the body shows the SELECTED zone's haptic ticks (a Touchpad or
+    /// Trackball zone with an analog card): Some(whether they're on, so their
+    /// density and softness show too).
+    pub(crate) fn nav_tz_shows_tick(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId) -> Option<bool> {
+        if !(self.nav_tz_has_analog_card(outer, inner) && self.nav_tz_selected_zone_touchpad(outer, inner)) {
+            return None;
+        }
+        let sp = nav_scope(&self.tabs[self.active_tab].canvas.snarl, outer)?;
+        let n = sp.get_node(inner)?;
+        let field = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zone = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        Some(crate::canvas::viewer::tz_zone_tick(sp, inner, field, zone) > 0.0)
+    }
+
+    /// Nudge one of the SELECTED zone's haptic tick values: `which` is the action
+    /// item (`tick` strength, `tick_density`, `tick_soft`), one step `d`.
+    pub(crate) fn nav_tz_nudge_tick(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, which: &str, d: i32)
+    {
+        use crate::canvas::viewer as vw;
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let Some(n) = sp.get_node(inner) else { return; };
+        let field = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zone = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let d = d as f32;
+        match which {
+            "tick_density" => {
+                let cur = vw::tz_zone_tick_density(sp, inner, field, zone);
+                vw::tz_set_zone_tick_density(sp, inner, field, zone, cur + d * 2.0);
+            }
+            "tick_soft" => {
+                let cur = vw::tz_zone_tick_soft(sp, inner, field, zone);
+                vw::tz_set_zone_tick_soft(sp, inner, field, zone, cur + d * 0.1);
+            }
+            _ => {
+                let cur = vw::tz_zone_tick(sp, inner, field, zone);
+                vw::tz_set_zone_tick(sp, inner, field, zone, cur + d * 0.1);
+            }
+        }
+    }
+
+    /// Nudge the SELECTED zone's Trackball friction by `delta`.
+    pub(crate) fn nav_tz_nudge_friction(&mut self, outer: egui_snarl::NodeId,
+        inner: egui_snarl::NodeId, delta: f32)
+    {
+        let Some(sp) = nav_scope_mut(&mut self.tabs[self.active_tab].canvas.snarl, outer) else { return; };
+        let Some(n) = sp.get_node(inner) else { return; };
+        let field = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let zone = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let cur = crate::canvas::viewer::tz_zone_friction(sp, inner, field, zone);
+        crate::canvas::viewer::tz_set_zone_friction(sp, inner, field, zone, cur + delta);
     }
 
     /// Toggle the SELECTED zone's "hold" flag in the `hold_zones` param (mirrors
@@ -591,7 +666,7 @@ impl FlexInputApp {
         let tp_mode = cards.iter().filter(in_zone)
             .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from))
             .unwrap_or_else(|| "synced".into());
-        if is_swipe { return tp_mode != "touchpad"; }
+        if is_swipe { return !crate::canvas::viewer::tz_mode_follows_motion(&tp_mode); }
         // The zone's top analog card is the first in-zone card driving an analog out.
         let top_analog_idx = cards.iter().enumerate().find(|(_, c)| in_zone(c)
             && c.get("out").and_then(|v| v.as_array())
@@ -599,7 +674,7 @@ impl FlexInputApp {
                     .any(crate::canvas::viewer::tz_out_pin_is_analog)).unwrap_or(false))
             .map(|(i, _)| i);
         match tp_mode.as_str() {
-            "touchpad" => false,
+            "touchpad" | "trackball" => false,
             "synced"   => top_analog_idx == Some(idx),
             _          => true, // percard
         }
@@ -615,7 +690,7 @@ impl FlexInputApp {
         let Some(n) = sp.get_node_mut(inner) else { return; };
         let sel_f = n.params.get("sel_field").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let sel_z = n.params.get("sel_zone").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        const MODES: [&str; 3] = ["synced", "percard", "touchpad"];
+        const MODES: [&str; 4] = ["synced", "percard", "touchpad", "trackball"];
         let in_zone = |c: &serde_json::Value| -> bool {
             c.get("f").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_f
                 && c.get("z").and_then(|v| v.as_u64()).unwrap_or(0) as usize == sel_z
@@ -625,7 +700,7 @@ impl FlexInputApp {
                 .find_map(|c| c.get("tp_mode").and_then(|v| v.as_str()).map(String::from)))
             .unwrap_or_else(|| "synced".into());
         let i = MODES.iter().position(|m| *m == cur).unwrap_or(0) as i32;
-        let next = MODES[(((i + dir) % 3 + 3) % 3) as usize];
+        let next = MODES[(i + dir).rem_euclid(MODES.len() as i32) as usize];
         if let Some(cards) = n.params.get_mut("zone_maps").and_then(|v| v.as_array_mut()) {
             for c in cards.iter_mut() {
                 if in_zone(c) {
@@ -681,9 +756,11 @@ impl FlexInputApp {
     fn nav_tz_actions_in(&self, outer: egui_snarl::NodeId, inner: egui_snarl::NodeId, phase: &str) -> Vec<&'static str> {
         let has_analog = self.nav_tz_has_analog_card(outer, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer, inner);
+        let tick = self.nav_tz_shows_tick(outer, inner);
+        let friction = self.nav_tz_shows_friction(outer, inner);
         let menu = self.nav_selected_module_id(outer).as_deref() == Some("module.menu");
         let area = self.nav_is_area(outer);
-        Self::nav_tz_action_items(phase, has_analog, show_speed, menu, area)
+        Self::nav_tz_action_items(phase, has_analog, show_speed, tick, friction, menu, area)
     }
 
     /// Publish the TzCards selection so the shared Remapper glow overlay rings the
@@ -774,6 +851,8 @@ impl FlexInputApp {
             .unwrap_or_else(|| "idle".into());
         let has_analog = self.nav_tz_has_analog_card(outer_id, inner);
         let show_speed = self.nav_tz_shows_mouse_speed(outer_id, inner);
+        let tick = self.nav_tz_shows_tick(outer_id, inner);
+        let friction = self.nav_tz_shows_friction(outer_id, inner);
         let area = self.nav_is_area(outer_id);
         // An Area Mapper cell takes the menu's trigger-less flow; its trigger is
         // the one picked in the action row (kept across cards), not menu_sel.
@@ -816,7 +895,7 @@ impl FlexInputApp {
 
         // Two-row cursor: [0..n_actions) = action buttons, [n_actions..total) =
         // the selected zone's cards.
-        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed, menu && !area, area);
+        let actions = Self::nav_tz_action_items(&phase, has_analog, show_speed, tick, friction, menu && !area, area);
         let n_actions = actions.len();
         let card_idxs = self.nav_tz_zone_card_indices(outer_id, inner);
         let count = card_idxs.len();
@@ -851,13 +930,16 @@ impl FlexInputApp {
         // Mode / mouse-speed are VALUE items in the action row: focus them with
         // left/right like the buttons, then change with up/down (dpad or left
         // stick) — the same select-then-U/D pattern as the entered-card fields.
-        let cur_is_value = on_actions && matches!(actions[cur], "tp_mode" | "mouse_speed" | "area_trig");
+        let cur_is_value = on_actions && matches!(actions[cur],
+            "tp_mode" | "mouse_speed" | "tick" | "tick_density" | "tick_soft" | "friction" | "area_trig");
         if cur_is_value {
             let d = match step_dir { Some(NavDir::Up) => 1i32, Some(NavDir::Down) => -1, _ => 0 };
             if d != 0 {
                 match actions[cur] {
                     "tp_mode" => self.nav_tz_cycle_mode(outer_id, inner, d),
                     "mouse_speed" => self.nav_tz_nudge_mouse_speed(outer_id, inner, d as f32 * 0.1),
+                    t @ ("tick" | "tick_density" | "tick_soft") => self.nav_tz_nudge_tick(outer_id, inner, t, d),
+                    "friction" => self.nav_tz_nudge_friction(outer_id, inner, d as f32 * 0.5),
                     "area_trig" => {
                         const TRIGS: [&str; 3] = ["area_in", "area_enter", "area_leave"];
                         let at = TRIGS.iter().position(|t| *t == trig).unwrap_or(0) as i32;

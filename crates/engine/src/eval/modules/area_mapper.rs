@@ -107,6 +107,34 @@ pub const AREA_TRIG_LEAVE: &str = "area_leave";
 /// alike against the same sink sensitivity.
 const AREA_MOUSE_BASE: f32 = 0.03;
 
+/// What a touchpad's point gives a cell's whole-stick and mouse outputs:
+/// `relative` (the point where it is, the default), `touchpad` (the finger's
+/// motion, as Touch Zones' Touchpad mode) or `trackball` (touchpad, and the
+/// motion rolls on after a lift, slowing by [`AREA_FRICTION_PARAM`]). A stick
+/// input always gives the point.
+pub const AREA_MOTION_PARAM: &str = "area_motion";
+pub const AREA_MOTIONS: &[&str] = &["relative", "touchpad", "trackball"];
+/// Trackball mode's friction (`TRACKBALL_FRICTION_*`).
+pub const AREA_FRICTION_PARAM: &str = "area_friction";
+/// Touchpad and Trackball modes' haptic ticks as the finger and the ball go:
+/// their strength, 0..1, 0 (or none) for off; how many go a pad's width
+/// (`TRACKBALL_TICK_DENSITY_*`); and their softness, 0..1 (0 = the pad's own
+/// click, see [`TickSet`]).
+pub const AREA_TICK_PARAM: &str = "area_tick";
+pub const AREA_TICK_DENSITY_PARAM: &str = "area_tick_density";
+pub const AREA_TICK_SOFT_PARAM: &str = "area_tick_soft";
+/// Touchpad motion on a whole stick: what Touch Zones' Touchpad mode gives it.
+const AREA_MOTION_STICK_GAIN: f32 = 8.0;
+/// The motion's state: `[down, last x, last y, motion x, y, ball (BALL_SLOTS),
+/// gains: mouse x, mouse y, left stick, right stick, travel toward the next tick,
+/// the pad the ticks play on (+1), the flick (FLICK_SLOTS)]`.
+const AREA_MOTION_BALL: usize = 5;
+const AREA_MOTION_GAINS: usize = AREA_MOTION_BALL + BALL_SLOTS;
+const AREA_MOTION_TRAVEL: usize = AREA_MOTION_GAINS + 4;
+const AREA_MOTION_PAD: usize = AREA_MOTION_TRAVEL + 1;
+const AREA_MOTION_FLICK: usize = AREA_MOTION_PAD + 1;
+const AREA_MOTION_SLOTS: usize = AREA_MOTION_FLICK + FLICK_SLOTS;
+
 /// A cell's click: how strong, 0..1, and optionally its own shape.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellHaptic {
@@ -222,17 +250,36 @@ pub fn area_touch_pin(input: &str) -> String {
     if input.starts_with("touch") { format!("{input}_active") } else { format!("{input}_touch") }
 }
 
-/// How long the point has to stay in a new cell for that to count as crossing into
-/// it: long enough that a finger at rest on a border doesn't buzz, with touch
-/// reports some 4 to 9 ms apart.
-const HAPTIC_SETTLE_SECS: f32 = 0.012;
-/// How long a haptic's pin stays up: enough for a rumble motor to answer.
-const HAPTIC_PULSE_SECS: f32 = 0.04;
-/// State per layer for [`area_border_crossed`].
-const HAPTIC_LAYER_SLOTS: usize = 3;
+/// How far the point has to get from where the last border was crossed before
+/// it crosses another (centred units, the area is 2 across): a finger or stick at
+/// rest on a border, its reading wobbling, gives one bump and not a buzz, while a
+/// swipe over rings as thin as this gives one bump per ring.
+pub(crate) const HAPTIC_HYSTERESIS: f32 = 0.02;
+/// The point's path from one tick to the next is walked in steps this long, so a
+/// fast swipe that jumps over several thin rings between two touch reports
+/// crosses each of them.
+const HAPTIC_PATH_STEP: f32 = HAPTIC_HYSTERESIS * 0.5;
+/// The most steps one tick's path is walked in.
+const HAPTIC_PATH_STEPS_MAX: usize = 128;
+/// How long a lone haptic's pin stays up: enough for a rumble motor to answer.
+pub(crate) const HAPTIC_PULSE_SECS: f32 = 0.04;
+/// With more bumps waiting, a pin stays up and then down at least this long, and
+/// at least a period and a half of the output rate, so every pad sees each one.
+const HAPTIC_PULSE_MIN_SECS: f32 = 0.003;
+/// Bumps that may wait to go out: past this, a swipe's bumps come faster than
+/// the pin can carry them and the extra ones are dropped, so the bumps can lag
+/// the finger by a few periods at most.
+pub(crate) const HAPTIC_QUEUE: usize = 4;
+/// One bump: `[strength, pad, hz, ms, soft]`.
+pub(crate) const HAPTIC_BUMP: usize = 5;
+/// The bumps going out: `[phase, time in it, the bump up (HAPTIC_BUMP), waiting,
+/// the waiting bumps (HAPTIC_QUEUE × HAPTIC_BUMP)]`.
+pub(crate) const HAPTIC_PULSE_SLOTS: usize = 2 + HAPTIC_BUMP + 1 + HAPTIC_QUEUE * HAPTIC_BUMP;
+/// State per layer for [`area_border_crossings`].
+pub(crate) const HAPTIC_LAYER_SLOTS: usize = 6;
 
 /// The pin a haptic plays on for this input.
-fn area_haptic_pin(input: &str) -> &'static str {
+pub(crate) fn area_haptic_pin(input: &str) -> &'static str {
     match input {
         "touch1" => "tp_l_click",
         "touch2" => "tp_r_click",
@@ -244,7 +291,7 @@ fn area_haptic_pin(input: &str) -> &'static str {
 /// Which of the pads behind the node a crossing belongs to: behind a Combiner
 /// there can be several, and `_automap_device_id` only names the first. The one
 /// with a finger on that touchpad, or the one pushing that stick furthest.
-fn area_haptic_pad(devs: &[&str], input: &str, dev_sigs: &BusMap) -> Option<usize> {
+pub(crate) fn area_haptic_pad(devs: &[&str], input: &str, dev_sigs: &BusMap) -> Option<usize> {
     if input.starts_with("touch") {
         let active = area_touch_pin(input);
         return devs.iter().position(|d| dev_sigs.get_pin(d, &active).is_some_and(|s| s.as_bool()));
@@ -257,36 +304,190 @@ fn area_haptic_pad(devs: &[&str], input: &str, dev_sigs: &BusMap) -> Option<usiz
     (0..devs.len()).max_by(|a, b| push(devs[*a]).total_cmp(&push(devs[*b])))
 }
 
-/// Follow one layer's hard cell: `Some((from, to))` the tick the point has settled
-/// into a new cell. A finger landing or lifting crosses nothing. `st` is `[settled
-/// cell + 1, candidate + 1, how long]`, zeroed to start.
-pub(crate) fn area_border_crossed(hard: Option<u32>, st: &mut [f32], dt: f32) -> Option<(u32, u32)> {
-    let Some(cell) = hard else {
+/// Follow one layer's hard cell along the point's path: every `(from, to)` border
+/// it crossed since the last tick, in order. The path is walked in short steps, so
+/// a point that jumped over cells crosses each of them; a crossing counts once the
+/// point is [`HAPTIC_HYSTERESIS`] from where the last one was (or from where the
+/// finger landed), so a reading wobbling on a border gives nothing more, and a
+/// crossing it held back is counted once the point gets that far. A finger landing
+/// or lifting crosses nothing. `locate` is the cell under a centred point, None
+/// for none. `st` is `[following, cell + 1 (0 = none), last point x, y, last
+/// crossing x, y]`, zeroed to start.
+pub(crate) fn area_border_crossings(
+    point: Option<Vec2>,
+    locate: impl Fn(f32, f32) -> Option<u32>,
+    st: &mut [f32],
+) -> Vec<(u32, u32)> {
+    let Some(p) = point else {
         st.fill(0.0);
-        return None;
+        return Vec::new();
     };
-    let now = cell as f32 + 1.0;
+    let code = |x: f32, y: f32| locate(x, y).map_or(0.0, |c| c as f32 + 1.0);
     if st[0] == 0.0 {
-        st[0] = now;
+        st.copy_from_slice(&[1.0, code(p.x, p.y), p.x, p.y, p.x, p.y]);
+        return Vec::new();
     }
-    if st[0] == now {
-        st[1] = 0.0;
-        st[2] = 0.0;
-        return None;
+    let (q, spot) = (Vec2::new(st[2], st[3]), Vec2::new(st[4], st[5]));
+    let path = p - q;
+    let len = path.length();
+    // Standing still crosses nothing new: neither the cell nor the distance from
+    // the last crossing has changed.
+    if len <= 0.0 {
+        return Vec::new();
     }
-    if st[1] != now {
-        st[1] = now;
-        st[2] = 0.0;
+    let steps = ((len / HAPTIC_PATH_STEP).ceil() as usize).clamp(1, HAPTIC_PATH_STEPS_MAX);
+    let (mut cell, mut spot) = (st[1], spot);
+    let mut out = Vec::new();
+    for k in 1..=steps {
+        let s = q + path * (k as f32 / steps as f32);
+        let c = code(s.x, s.y);
+        if c == cell || (s - spot).length() < HAPTIC_HYSTERESIS {
+            continue;
+        }
+        if cell > 0.0 && c > 0.0 {
+            out.push((cell as u32 - 1, c as u32 - 1));
+        }
+        cell = c;
+        spot = s;
     }
-    st[2] += dt;
-    if st[2] < HAPTIC_SETTLE_SECS {
-        return None;
+    st.copy_from_slice(&[1.0, cell, p.x, p.y, spot.x, spot.y]);
+    out
+}
+
+/// The bumps going out on a haptic's pin, one after another: each holds the pin
+/// up, then down, long enough for every pad to see it rise again for the next. A
+/// lone bump stays up [`HAPTIC_PULSE_SECS`]; with more waiting it gives way after
+/// `min_secs`. `new` are this tick's bumps, queued behind any waiting (past
+/// [`HAPTIC_QUEUE`] they're dropped). `st` is the [`HAPTIC_PULSE_SLOTS`] block,
+/// zeroed to start. Returns the bump up this tick.
+pub(crate) fn area_haptic_pulses(
+    new: &[[f32; HAPTIC_BUMP]],
+    st: &mut [f32],
+    min_secs: f32,
+    dt: f32,
+) -> Option<[f32; HAPTIC_BUMP]> {
+    const IDLE: f32 = 0.0;
+    const UP: f32 = 1.0;
+    const DOWN: f32 = 2.0;
+    let (head, queue) = st.split_at_mut(2 + HAPTIC_BUMP + 1);
+    let waiting = &mut head[2 + HAPTIC_BUMP];
+    for bump in new {
+        let n = *waiting as usize;
+        if n < HAPTIC_QUEUE {
+            queue[n * HAPTIC_BUMP..(n + 1) * HAPTIC_BUMP].copy_from_slice(bump);
+            *waiting = (n + 1) as f32;
+        }
     }
-    let from = st[0] as u32 - 1;
-    st[0] = now;
-    st[1] = 0.0;
-    st[2] = 0.0;
-    Some((from, cell))
+    let more = *waiting > 0.0;
+    match head[0] {
+        UP => {
+            head[1] += dt;
+            if head[1] >= HAPTIC_PULSE_SECS || (more && head[1] >= min_secs) {
+                head[0] = DOWN;
+                head[1] = 0.0;
+            }
+        }
+        DOWN => {
+            head[1] += dt;
+            if head[1] >= min_secs {
+                head[0] = IDLE;
+            }
+        }
+        _ => {}
+    }
+    if head[0] == IDLE && more {
+        head[2..2 + HAPTIC_BUMP].copy_from_slice(&queue[..HAPTIC_BUMP]);
+        queue.copy_within(HAPTIC_BUMP.., 0);
+        head[2 + HAPTIC_BUMP] -= 1.0;
+        head[0] = UP;
+        head[1] = 0.0;
+    }
+    (head[0] == UP).then(|| {
+        let mut bump = [0.0; HAPTIC_BUMP];
+        bump.copy_from_slice(&head[2..2 + HAPTIC_BUMP]);
+        bump
+    })
+}
+
+/// How a Touchpad / Trackball motion ticks: strength 0..1 (0 = off), ticks a pad
+/// width, softness 0..1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TickSet {
+    pub strength: f32,
+    pub density: f32,
+    pub soft: f32,
+}
+
+impl TickSet {
+    /// From its three numbers as stored, each missing one its default; None while
+    /// off.
+    pub(crate) fn read(strength: Option<f64>, density: Option<f64>, soft: Option<f64>) -> Option<TickSet> {
+        let strength = strength.unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+        (strength > 0.0).then(|| TickSet {
+            strength,
+            density: density.map_or(TRACKBALL_TICK_DENSITY_DEFAULT, |d| d as f32)
+                .clamp(TRACKBALL_TICK_DENSITY_MIN, TRACKBALL_TICK_DENSITY_MAX),
+            soft: soft.unwrap_or(0.0).clamp(0.0, 1.0) as f32,
+        })
+    }
+
+    /// The bump a tick plays on pad `pad` (+1): the pad's own click, or with any
+    /// softness a tone at the pad click's pitch and length, faded in and out by it.
+    pub(crate) fn bump(self, pad: f32) -> [f32; HAPTIC_BUMP] {
+        if self.soft > 0.0 {
+            [self.strength, pad, automap::PAD_CLICK_HZ, automap::PAD_CLICK_MS, self.soft]
+        } else {
+            [self.strength, pad, 0.0, 0.0, 0.0]
+        }
+    }
+}
+
+/// No bump is waiting in an [`area_haptic_pulses`] block: a trackball tick goes
+/// in only then, so the ticks never lag the motion.
+pub(crate) fn haptic_queue_empty(st: &[f32]) -> bool {
+    st[2 + HAPTIC_BUMP] == 0.0
+}
+
+/// The upstream pads a node's haptics may go to (`_upstream_device_ids`).
+pub(crate) fn haptic_pads(snap: &NodeSnap) -> Vec<&str> {
+    snap.params.get("_upstream_device_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Put the bump up this tick on `input`'s haptic pin of a pad: `pad` in the bump
+/// is its place in `pads` + 1, 0 (or one gone) for `fallback`, the node's own.
+/// No pitch = no tone of its own.
+pub(crate) fn play_haptic_bump(
+    collector_sigs: &mut BusMap,
+    pads: &[&str],
+    fallback: &str,
+    input: &str,
+    [strength, pad, hz, ms, soft]: [f32; HAPTIC_BUMP],
+) {
+    let pad = (pad as usize).checked_sub(1).and_then(|i| pads.get(i).copied()).unwrap_or(fallback);
+    if pad.is_empty() {
+        return;
+    }
+    let target = format!("{FEEDBACK_INJECT}{pad}");
+    let sig = Signal::Float(strength);
+    let click = area_haptic_pin(input);
+    collector_sigs.merge_pin(&target, click, sig, |cur| *cur = combine_signals(*cur, sig));
+    if hz > 0.0 {
+        if let Some((_, pins)) = automap::CLICK_TONE_PINS.iter().find(|(c, _)| *c == click) {
+            let key = format!("{FEEDBACK_CLICK_TONE}{pad}");
+            for (pin, v) in pins.iter().zip([hz, ms, soft]) {
+                collector_sigs.set_pin(&key, pin, Signal::Float(v));
+            }
+        }
+    }
+}
+
+/// Up and down for a period and a half of the output rate at least, so that
+/// every send catches a haptic pin's level at least once each way.
+pub(crate) fn haptic_min_secs() -> f32 {
+    (1.5 / crate::thread::current_output_rate() as f32).max(HAPTIC_PULSE_MIN_SECS)
 }
 
 /// A gradient's crossfade through its curve (linear without one).
@@ -652,53 +853,112 @@ pub(crate) fn eval_area_mapper_node(
         live.push(LayerLive { weights, hard, digital });
     }
 
-    // ── Border-cross haptics. State after the layers': each layer's crossing,
-    // then the pulse going out `[time left, strength, pad, hz, ms, soft]`. A crossing
-    // takes the haptic of the cell it enters, else of the one it leaves. The pad is
-    // fixed as it starts: it stops being "the one touched" if the finger lifts
-    // mid-pulse. No pitch = no tone of its own.
+    // ── Touchpad motion (Touchpad / Trackball modes): the finger's movement as a
+    // velocity for the cells' whole-stick and mouse outputs, the ball a Trackball
+    // flick lets go, which carries on through the outputs that were moving as the
+    // finger lifted, and the haptic ticks of their travel (played with the
+    // borders' bumps below). State after the haptics'.
+    let pads = haptic_pads(snap);
+    let motion_mode = snap.params.get(AREA_MOTION_PARAM).and_then(|v| v.as_str())
+        .filter(|m| touchpad && matches!(*m, "touchpad" | "trackball"));
+    let trackball = motion_mode == Some("trackball");
+    let friction = snap.params.get(AREA_FRICTION_PARAM).and_then(|v| v.as_f64()).map(|v| v as f32)
+        .unwrap_or(TRACKBALL_FRICTION_DEFAULT);
+    let num = |k: &str| snap.params.get(k).and_then(|v| v.as_f64());
+    let ticks = TickSet::read(num(AREA_TICK_PARAM), num(AREA_TICK_DENSITY_PARAM), num(AREA_TICK_SOFT_PARAM));
+    let motion_at = base + layers.len() * HAPTIC_LAYER_SLOTS + HAPTIC_PULSE_SLOTS;
+    let mut motion: Option<Vec2> = None;
+    let mut ball: Option<(Vec2, [f32; 4])> = None;
+    // The tick due this tick.
+    let mut tick: Option<[f32; HAPTIC_BUMP]> = None;
+    if motion_mode.is_some() {
+        if ns.aux_f32.len() < motion_at + AREA_MOTION_SLOTS {
+            ns.aux_f32.resize(motion_at + AREA_MOTION_SLOTS, 0.0);
+        }
+        let st = &mut ns.aux_f32[motion_at..motion_at + AREA_MOTION_SLOTS];
+        let mut travel = 0.0;
+        match point {
+            Some(p) => {
+                // Landing: the motion starts still, and a rolling ball is caught.
+                let landed = st[0] == 0.0;
+                if landed {
+                    st[..AREA_MOTION_GAINS].fill(0.0);
+                    st[..3].copy_from_slice(&[1.0, p.x, p.y]);
+                    st[AREA_MOTION_TRAVEL] = 0.0;
+                }
+                // The point is centred, 2 across: half its move is in pad widths.
+                let moved = ((p.x - st[1]) * 0.5, (p.y - st[2]) * 0.5);
+                st[1] = p.x;
+                st[2] = p.y;
+                let m = pad_motion(&mut st[3..5], moved, dt);
+                flick_follow(&mut st[AREA_MOTION_FLICK..], (p.x * 0.5, p.y * 0.5), landed, dt);
+                motion = Some(Vec2::new(m.0, m.1));
+                travel = moved.0.hypot(moved.1);
+                st[AREA_MOTION_PAD] = area_haptic_pad(&pads, input, dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
+            }
+            None => {
+                // Lifted: a Trackball flick lets its ball go.
+                if st[0] != 0.0 && trackball {
+                    let (head, flick) = st.split_at_mut(AREA_MOTION_FLICK);
+                    trackball_let_go(&mut head[AREA_MOTION_BALL..AREA_MOTION_GAINS], flick);
+                }
+                st[0] = 0.0;
+                st[3..5].fill(0.0);
+                if trackball {
+                    let mut gains = [0.0f32; 4];
+                    gains.copy_from_slice(&st[AREA_MOTION_GAINS..AREA_MOTION_TRAVEL]);
+                    if let Some(b) = trackball_roll(&mut st[AREA_MOTION_BALL..AREA_MOTION_GAINS], friction, dt) {
+                        travel = motion_travel(b, dt);
+                        ball = Some((Vec2::new(b.0, b.1), gains));
+                    }
+                } else {
+                    st[AREA_MOTION_BALL..AREA_MOTION_GAINS].fill(0.0);
+                }
+            }
+        }
+        // Ticks whether or not a cell takes the motion: an Area Mapper can be there
+        // only for its haptics, the touchpad passing on.
+        if let Some(t) = ticks.filter(|t| trackball_tick(&mut st[AREA_MOTION_TRAVEL], travel, t.density)) {
+            tick = Some(t.bump(st[AREA_MOTION_PAD]));
+        }
+    }
+
+    // ── Border-cross haptics. State after the layers': each layer's path through
+    // its cells, then the bumps going out (`area_haptic_pulses`). A crossing takes
+    // the haptic of the cell it enters, else of the one it leaves; every border the
+    // point crossed gives its own bump, however fast. A bump's pad is fixed as it is
+    // queued: it stops being "the one touched" if the finger lifts mid-pulse. No
+    // pitch = no tone of its own. The motion's tick goes in when nothing else is
+    // waiting, so it never lags the motion.
     {
-        let need = base + layers.len() * HAPTIC_LAYER_SLOTS + 6;
-        let pads: Vec<&str> = snap.params.get("_upstream_device_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+        let need = base + layers.len() * HAPTIC_LAYER_SLOTS + HAPTIC_PULSE_SLOTS;
         if ns.aux_f32.len() < need {
             ns.aux_f32.resize(need, 0.0);
         }
         let (crossings, pulse) = ns.aux_f32[base..need].split_at_mut(layers.len() * HAPTIC_LAYER_SLOTS);
-        for ((spec, lay), st) in layers.iter().zip(&live).zip(crossings.chunks_mut(HAPTIC_LAYER_SLOTS)) {
-            if let Some((from, to)) = area_border_crossed(lay.hard, st, dt) {
+        let mut bumps: Vec<[f32; HAPTIC_BUMP]> = Vec::new();
+        for (spec, st) in layers.iter().zip(crossings.chunks_mut(HAPTIC_LAYER_SLOTS)) {
+            let gated = |id: u32| spec.touch_cells.contains(&id) && !touched;
+            let locate = |x: f32, y: f32| Some(spec.layout.locate_id(x, y)).filter(|id| !gated(*id));
+            for (from, to) in area_border_crossings(point, locate, st) {
                 if let Some(h) = spec.haptics.get(&to).or_else(|| spec.haptics.get(&from)) {
-                    pulse[0] = HAPTIC_PULSE_SECS;
-                    pulse[1] = h.strength.clamp(0.0, 1.0);
-                    pulse[2] = area_haptic_pad(&pads, input, dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
-                    let t = h.tone.map_or([0.0; 3], |t| [t.hz, t.ms, t.soft]);
-                    pulse[3..6].copy_from_slice(&t);
+                    let pad = area_haptic_pad(&pads, input, dev_sigs).map_or(0.0, |i| i as f32 + 1.0);
+                    let [hz, ms, soft] = h.tone.map_or([0.0; 3], |t| [t.hz, t.ms, t.soft]);
+                    bumps.push([h.strength.clamp(0.0, 1.0), pad, hz, ms, soft]);
                 }
             }
         }
-        if pulse[0] > 0.0 {
-            pulse[0] -= dt;
-            let pad = (pulse[2] as usize).checked_sub(1).and_then(|i| pads.get(i).copied())
-                .unwrap_or(dev_id.as_str());
-            if !pad.is_empty() {
-                let target = format!("{FEEDBACK_INJECT}{pad}");
-                let sig = Signal::Float(pulse[1]);
-                let click = area_haptic_pin(input);
-                collector_sigs.merge_pin(&target, click, sig, |cur| *cur = combine_signals(*cur, sig));
-                if pulse[3] > 0.0 {
-                    let tones = automap::CLICK_TONE_PINS.iter().find(|(c, _)| *c == click);
-                    if let Some((_, pins)) = tones {
-                        let key = format!("{FEEDBACK_CLICK_TONE}{pad}");
-                        for (pin, v) in pins.iter().zip(&pulse[3..6]) {
-                            collector_sigs.set_pin(&key, pin, Signal::Float(*v));
-                        }
-                    }
-                }
-            }
+        if let Some(t) = tick.filter(|_| bumps.is_empty() && haptic_queue_empty(pulse)) {
+            bumps.push(t);
+        }
+        if let Some(bump) = area_haptic_pulses(&bumps, pulse, haptic_min_secs(), dt) {
+            play_haptic_bump(collector_sigs, &pads, &dev_id, input, bump);
         }
     }
+
+    // What each output takes of the motion this tick: mouse x, mouse y, left
+    // stick, right stick — kept while the finger is down for a ball to roll on.
+    let mut motion_gains = [0.0f32; 4];
 
     // One press mode for all cards, when locked.
     let press_lock = snap.params.get(AREA_PRESS_LOCK_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
@@ -781,9 +1041,21 @@ pub(crate) fn eval_area_mapper_node(
             // it as a stick, the mouse as a velocity, scroll as a rate — so a
             // cell can say "in here, the stick aims".
             let pt = point.filter(|_| analog > 0.0).map(|v| v * analog);
+            // Touchpad / Trackball: the finger's motion instead, the card's speed
+            // scaling it as Touch Zones' zone speed does.
+            let speed = (card.get("mouse_speed").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32).clamp(0.1, 10.0);
             match p {
                 "left_stick" | "right_stick" => {
-                    if let Some(v) = pt {
+                    let v = match motion {
+                        Some(m) => {
+                            let g = analog * AREA_MOTION_STICK_GAIN * speed;
+                            motion_gains[if p == "left_stick" { 2 } else { 3 }] += g;
+                            Some(m * g).filter(|_| analog > 0.0)
+                        }
+                        None if motion_mode.is_some() => None,
+                        None => pt,
+                    };
+                    if let Some(v) = v {
                         let (x, y) = if p == "left_stick" {
                             ("left_stick_x", "left_stick_y")
                         } else {
@@ -795,9 +1067,17 @@ pub(crate) fn eval_area_mapper_node(
                     continue;
                 }
                 "mouse" | "mouse_x" | "mouse_y" => {
-                    if let Some(v) = pt {
-                        let speed = card.get("mouse_speed").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32;
-                        let v = v * speed.clamp(0.1, 10.0) * AREA_MOUSE_BASE;
+                    let v = match motion {
+                        Some(m) => {
+                            let g = analog * speed;
+                            if p != "mouse_y" { motion_gains[0] += g; }
+                            if p != "mouse_x" { motion_gains[1] += g; }
+                            Some(m * g).filter(|_| analog > 0.0)
+                        }
+                        None if motion_mode.is_some() => None,
+                        None => pt.map(|v| v * speed * AREA_MOUSE_BASE),
+                    };
+                    if let Some(v) = v {
                         let m = mouse.get_or_insert(Vec2::ZERO);
                         if p != "mouse_y" { m.x += v.x; }
                         if p != "mouse_x" { m.y += v.y; }
@@ -815,6 +1095,25 @@ pub(crate) fn eval_area_mapper_node(
             }
             let e = button_on.entry(p.to_string()).or_insert(false);
             *e = *e || held;
+        }
+    }
+
+    // The motion's gains kept while the finger is down; a rolling ball carries on
+    // through them.
+    if motion.is_some() {
+        ns.aux_f32[motion_at + AREA_MOTION_GAINS..motion_at + AREA_MOTION_TRAVEL].copy_from_slice(&motion_gains);
+    }
+    if let Some((b, [mx, my, ls, rs])) = ball {
+        if mx > 0.0 || my > 0.0 {
+            let m = mouse.get_or_insert(Vec2::ZERO);
+            m.x += b.x * mx;
+            m.y += b.y * my;
+        }
+        for (g, x, y) in [(ls, "left_stick_x", "left_stick_y"), (rs, "right_stick_x", "right_stick_y")] {
+            if g > 0.0 {
+                *axis_acc.entry(x).or_insert(0.0) += b.x * g;
+                *axis_acc.entry(y).or_insert(0.0) += b.y * g;
+            }
         }
     }
 

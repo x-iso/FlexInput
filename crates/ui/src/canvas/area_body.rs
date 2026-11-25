@@ -2099,6 +2099,48 @@ fn input_carried(input: &str, carried: impl Fn(&str) -> bool) -> bool {
     carried(input) || carried(&format!("{input}_x")) || carried(&format!("{input}_active"))
 }
 
+/// A touchpad input's motion mode (`relative` / `touchpad` / `trackball`) and its
+/// Trackball friction.
+pub(crate) fn area_motion(n: &NodeData) -> (String, f32) {
+    use flexinput_engine::eval::{AREA_FRICTION_PARAM, AREA_MOTIONS, AREA_MOTION_PARAM, TRACKBALL_FRICTION_DEFAULT,
+        TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN};
+    let mode = n.params.get(AREA_MOTION_PARAM).and_then(|v| v.as_str())
+        .filter(|m| AREA_MOTIONS.contains(m))
+        .unwrap_or(AREA_MOTIONS[0])
+        .to_string();
+    let friction = n.params.get(AREA_FRICTION_PARAM).and_then(|v| v.as_f64()).map_or(TRACKBALL_FRICTION_DEFAULT, |v| v as f32)
+        .clamp(TRACKBALL_FRICTION_MIN, TRACKBALL_FRICTION_MAX);
+    (mode, friction)
+}
+
+/// A touchpad input's haptic tick strength in Touchpad / Trackball mode, 0..1,
+/// 0 for off.
+pub(crate) fn area_tick(n: &NodeData) -> f32 {
+    n.params.get(flexinput_engine::eval::AREA_TICK_PARAM).and_then(|v| v.as_f64()).map_or(0.0, |v| v as f32).clamp(0.0, 1.0)
+}
+
+/// The haptic ticks' density (ticks a pad width) and softness, 0..1.
+pub(crate) fn area_tick_feel(n: &NodeData) -> (f32, f32) {
+    use flexinput_engine::eval::{AREA_TICK_DENSITY_PARAM, AREA_TICK_SOFT_PARAM, TRACKBALL_TICK_DENSITY_DEFAULT,
+        TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN};
+    let num = |k: &str| n.params.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+    (
+        num(AREA_TICK_DENSITY_PARAM).unwrap_or(TRACKBALL_TICK_DENSITY_DEFAULT)
+            .clamp(TRACKBALL_TICK_DENSITY_MIN, TRACKBALL_TICK_DENSITY_MAX),
+        num(AREA_TICK_SOFT_PARAM).unwrap_or(0.0).clamp(0.0, 1.0),
+    )
+}
+
+/// The motion modes' hover texts, in `AREA_MOTIONS`' order.
+pub(crate) const AREA_MOTION_TIPS: [&str; 3] = [
+    "Relative: a cell's whole-stick and mouse outputs take where the finger is on the area, as a stick pushed that far.",
+    "Touchpad: a cell's whole-stick and mouse outputs follow the finger's motion, like a laptop touchpad: a still finger moves nothing.",
+    "Trackball: as Touchpad, and a flick (lifting your finger while it moves fast) keeps the pointer (and stick) rolling, slowing down by the friction; touch the pad to stop it.",
+];
+
+/// Trackball friction's hover text.
+pub(crate) const AREA_FRICTION_TIP: &str = super::viewer::TRACKBALL_FRICTION_TIP;
+
 pub(crate) fn show_area_options_row(
     node_id: NodeId,
     ui: &mut egui::Ui,
@@ -2127,6 +2169,10 @@ pub(crate) fn show_area_options_row(
     let mut sym = area_symmetric(n);
     let mut pass = n.params.get(AREA_PASS_SOURCE_PARAM).and_then(|v| v.as_bool()).unwrap_or(false);
     let mut touched = n.params.get(AREA_CELL_TOUCH).and_then(|v| v.as_bool()).unwrap_or(false);
+    let (motion, mut friction) = area_motion(n);
+    let mut tick = area_tick(n) as f64 * 100.0;
+    let (mut density, mut soft) = area_tick_feel(n);
+    let mut soft_pct = soft * 100.0;
     let cell = selected_cell(n, &area_layout(n));
     let stick = !current.starts_with("touch");
     let touch_pin = area_touch_pin(&current);
@@ -2220,14 +2266,89 @@ pub(crate) fn show_area_options_row(
             rects.push(r.rect);
         }
     });
-    publish_nav_field_rects(ui, node_id, &rects);
     let preset_changed = ui.horizontal(|ui| {
         let changed = presets_menu(node_id, ui, snarl);
         changed | overlay_controls(node_id, ui, snarl, automap_parent)
     }).inner;
+    // A touchpad: what its point gives a cell's whole-stick and mouse outputs,
+    // a Trackball's friction and the motion's haptic ticks. Gamepad fields after
+    // the first row's.
+    let (mut new_motion, mut friction_changed, mut tick_changed) = (None, false, false);
+    let (mut density_changed, mut soft_changed) = (false, false);
+    if !stick {
+        use flexinput_engine::eval::{AREA_MOTIONS, TRACKBALL_FRICTION_MAX, TRACKBALL_FRICTION_MIN};
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Motion").small().weak());
+            let r = egui::ComboBox::from_id_salt((node_id, "area_motion"))
+                .selected_text(super::viewer::simple_bodies::combo_text(ui, &motion, 80.0))
+                .width(80.0)
+                .show_ui(ui, |ui| {
+                    for (m, tip) in AREA_MOTIONS.iter().zip(AREA_MOTION_TIPS) {
+                        if ui.selectable_label(*m == motion, *m).on_hover_text(tip).clicked() && *m != motion {
+                            new_motion = Some(m.to_string());
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(AREA_MOTION_TIPS[AREA_MOTIONS.iter().position(|m| *m == motion).unwrap_or(0)]);
+            rects.push(r.rect);
+            if motion == "trackball" {
+                let r = ui.add(egui::DragValue::new(&mut friction).range(TRACKBALL_FRICTION_MIN..=TRACKBALL_FRICTION_MAX)
+                        .speed(0.02).fixed_decimals(1).prefix("friction "))
+                    .on_hover_text(AREA_FRICTION_TIP);
+                friction_changed = r.changed();
+                rects.push(r.rect);
+            }
+            if motion != "relative" {
+                let r = ui.add(egui::DragValue::new(&mut tick).range(0.0..=100.0).speed(0.5)
+                        .custom_formatter(|v, _| super::viewer::tick_text(v))
+                        .custom_parser(super::viewer::tick_parse)
+                        .prefix("ticks "))
+                    .on_hover_text(super::viewer::TRACKBALL_TICK_TIP);
+                tick_changed = r.changed();
+                rects.push(r.rect);
+                if tick > 0.0 {
+                    use flexinput_engine::eval::{TRACKBALL_TICK_DENSITY_MAX, TRACKBALL_TICK_DENSITY_MIN};
+                    let r = ui.add(egui::DragValue::new(&mut density)
+                            .range(TRACKBALL_TICK_DENSITY_MIN..=TRACKBALL_TICK_DENSITY_MAX).speed(0.1).fixed_decimals(0)
+                            .prefix("density "))
+                        .on_hover_text(super::viewer::TRACKBALL_TICK_DENSITY_TIP);
+                    density_changed = r.changed();
+                    rects.push(r.rect);
+                    let r = ui.add(egui::DragValue::new(&mut soft_pct).range(0.0..=100.0).speed(0.5).fixed_decimals(0)
+                            .prefix("soft ").suffix("%"))
+                        .on_hover_text(super::viewer::TRACKBALL_TICK_SOFT_TIP);
+                    soft_changed = r.changed();
+                    rects.push(r.rect);
+                }
+            }
+        });
+    }
+    soft = soft_pct / 100.0;
+    publish_nav_field_rects(ui, node_id, &rects);
 
     let Some(n) = snarl.get_node_mut(node_id) else { return false };
     let mut changed = preset_changed;
+    if let Some(m) = new_motion {
+        n.params.insert(flexinput_engine::eval::AREA_MOTION_PARAM.into(), json!(m));
+        changed = true;
+    }
+    if friction_changed {
+        n.params.insert(flexinput_engine::eval::AREA_FRICTION_PARAM.into(), json!((friction * 10.0).round() / 10.0));
+        changed = true;
+    }
+    if tick_changed {
+        n.params.insert(flexinput_engine::eval::AREA_TICK_PARAM.into(), json!(tick.round() / 100.0));
+        changed = true;
+    }
+    if density_changed {
+        n.params.insert(flexinput_engine::eval::AREA_TICK_DENSITY_PARAM.into(), json!(density.round()));
+        changed = true;
+    }
+    if soft_changed {
+        n.params.insert(flexinput_engine::eval::AREA_TICK_SOFT_PARAM.into(), json!((soft * 100.0).round() / 100.0));
+        changed = true;
+    }
     if let Some(p) = picked {
         n.params.insert(AREA_INPUT_PARAM.into(), json!(p));
         changed = true;
