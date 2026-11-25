@@ -31,6 +31,12 @@ All notable changes to FlexInput are documented here. This project adheres to
 
 ### Fixed
 
+- **Crashes with a Bluetooth dongle's search running.** The title-bar Bluetooth button looks
+  for adapters every two seconds, and the Classic and Joy-Con transports look for theirs
+  while they have none; two of those looking at the same moment could take the app down,
+  in libusb's device list (an abort, or a crash reading a device another search hadn't
+  finished setting up). FlexInput lists USB devices one search at a time now.
+
 - **3DOF to 2D: Orient no longer spirals up or down as you turn round.** The gyro's turn axis
   and the accelerometer's down never quite agree, so a turn about the vertical read partly as
   pitch. An accelerometer reading 0.02 g to one side, or a gyro set a degree askew against

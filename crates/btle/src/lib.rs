@@ -199,7 +199,7 @@ pub struct ClassicLink {
 
 /// An open Bluetooth dongle, ready to exchange HCI traffic.
 pub struct Dongle {
-    handle: rusb::DeviceHandle<rusb::GlobalContext>,
+    handle: UsbHandle,
     event_ep: u8,
     /// See [`hci::split_event_transfer`].
     event_mps: usize,
@@ -240,6 +240,54 @@ pub struct Dongle {
     /// Which device this is, for the open-dongle registry.
     vid: u16,
     pid: u16,
+}
+
+/// Held while libusb lists devices, and while a list or a handle lets go of them.
+///
+/// ⛔ **libusb's Windows backend must never list devices on two threads at once.**
+/// The title-bar Bluetooth button lists them every two seconds on the UI thread,
+/// the Classic and Joy-Con transports each list them looking for their adapter,
+/// and on Windows a device lives only as long as some list or handle holds it.
+/// One thread dropping its last hold on a device while another's listing finds
+/// it bumped a dying device and libusb aborted (`assert(refcnt >= 2)` in
+/// `libusb_ref_device`); a listing finding a device another listing had just
+/// created, before its instance id was filled in, crashed in `strcmp(NULL, …)`
+/// (`winusb_get_device_list`). Both took the whole app down. Everything here
+/// that lists, opens or closes a device takes this first.
+fn usb_lock() -> std::sync::MutexGuard<'static, ()> {
+    static USB: Mutex<()> = Mutex::new(());
+    USB.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A libusb handle that closes under [`usb_lock`]: closing lets go of its device,
+/// which may be the last hold on it.
+struct UsbHandle(std::mem::ManuallyDrop<rusb::DeviceHandle<rusb::GlobalContext>>);
+
+impl UsbHandle {
+    fn new(handle: rusb::DeviceHandle<rusb::GlobalContext>) -> Self {
+        Self(std::mem::ManuallyDrop::new(handle))
+    }
+}
+
+impl std::ops::Deref for UsbHandle {
+    type Target = rusb::DeviceHandle<rusb::GlobalContext>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for UsbHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for UsbHandle {
+    fn drop(&mut self) {
+        let _usb = usb_lock();
+        // SAFETY: dropped once, here, and never touched again.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.0) };
+    }
 }
 
 /// Dongles this process currently holds open.
@@ -553,6 +601,8 @@ pub fn discover() -> Vec<DongleInfo> {
     // FlexInput can open.
     #[cfg(windows)]
     {
+        // Held until the devices below are let go of again (`usb_lock`).
+        let _usb = usb_lock();
         let usb: Vec<rusb::Device<rusb::GlobalContext>> =
             rusb::devices().map(|l| l.iter().collect()).unwrap_or_default();
         return windows::adapters()
@@ -572,6 +622,7 @@ pub fn discover() -> Vec<DongleInfo> {
 /// The adapters libusb lists, by their class codes: Linux's.
 #[cfg(not(windows))]
 fn discover_usb() -> Vec<DongleInfo> {
+    let _usb = usb_lock();
     let Ok(devices) = rusb::devices() else { return Vec::new() };
     #[cfg(target_os = "linux")]
     let dedicated = linux::dedicated();
@@ -744,13 +795,14 @@ fn linux_entry(
 /// open it" into a single `None`. Those are different problems with different
 /// fixes — one means plug it in or run Zadig, the other means close whatever is
 /// holding it — so this walks the bus itself and reports which happened.
-fn open_by_ids(vid: u16, pid: u16) -> Result<rusb::DeviceHandle<rusb::GlobalContext>> {
+fn open_by_ids(vid: u16, pid: u16) -> Result<UsbHandle> {
+    let _usb = usb_lock();
     for device in rusb::devices()?.iter() {
         let Ok(desc) = device.device_descriptor() else { continue };
         if desc.vendor_id() != vid || desc.product_id() != pid {
             continue;
         }
-        return device.open().map_err(|source| Error::Busy { vid, pid, source });
+        return device.open().map(UsbHandle::new).map_err(|source| Error::Busy { vid, pid, source });
     }
     Err(Error::NotFound { vid, pid })
 }
