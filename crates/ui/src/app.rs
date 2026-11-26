@@ -188,17 +188,55 @@ pub struct EasyState {
     /// shows a "discard your tweaks?" modal; on confirm the preset at
     /// this path is applied.
     pub pending_preset_switch: Option<std::path::PathBuf>,
-    /// Path + canonical-JSON content hash of the preset that was last
-    /// loaded into this tab's sub-patch. Set when the user picks a chip;
-    /// compared against the live sub-patch hash each frame to detect
-    /// dirty state.
-    pub loaded_preset: Option<(std::path::PathBuf, u64)>,
+    /// Per Easy-mode sub-patch (by outer node id): path + canonical-JSON content
+    /// hash of the preset last loaded into it. Set when the user picks a chip;
+    /// compared against the live sub-patch hash each frame to detect dirty
+    /// state. A hash of 0 means "just restored from disk, not checked yet".
+    pub loaded_preset: HashMap<usize, (std::path::PathBuf, u64)>,
+    /// The outer node id of the sub-patch Easy mode shows (its tab row's pick).
+    /// `None`, or one no longer in Easy mode: the primary (`easy::subpatches`).
+    pub shown: Option<usize>,
     /// Transient: set by a preset / sub-patch load to the outer sub-patch node
     /// id whose stored overlay/config pins should be re-materialized onto the
     /// tab's info + config overlays. Consumed once by `center_panel::show`.
     pub overlay_reload_node: Option<usize>,
-    /// When the preset bar last worked out "modified", for what, and the answer.
-    pub dirty_cache: Option<(std::time::Instant, (u64, Option<u64>), bool)>,
+    /// When the preset bar last worked out "modified", for what (canvas
+    /// generation, sub-patch, its link's hash), and the answer.
+    pub dirty_cache: Option<(std::time::Instant, (u64, Option<usize>, Option<u64>), bool)>,
+}
+
+impl EasyState {
+    /// What a saved tab or patch kept: each sub-patch's preset path (`links`),
+    /// and the single path older saves kept (`legacy`), which was the primary's.
+    /// Hashes start at 0, to be confirmed against the live sub-patch.
+    pub(crate) fn restored(
+        snarl: &egui_snarl::Snarl<NodeData>,
+        legacy: Option<std::path::PathBuf>,
+        links: std::collections::BTreeMap<usize, std::path::PathBuf>,
+        shown: Option<usize>,
+    ) -> Self {
+        let mut loaded_preset: HashMap<usize, (std::path::PathBuf, u64)> =
+            links.into_iter().map(|(id, p)| (id, (p, 0))).collect();
+        if let (Some(p), Some(primary)) = (legacy, crate::easy::subpatches::primary(snarl)) {
+            loaded_preset.entry(primary.0).or_insert((p, 0));
+        }
+        Self { loaded_preset, shown, ..Default::default() }
+    }
+
+    /// The preset link of sub-patch `id`.
+    pub(crate) fn link(&self, id: Option<egui_snarl::NodeId>) -> Option<&(std::path::PathBuf, u64)> {
+        self.loaded_preset.get(&id?.0)
+    }
+
+    /// Every sub-patch's preset path, to save.
+    pub(crate) fn saved_links(&self) -> std::collections::BTreeMap<usize, std::path::PathBuf> {
+        self.loaded_preset.iter().map(|(id, (p, _))| (*id, p.clone())).collect()
+    }
+
+    /// The primary's preset path, for the field older builds read.
+    pub(crate) fn primary_link(&self, snarl: &egui_snarl::Snarl<NodeData>) -> Option<std::path::PathBuf> {
+        self.link(crate::easy::subpatches::primary(snarl)).map(|(p, _)| p.clone())
+    }
 }
 
 impl PatchTab {
@@ -917,10 +955,8 @@ impl FlexInputApp {
             // fresh unique salt so old tabs don't all collapse onto one key.
             let view_salt = if pt.view_salt != 0 { pt.view_salt } else { crate::canvas::next_canvas_salt() };
             canvas.set_view_salt(view_salt);
-            let easy_state = EasyState {
-                loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
-                ..EasyState::default()
-            };
+            let easy_state = EasyState::restored(
+                &canvas.snarl, pt.easy_preset_path, pt.easy_presets, pt.easy_shown);
             // Re-materialize overlay/config pins that a sub-patch carries (from a
             // preset or an earlier attributed save) back onto the tab.
             let mut overlay = pt.overlay;
@@ -3430,24 +3466,34 @@ impl FlexInputApp {
     /// whether the tab changed (not past either end). What was selected goes.
     pub(crate) fn step_layout_tab(&mut self, ctx: &egui::Context, dir: i32) -> Option<bool> {
         let config = crate::config_overlay::config_overlay_visible(ctx);
-        let (tabs, active, selected, selection) = if config {
+        if config {
             let c = &mut self.tabs[self.active_tab].config;
-            (c.layout_tabs.len(), &mut c.active_tab, &mut c.selected_item, &mut c.selected_items)
+            let (tabs, active, selected, selection) =
+                (c.layout_tabs.len(), &mut c.active_tab, &mut c.selected_item, &mut c.selected_items);
+            if tabs < 2 {
+                return None;
+            }
+            let Some(k) = crate::canvas::viewer::stepped_tab(*active, tabs, dir) else { return Some(false) };
+            *active = k;
+            *selected = None;
+            selection.clear();
         } else {
             if self.settings.ui_mode != settings::UiMode::Easy {
                 return None;
             }
-            let id = self.nav_active_subpatch_id()?;
-            let sp = self.tabs[self.active_tab].canvas.snarl.get_node_mut(id)?.subpatch.as_mut()?;
-            (sp.layout_tabs.len(), &mut sp.active_tab, &mut sp.selected_item, &mut sp.selected_items)
-        };
-        if tabs < 2 {
-            return None;
+            // Easy mode's row runs through every sub-patch it shows, each one's
+            // layout tabs in turn: stepping past a sub-patch's last tab shows the
+            // next sub-patch.
+            let tab = &mut self.tabs[self.active_tab];
+            if crate::easy::subpatches::pages(&tab.canvas.snarl).len() < 2 {
+                return None;
+            }
+            let Some((id, k)) = crate::easy::subpatches::stepped_page(&tab.canvas.snarl, tab.easy_state.shown, dir)
+            else {
+                return Some(false);
+            };
+            crate::easy::subpatches::show_page(&mut tab.canvas.snarl, &mut tab.easy_state.shown, id, k);
         }
-        let Some(k) = crate::canvas::viewer::stepped_tab(*active, tabs, dir) else { return Some(false) };
-        *active = k;
-        *selected = None;
-        selection.clear();
         self.gamepad_nav.module_part = None;
         self.gamepad_nav.module_field = None;
         self.gamepad_nav.module_part_item = None;
@@ -3473,20 +3519,17 @@ impl FlexInputApp {
         }
     }
 
-    /// Whether the Easy body's layout has tabs for LB / RB to step through.
+    /// Whether Easy mode's tab row has pages for LB / RB to step through - layout
+    /// tabs, or sub-patches beside the primary.
     pub(crate) fn easy_layout_has_tabs(&self) -> bool {
         self.settings.ui_mode == settings::UiMode::Easy
-            && self.nav_active_subpatch_id()
-                .and_then(|id| self.tabs[self.active_tab].canvas.snarl.get_node(id))
-                .and_then(|n| n.subpatch.as_ref())
-                .is_some_and(|sp| sp.layout_tabs.len() >= 2)
+            && crate::easy::subpatches::pages(&self.tabs[self.active_tab].canvas.snarl).len() >= 2
     }
 
+    /// The sub-patch Easy mode shows in the active tab - the one its nav drives.
     pub(crate) fn nav_active_subpatch_id(&self) -> Option<egui_snarl::NodeId> {
-        self.tabs[self.active_tab].canvas.snarl
-            .nodes_ids_data()
-            .find(|(_, n)| n.value.module_id == "subpatch")
-            .map(|(id, _)| id)
+        let tab = &self.tabs[self.active_tab];
+        crate::easy::subpatches::shown(&tab.canvas.snarl, tab.easy_state.shown)
     }
 
     /// Publish the sub-patch nav glow for `outer_id` (selection ring + the

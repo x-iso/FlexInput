@@ -1438,6 +1438,13 @@ pub struct PersistedTab {
     /// workspace round-trip restores the preset link.
     #[serde(default)]
     pub easy_preset_path: Option<std::path::PathBuf>,
+    /// The same for each sub-patch Easy mode shows, by outer node id. The field
+    /// above stays the primary's, for builds that read only that.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub easy_presets: std::collections::BTreeMap<usize, std::path::PathBuf>,
+    /// The sub-patch Easy mode was showing (outer node id), for its tab row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub easy_shown: Option<usize>,
     /// Stable salt that keys this tab's canvas pan/zoom (see
     /// `Canvas::set_view_salt`). Persisted so the view stays tied to the same
     /// tab across restarts and never cross-contaminates other tabs. `0` (the
@@ -1524,6 +1531,8 @@ fn blank_tab_from_value(v: &serde_json::Value) -> PersistedTab {
         auto_bypass: v.get("auto_bypass").and_then(|x| x.as_bool()).unwrap_or(false),
         snarl: Snarl::new(),
         easy_preset_path: None,
+        easy_presets: Default::default(),
+        easy_shown: None,
         view_salt: 0,
         overlay: crate::canvas::OverlayLayout::default(),
         config: crate::canvas::OverlayLayout::default(),
@@ -1748,6 +1757,8 @@ mod workspace_resilience_tests {
             auto_bypass: false,
             snarl: Snarl::new(),
             easy_preset_path: None,
+            easy_presets: Default::default(),
+            easy_shown: None,
             view_salt: 7,
             overlay: crate::canvas::OverlayLayout::default(),
             config: crate::canvas::OverlayLayout::default(),

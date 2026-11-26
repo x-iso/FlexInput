@@ -15,4 +15,5 @@ pub mod center_panel;
 pub mod io_panel;
 pub mod layout;
 pub mod presets;
+pub mod subpatches;
 pub mod wiring;

@@ -286,6 +286,16 @@ fn show_input_section(
     ui.add_space(PANEL_PADDING);
     ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new("Choose input device").size(crate::settings::ui_size(15.0)).strong());
+        // With several sub-patches on the tab row, which one the devices are for.
+        let snarl = &canvas.snarl;
+        if let Some(p) = super::subpatches::primary(snarl).filter(|_| super::subpatches::easy_list(snarl).len() >= 2) {
+            let icon = super::subpatches::icon(snarl, p);
+            let name = super::subpatches::name(snarl, p);
+            let into = if icon.is_empty() { name } else { format!("{icon} {name}") };
+            ui.label(egui::RichText::new(format!("for {into}")).small().weak())
+                .on_hover_text("Devices wire into and out of the primary sub-patch; the tab row's \
+                                others keep the wiring Advanced mode gives them.");
+        }
     });
     ui.add_space(SECTION_GAP * 0.5);
 
@@ -883,12 +893,16 @@ fn port_row(
                 .show_ui(ui, |ui| {
                     for (p, name) in ports.names.iter().enumerate() {
                         // Say who'd be displaced, so a swap is never a surprise.
+                        let held = ports.held.get(p).copied().unwrap_or(false);
                         let text = match &ports.holders[p] {
+                            _ if held => format!("{name}  ·  wired in Advanced mode"),
                             Some((holder, label)) if holder != device_id =>
                                 format!("{name}  ·  {label}"),
                             _ => name.clone(),
                         };
-                        if ui.selectable_label(mine == Some(p), text).clicked() && mine != Some(p) {
+                        if ui.add_enabled(!held, egui::Button::selectable(mine == Some(p), text)).clicked()
+                            && mine != Some(p)
+                        {
                             *port_pick = Some(p);
                         }
                     }
@@ -1092,28 +1106,30 @@ fn find_source_node_for(canvas: &Canvas, device_id: &str) -> Option<NodeId> {
 }
 
 /// How many input devices this preset accepts — one per AutoMap inlet the
-/// subpatch declares.
+/// primary sub-patch declares, less any a wire from Advanced mode feeds.
 ///
 /// Read from the preset rather than fixed, so a single-inlet preset keeps
 /// behaving exactly as it always has and a multi-inlet one just works.
 pub(super) fn input_capacity(canvas: &Canvas) -> usize {
-    let sp = canvas.snarl.nodes_ids_data()
-        .find(|(_, n)| n.value.module_id == "subpatch");
-    match sp {
-        Some((id, _)) => {
-            super::wiring::automap_input_indices(canvas.snarl.get_node(id)).len().max(1)
-        }
-        None => 1,
-    }
+    super::wiring::held_inlets(canvas).iter().filter(|h| !**h).count().max(1)
 }
 
-/// Active sources with their AutoMap port, lowest port first.
+/// How many AutoMap inlets the primary sub-patch has, held or not.
+fn inlet_count(canvas: &Canvas) -> usize {
+    super::subpatches::primary(&canvas.snarl)
+        .map_or(0, |p| super::wiring::automap_input_indices(canvas.snarl.get_node(p)).len())
+}
+
+/// Easy mode's sources with their AutoMap port, lowest port first. A pad that
+/// Advanced mode wires somewhere else isn't one - not until it's picked here.
 fn active_sources(canvas: &Canvas) -> Vec<(NodeId, String, usize)> {
-    let mut v: Vec<(NodeId, String, usize)> = canvas.snarl.nodes_ids_data()
-        .filter(|(_, n)| n.value.module_id == "device.source")
-        .filter_map(|(id, n)| {
-            let dev = n.value.params.get("device_id")?.as_str()?.to_string();
-            let port = n.value.params.get("automap_port")
+    let primary = super::subpatches::primary(&canvas.snarl);
+    let mut v: Vec<(NodeId, String, usize)> = super::wiring::managed_sources(&canvas.snarl, primary)
+        .into_iter()
+        .filter_map(|id| {
+            let n = canvas.snarl.get_node(id)?;
+            let dev = n.params.get("device_id")?.as_str()?.to_string();
+            let port = n.params.get("automap_port")
                 .and_then(|p| p.as_u64()).unwrap_or(0) as usize;
             Some((id, dev, port))
         })
@@ -1147,8 +1163,7 @@ pub(crate) fn toggle_source(
 
     if let Some((id, _, _)) = active.iter().find(|(_, d, _)| d == &device.id) {
         if capacity > 1 {
-            canvas.remember_device_source(*id);
-            canvas.snarl.remove_node(*id);
+            super::wiring::release_source(canvas, *id);
             super::layout::reposition_io_nodes(canvas);
         }
         return;
@@ -1158,14 +1173,23 @@ pub(crate) fn toggle_source(
     let (evict, port) = place_new_source(&held, capacity, |d| connected.iter().any(|c| c.id == d));
     if let Some(i) = evict {
         // Its calibration stays with the tab, for when it's picked again.
-        canvas.remember_device_source(active[i].0);
-        canvas.snarl.remove_node(active[i].0);
+        super::wiring::release_source(canvas, active[i].0);
     }
 
+    // A pad Advanced mode already wires elsewhere keeps its node: it's wired into
+    // the primary as well (`add_device_source` adds none while one exists).
+    let existed = find_source_node_for(canvas, &device.id).is_some();
     canvas.add_device_source(device, default_collapsed, defaults);
     if let Some(node_id) = find_source_node_for(canvas, &device.id) {
         if let Some(n) = canvas.snarl.get_node_mut(node_id) {
             n.params.insert("automap_port".into(), serde_json::Value::from(port as u64));
+        }
+        if existed {
+            // Not Easy mode's by its wires yet: wire it in now, as the caller's
+            // rewire only takes the primary's own and unwired pads.
+            super::wiring::adopt_source(canvas, node_id);
+        } else {
+            super::layout::place_beside_primary(canvas, node_id);
         }
     }
     super::layout::reposition_io_nodes(canvas);
@@ -1204,15 +1228,14 @@ struct PortTable {
     names: Vec<String>,
     /// The device id wired into each inlet, with that device's display name.
     holders: Vec<Option<(String, String)>>,
+    /// The inlets a wire from Advanced mode feeds, which no device can take.
+    held: Vec<bool>,
 }
 
 impl PortTable {
     fn read(canvas: &Canvas, devices: &[PhysicalDevice]) -> Self {
-        let Some(sp) = canvas.snarl.nodes_ids_data()
-            .find(|(_, n)| n.value.module_id == "subpatch")
-            .map(|(id, _)| id)
-        else {
-            return Self { names: Vec::new(), holders: Vec::new() };
+        let Some(sp) = super::subpatches::primary(&canvas.snarl) else {
+            return Self { names: Vec::new(), holders: Vec::new(), held: Vec::new() };
         };
         let node = canvas.snarl.get_node(sp);
         let names: Vec<String> = super::wiring::automap_input_indices(node).iter()
@@ -1233,7 +1256,9 @@ impl PortTable {
                 .unwrap_or_else(|| format!("{dev} (not connected)"));
             *h = Some((dev, label));
         }
-        Self { names, holders }
+        let mut held = super::wiring::held_inlets(canvas);
+        held.resize(names.len(), false);
+        Self { names, holders, held }
     }
 
     fn slot_of(&self, device_id: &str) -> Option<usize> {
@@ -1251,7 +1276,7 @@ pub(crate) fn set_source_port(canvas: &mut Canvas, device_id: &str, port: usize)
     if my_slot == Some(port) { return; }
     // Out of range = surplus: `resolve_ports` only hands it an inlet if one is
     // free, and the one this device just took was the last.
-    let vacated = my_slot.unwrap_or(input_capacity(canvas));
+    let vacated = my_slot.unwrap_or(inlet_count(canvas));
     let holder = active_sources(canvas).into_iter()
         .map(|(id, _, _)| id)
         .find(|&id| id != mine && super::wiring::source_slot(canvas, id) == Some(port));
@@ -1269,9 +1294,12 @@ pub(crate) fn set_source_port(canvas: &mut Canvas, device_id: &str, port: usize)
 /// the gamepad-nav twin of picking from the Port dropdown.
 pub(crate) fn cycle_source_port(canvas: &mut Canvas, device_id: &str) {
     let Some(mine) = find_source_node_for(canvas, device_id) else { return; };
-    let n = input_capacity(canvas);
-    if n < 2 { return; }
-    let next = super::wiring::source_slot(canvas, mine).map_or(0, |s| (s + 1) % n);
+    if input_capacity(canvas) < 2 { return; }
+    // The next inlet no Advanced-mode wire holds.
+    let held = super::wiring::held_inlets(canvas);
+    let n = held.len();
+    let from = super::wiring::source_slot(canvas, mine).map_or(n.saturating_sub(1), |s| s);
+    let Some(next) = (1..=n).map(|k| (from + k) % n).find(|&p| !held[p]) else { return };
     set_source_port(canvas, device_id, next);
 }
 
@@ -2172,40 +2200,35 @@ fn model_kind(device_id: &str) -> String {
         .map_or(kind, |(plain, _)| plain.to_string())
 }
 
-fn has_sink_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> bool {
-    canvas.snarl.nodes_ids_data().any(|(_, n)| {
-        n.value.module_id == "device.sink"
-            && n.value.params.get("device_id")
+/// Easy mode's output sinks of a kind: those the primary feeds, or nothing feeds
+/// yet. A virtual pad Advanced mode feeds from elsewhere isn't the panel's.
+fn managed_sinks_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> Vec<NodeId> {
+    let primary = super::subpatches::primary(&canvas.snarl);
+    super::wiring::managed_sinks(&canvas.snarl, primary)
+        .into_iter()
+        .filter(|&id| {
+            canvas.snarl.get_node(id)
+                .and_then(|n| n.params.get("device_id"))
                 .and_then(|v| v.as_str())
-                .map(|did| model_kind(did) == kind_prefix_str)
-                .unwrap_or(false)
-    })
+                .is_some_and(|did| model_kind(did) == kind_prefix_str)
+        })
+        .collect()
+}
+
+pub(crate) fn has_sink_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> bool {
+    !managed_sinks_of_kind(canvas, kind_prefix_str).is_empty()
 }
 
 fn sink_node_of_kind(canvas: &Canvas, kind_prefix_str: &str) -> Option<NodeId> {
-    canvas.snarl.nodes_ids_data()
-        .find(|(_, n)| {
-            n.value.module_id == "device.sink"
-                && n.value.params.get("device_id")
-                    .and_then(|v| v.as_str())
-                    .map(|did| model_kind(did) == kind_prefix_str)
-                    .unwrap_or(false)
-        })
-        .map(|(id, _)| id)
+    managed_sinks_of_kind(canvas, kind_prefix_str).first().copied()
 }
 
-fn remove_sinks_of_kind(canvas: &mut Canvas, kind_prefix_str: &str) {
-    let to_remove: Vec<NodeId> = canvas.snarl.nodes_ids_data()
-        .filter(|(_, n)| {
-            n.value.module_id == "device.sink"
-                && n.value.params.get("device_id")
-                    .and_then(|v| v.as_str())
-                    .map(|did| model_kind(did) == kind_prefix_str)
-                    .unwrap_or(false)
-        })
-        .map(|(id, _)| id)
-        .collect();
-    for id in to_remove { canvas.snarl.remove_node(id); }
+/// Take the outputs of a kind off the primary (the nodes go, unless Advanced
+/// mode wires them elsewhere too).
+pub(crate) fn remove_sinks_of_kind(canvas: &mut Canvas, kind_prefix_str: &str) {
+    for id in managed_sinks_of_kind(canvas, kind_prefix_str) {
+        super::wiring::release_sink(canvas, id);
+    }
 }
 
 fn ensure_sink_of_kind(
@@ -2216,24 +2239,42 @@ fn ensure_sink_of_kind(
     defaults: DeviceParamDefaults,
 ) {
     if has_sink_of_kind(canvas, kind_id) { return; }
+    // A pad of this kind this canvas already has a node for is Advanced mode's
+    // (it isn't one of Easy mode's, or the check above would have found it): the
+    // primary gets a pad of its own rather than a second wire into that one.
+    let on_canvas = |id: &str| canvas.snarl.nodes_ids_data().any(|(_, n)| {
+        n.value.module_id == "device.sink"
+            && n.value.params.get("device_id").and_then(|v| v.as_str()) == Some(id)
+    });
     let existing: Option<String> = {
         let devs = pool.lock().unwrap();
         devs.iter()
-            .find(|d| kind_prefix(d.id()) == kind_id)
+            .find(|d| kind_prefix(d.id()) == kind_id && !on_canvas(d.id()))
             .map(|d| d.id().to_string())
     };
-    if existing.is_some() {
+    let before: Vec<NodeId> = canvas.snarl.node_ids().map(|(id, _)| id).collect();
+    if let Some(id) = existing {
         let devs = pool.lock().unwrap();
-        if let Some(d) = devs.iter().find(|d| kind_prefix(d.id()) == kind_id) {
+        if let Some(d) = devs.iter().find(|d| d.id() == id) {
             canvas.add_virtual_sink(d.as_ref(), default_collapsed, defaults);
         }
     } else if is_known_kind(kind_id) {
         // Unknown on a platform without this kind (no virtual devices on Linux
-        // yet); create_device would panic.
-        let dev = create_device(kind_id, 0);
+        // yet); create_device would panic. The first instance free of every pad
+        // in the pool and on this canvas - instance 0 on a patch Easy mode built.
+        let taken = |id: &str| on_canvas(id) || pool.lock().unwrap().iter().any(|d| d.id() == id);
+        let Some(instance) = (0..64)
+            .find(|&i| !taken(&if i == 0 { kind_id.to_string() } else { format!("{kind_id}.{i}") }))
+        else { return };
+        // There's one keyboard and mouse: a second would only fight the first.
+        if instance > 0 && kind_id == KIND_KEYMOUSE { return; }
+        let dev = create_device(kind_id, instance);
         canvas.add_virtual_sink(dev.as_ref(), default_collapsed, defaults);
         let mut devs = pool.lock().unwrap();
         devs.push(dev);
+    }
+    if let Some(new) = canvas.snarl.node_ids().map(|(id, _)| id).find(|id| !before.contains(id)) {
+        super::layout::place_beside_primary(canvas, new);
     }
     super::layout::reposition_io_nodes(canvas);
 }

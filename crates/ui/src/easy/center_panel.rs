@@ -6,11 +6,13 @@
 //!     section, drag-handles that let the user reorder.
 //!   * Active-preset display with re-pick / dirty indicator.
 //! Body:
-//!   * If the canvas isn't preset-shaped → "incompatible" message.
-//!   * Otherwise renders the sub-patch's inner snarl via
-//!     `Canvas::show`, the same path the Sub-Patch editor window
-//!     uses. Changes are written back into the outer sub-patch
-//!     node's `subpatch` field each frame.
+//!   * Any canvas: Easy mode shows the sub-patches marked for it
+//!     (`super::subpatches`), each a section of the tab row over the body
+//!     holding that sub-patch's layout tabs. The preset bar and the body are
+//!     the shown sub-patch's.
+//!   * Renders the sub-patch's inner snarl via `Canvas::show`, the same path
+//!     the Sub-Patch editor window uses. Changes are written back into the
+//!     outer sub-patch node's `subpatch` field each frame.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,12 +28,6 @@ use crate::app::{EasyState, PanicShortcut};
 use crate::canvas::node::UiSubPatch;
 use crate::canvas::{Canvas, DeviceParamDefaults, NodeData};
 use super::presets::{load_index, PresetInfo, PresetSource};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Compat {
-    Ok,
-    Incompatible,
-}
 
 pub fn show(
     ui: &mut egui::Ui,
@@ -61,7 +57,9 @@ pub fn show(
     //      back to scanning the preset index for a content-hash
     //      match against the live sub-patch.
     restore_preset_link(canvas, easy_state, &presets);
-    let compat = check_compat(canvas);
+    // Settle which sub-patch shows: the one picked while it's still Easy mode's,
+    // else the primary.
+    easy_state.shown = find_subpatch(canvas, easy_state).map(|id| id.0);
 
     // Resolve gamepad preset-nav state (open flag + highlight) BEFORE the
     // dropdown renders, so the body can glow the highlighted row this frame.
@@ -87,32 +85,140 @@ pub fn show(
     ui.add_space(6.0);
     ui.separator();
 
-    match compat {
-        Compat::Incompatible => {
+    // Any canvas will do: Easy mode shows its sub-patches and leaves the rest of
+    // the patch to Advanced mode. (It used to refuse anything but device nodes
+    // around a single sub-patch.)
+    match find_subpatch(canvas, easy_state) {
+        None => {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.heading("Current patch is incompatible with Easy mode");
-                ui.label("Switch to Advanced mode and remove any modules apart from a Sub-patch.");
+                ui.label(egui::RichText::new("Pick a preset above to begin.").weak());
             });
         }
-        Compat::Ok => {
-            if find_subpatch(canvas).is_none() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
-                    ui.label(egui::RichText::new("Pick a preset above to begin.").weak());
-                });
-            } else {
-                let cursor = if gamepad_nav.cursor_visible {
-                    Some(gamepad_nav.cursor_pos)
-                } else { None };
-                render_subpatch_body(
-                    ui, canvas, defaults,
-                    descriptors, physical_devices, live_device_ids,
-                    live_signals, panic_shortcut, device_rates, cursor,
-                );
+        Some(outer_id) => {
+            if section_row(ui, canvas, easy_state) {
+                gamepad_nav.module_part = None;
+                gamepad_nav.module_field = None;
+                gamepad_nav.module_part_item = None;
+            }
+            // The row may just have shown another sub-patch.
+            let outer_id = find_subpatch(canvas, easy_state).unwrap_or(outer_id);
+            let cursor = if gamepad_nav.cursor_visible {
+                Some(gamepad_nav.cursor_pos)
+            } else { None };
+            render_subpatch_body(
+                ui, canvas, outer_id, defaults,
+                descriptors, physical_devices, live_device_ids,
+                live_signals, panic_shortcut, device_rates, cursor,
+            );
+        }
+    }
+}
+
+/// Easy mode's row of tabs across the top of the body: a section per sub-patch
+/// it shows, the primary's first, each holding that sub-patch's layout tabs (one
+/// tab, named for the sub-patch, for a layout without tabs) with the
+/// sub-patch's icon before each name. A click shows a tab - the sub-patch's,
+/// and its layout's tab. While a layout is edited, a double click renames a tab
+/// (a lone tab renames its sub-patch), a section's tabs after its first have a
+/// ×, and each section ends in a + for another tab of its own. Nothing is drawn
+/// for fewer than two tabs in all. Returns whether another page shows.
+fn section_row(ui: &mut egui::Ui, canvas: &mut Canvas, easy_state: &mut EasyState) -> bool {
+    use super::subpatches;
+    let snarl = &canvas.snarl;
+    if subpatches::pages(snarl).len() < 2 {
+        return false;
+    }
+    let list = subpatches::easy_list(snarl);
+    let Some((shown, shown_tab)) = subpatches::current_page(snarl, easy_state.shown) else { return false };
+    let edit = snarl.get_node(shown).is_some_and(|n| n.extra.layout_unlocked);
+    let sections: Vec<crate::canvas::viewer::TabSection> = list
+        .iter()
+        .map(|&id| {
+            let tabs = snarl.get_node(id).and_then(|n| n.subpatch.as_ref()).map(|sp| sp.layout_tabs.clone()).unwrap_or_default();
+            crate::canvas::viewer::TabSection {
+                icon: subpatches::icon(snarl, id).to_string(),
+                names: if tabs.len() >= 2 { tabs } else { vec![subpatches::name(snarl, id)] },
+                primary: Some(id) == subpatches::primary(snarl),
+            }
+        })
+        .collect();
+    let active = (list.iter().position(|&id| id == shown).unwrap_or(0), shown_tab);
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), crate::canvas::viewer::TAB_ROW_H),
+        egui::Sense::hover(),
+    );
+    let act = crate::canvas::viewer::section_tab_row(ui, row_rect, &sections, active, edit, egui::Id::new("easy_section_row"));
+
+    let mut shown_changed = false;
+    if let Some((s, name)) = act.rename {
+        if let Some(&id) = list.get(s.0) {
+            let single = sections[s.0].names.len() < 2;
+            let name = name.trim().to_string();
+            if let Some(n) = canvas.snarl.get_node_mut(id).filter(|_| !name.is_empty()) {
+                if single {
+                    // Its lone tab is named for the sub-patch: that's what's renamed.
+                    n.display_name = name.clone();
+                    if let Some(sp) = n.subpatch.as_mut() {
+                        sp.display_name = name;
+                    }
+                } else if let Some(t) = n.subpatch.as_mut().and_then(|sp| sp.layout_tabs.get_mut(s.1)) {
+                    *t = name;
+                }
             }
         }
     }
+    if let Some((s, k)) = act.remove.filter(|&(_, k)| k > 0) {
+        if let Some(sp) = list.get(s).and_then(|&id| canvas.snarl.get_node_mut(id)).and_then(|n| n.subpatch.as_mut()) {
+            let (mut active, mut sel, mut sels) = (sp.active_tab, sp.selected_item, std::mem::take(&mut sp.selected_items));
+            crate::canvas::viewer::TabRowAct { remove: Some(k), ..Default::default() }
+                .apply(&mut sp.layout_tabs, &mut sp.items, &mut active, &mut sel, &mut sels);
+            sp.active_tab = active;
+            sp.selected_item = sel;
+            sp.selected_items = sels;
+        }
+    }
+    let mut show: Option<(egui_snarl::NodeId, usize)> = act.show.and_then(|(s, k)| list.get(s).map(|&id| (id, k)));
+    if let Some(s) = act.add {
+        if let Some(&id) = list.get(s) {
+            let name = subpatches::name(&canvas.snarl, id);
+            if let Some(sp) = canvas.snarl.get_node_mut(id).and_then(|n| n.subpatch.as_mut()) {
+                // A layout's first tab is what it showed until now: it keeps the
+                // sub-patch's name, as its tab had.
+                if sp.layout_tabs.is_empty() {
+                    sp.layout_tabs = vec![name];
+                }
+                if let Some(k) = crate::canvas::viewer::add_layout_tab(&mut sp.layout_tabs) {
+                    show = Some((id, k));
+                }
+            }
+        }
+    }
+    if let Some((id, k)) = show {
+        shown_changed = subpatches::show_page(&mut canvas.snarl, &mut easy_state.shown, id, k);
+    }
+    // Picking an icon, or which sub-patch is primary, from a tab's menu.
+    if let Some((s, icon)) = act.icon {
+        if let Some(&id) = list.get(s) {
+            subpatches::set_icon(&mut canvas.snarl, id, icon);
+        }
+    }
+    if let Some(s) = act.make_primary {
+        if let Some(&id) = list.get(s) {
+            super::wiring::move_primary(&mut canvas.snarl, id);
+            super::layout::reposition_io_nodes(canvas);
+        }
+    }
+    if let Some(s) = act.hide {
+        if let Some(&id) = list.get(s).filter(|&&id| Some(id) != subpatches::primary(&canvas.snarl)) {
+            subpatches::set_in_easy(&mut canvas.snarl, id, false);
+            if let Some(n) = canvas.snarl.get_node_mut(id) {
+                n.extra.layout_unlocked = false;
+            }
+            shown_changed = true;
+        }
+    }
+    shown_changed
 }
 
 // ── Preset dropdown ─────────────────────────────────────────────────
@@ -144,7 +250,9 @@ fn show_preset_picker(
 ) {
     ui.add_space(6.0);
 
-    let active_path = easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
+    // The bar is the shown sub-patch's: its preset, its name, its layout.
+    let outer_id = find_subpatch(canvas, easy_state);
+    let active_path = easy_state.link(outer_id).map(|(p, _)| p.clone());
     let active_is_fav = active_path.as_ref()
         .map(|p| favorites.iter().any(|f| f == p))
         .unwrap_or(false);
@@ -152,7 +260,6 @@ fn show_preset_picker(
     //   1. live sub-patch's `display_name` (user title) if non-empty
     //   2. otherwise the loaded preset file's stem
     //   3. otherwise "(unsaved)"
-    let outer_id = find_subpatch(canvas);
     let live_title: String = outer_id
         .and_then(|id| canvas.snarl.get_node(id))
         .and_then(|n| n.subpatch.as_ref())
@@ -286,12 +393,22 @@ fn show_preset_picker(
             ui.label(egui::RichText::new("Layout editor").strong());
             ui.add_space(8.0);
         }
+        // With other sub-patches on the row, a layout without tabs shows as one tab named for
+        // its sub-patch: a first tab added from the picker keeps that name, as one added with
+        // the row's + does.
+        let row_name = outer_id
+            .filter(|_| super::subpatches::easy_list(&canvas.snarl).len() >= 2)
+            .map(|id| super::subpatches::name(&canvas.snarl, id));
         if let Some(sp) = outer_id
             .and_then(|id| canvas.snarl.get_node_mut(id))
             .and_then(|n| n.subpatch.as_mut())
         {
+            let had_tabs = sp.layout_tabs.len() >= 2;
             crate::canvas::viewer::layout_toolbar_controls_core(
                 ui, &mut crate::canvas::viewer::LayoutStateMut::of_subpatch(sp));
+            if let Some(name) = row_name.filter(|_| !had_tabs && sp.layout_tabs.len() >= 2) {
+                sp.layout_tabs[0] = name;
+            }
         }
     } else {
         let ui = &mut row_ui;
@@ -396,7 +513,7 @@ fn show_preset_picker(
                     if let Some(path) = crate::app::save_subpatch_file(&sp) {
                         super::presets::invalidate_index();
                         let hash = hash_subpatch(&sp);
-                        easy_state.loaded_preset = Some((path, hash));
+                        easy_state.loaded_preset.insert(oid.0, (path, hash));
                     }
                 }
             }
@@ -705,9 +822,9 @@ fn preset_name_widget(
     display_name: &str,
     dirty: bool,
     canvas: &mut Canvas,
-    _easy_state: &mut EasyState,
+    easy_state: &mut EasyState,
 ) {
-    let outer_id = find_subpatch(canvas);
+    let outer_id = find_subpatch(canvas, easy_state);
     let editing_key = egui::Id::new(("easy_preset_name_editing",
         outer_id.map(|n| n.0).unwrap_or(0)));
     let buffer_key = egui::Id::new(("easy_preset_name_buffer",
@@ -779,7 +896,7 @@ fn preset_dropdown_body(
     }
 
     let ctx = ui.ctx().clone();
-    let active_path = easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
+    let active_path = easy_state.link(find_subpatch(canvas, easy_state)).map(|(p, _)| p.clone());
 
     // ── Favorites ─────────────────────────────────────────────
     let fav_entries: Vec<&PresetInfo> = favorites.iter()
@@ -1048,7 +1165,7 @@ fn handle_row_action(
     match action {
         RowAction::None => {}
         RowAction::Pick => {
-            let active = easy_state.loaded_preset.as_ref()
+            let active = easy_state.link(find_subpatch(canvas, easy_state))
                 .map(|(p2, _)| p2.as_path()) == Some(p.path.as_path());
             if !active {
                 if is_subpatch_dirty(canvas, easy_state, presets) {
@@ -1073,14 +1190,14 @@ fn handle_row_action(
 /// Apply a sub-patch loaded directly from a file (Save/Load button
 /// path). Mirrors apply_preset but doesn't require a PresetInfo —
 /// the on-disk path is unknown to our index so we treat it as
-/// "ad-hoc": loaded_preset is cleared.
+/// "ad-hoc": loaded_preset is cleared. It goes into the sub-patch showing.
 fn apply_subpatch_inline(
     canvas: &mut Canvas,
     easy_state: &mut EasyState,
     sp: &UiSubPatch,
     source_path: Option<PathBuf>,
 ) {
-    let existing: Option<NodeId> = find_subpatch(canvas);
+    let existing: Option<NodeId> = find_subpatch(canvas, easy_state);
     let node_id = match existing {
         Some(id) => id,
         None => {
@@ -1105,8 +1222,13 @@ fn apply_subpatch_inline(
         }
         mirror_pins(n, sp);
     }
+    super::wiring::drop_stale_wires(&mut canvas.snarl, node_id);
     let hash = hash_subpatch(sp);
-    easy_state.loaded_preset = source_path.map(|p| (p, hash));
+    match source_path {
+        Some(p) => { easy_state.loaded_preset.insert(node_id.0, (p, hash)); }
+        None => { easy_state.loaded_preset.remove(&node_id.0); }
+    }
+    easy_state.shown = Some(node_id.0);
     easy_state.overlay_reload_node = Some(node_id.0);
     super::wiring::rewire(canvas);
     super::layout::reposition_io_nodes(canvas);
@@ -1142,121 +1264,14 @@ fn show_pending_modal(
         });
 }
 
-// ── Compatibility check ─────────────────────────────────────────────
-
-fn check_compat(canvas: &Canvas) -> Compat {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for (_, n) in canvas.snarl.nodes_ids_data() {
-        *counts.entry(n.value.module_id.clone()).or_default() += 1;
-    }
-    let allowed = ["device.source", "subpatch", "device.sink"];
-    for k in counts.keys() {
-        if !allowed.iter().any(|a| a == k) { return Compat::Incompatible; }
-    }
-    // ⭐ As many input devices as the sub-patch has AutoMap inlets.
-    //
-    // ❗ This was pinned at one, which made multi-device Easy mode
-    // unreachable from the UI that offers it: the picker lets you choose up to
-    // `input_capacity` gamepads — the wiring layer has always given each its own
-    // port — and then the patch was declared incompatible the moment a second
-    // one was chosen. A Joy-Con 2 grip is the obvious casualty, being two
-    // devices for one pair of hands.
-    //
-    // The SAME helper the picker caps itself with, so the two cannot drift
-    // apart again: a preset with one inlet still admits exactly one source, and
-    // no preset can be configured into a state the check then rejects.
-    if counts.get("device.source").copied().unwrap_or(0)
-        > super::io_panel::input_capacity(canvas)
-    {
-        return Compat::Incompatible;
-    }
-    if counts.get("subpatch").copied().unwrap_or(0) > 1     { return Compat::Incompatible; }
-
-    let mut by_kind: HashMap<String, usize> = HashMap::new();
-    for (_, n) in canvas.snarl.nodes_ids_data() {
-        if n.value.module_id != "device.sink" { continue; }
-        if let Some(did) = n.value.params.get("device_id").and_then(|v| v.as_str()) {
-            let prefix: String = did.split('.').take(2).collect::<Vec<_>>().join(".");
-            *by_kind.entry(prefix).or_default() += 1;
-        }
-    }
-    if by_kind.values().any(|v| *v > 1) { return Compat::Incompatible; }
-    Compat::Ok
-}
-
-#[cfg(test)]
-mod compat_tests {
-    use super::*;
-    use crate::canvas::NodeData;
-    use flexinput_core::{PinDescriptor, SignalType};
-
-    fn node(module_id: &str, automap_inlets: usize) -> NodeData {
-        NodeData {
-            module_id: module_id.into(),
-            display_name: String::new(),
-            category: String::new(),
-            inputs: (0..automap_inlets)
-                .map(|_| PinDescriptor::new("in", SignalType::AutoMap))
-                .collect(),
-            outputs: Vec::new(),
-            params: Default::default(),
-            subpatch: None,
-            extra: Default::default(),
-        }
-    }
-
-    fn canvas_with(inlets: usize, sources: usize) -> Canvas {
-        let mut c = Canvas::default();
-        c.snarl.insert_node(egui::pos2(0.0, 0.0), node("subpatch", inlets));
-        for i in 0..sources {
-            c.snarl
-                .insert_node(egui::pos2(0.0, 40.0 * (i + 1) as f32), node("device.source", 0));
-        }
-        c
-    }
-
-    /// ⛔ A preset with N AutoMap inlets must accept N input devices.
-    ///
-    /// The picker offers exactly that many, so anything stricter here declares
-    /// the patch broken for a configuration the UI just invited. A Joy-Con 2
-    /// grip is two devices for one pair of hands, and this is what stopped it
-    /// working in Easy mode.
-    #[test]
-    fn a_multi_inlet_preset_accepts_one_device_per_inlet() {
-        for n in 1..=4 {
-            assert!(
-                matches!(check_compat(&canvas_with(n, n)), Compat::Ok),
-                "{n} inlets with {n} sources was rejected",
-            );
-        }
-    }
-
-    /// …and one more than it has inlets is genuinely incompatible: there is no
-    /// port left to wire it to.
-    #[test]
-    fn more_devices_than_inlets_is_still_incompatible() {
-        assert!(matches!(check_compat(&canvas_with(2, 3)), Compat::Incompatible));
-        assert!(matches!(check_compat(&canvas_with(1, 2)), Compat::Incompatible));
-    }
-
-    /// The single-inlet case must behave exactly as it always did — that is the
-    /// whole existing preset library.
-    #[test]
-    fn a_single_inlet_preset_is_unchanged() {
-        assert!(matches!(check_compat(&canvas_with(1, 1)), Compat::Ok));
-        assert!(matches!(check_compat(&canvas_with(1, 0)), Compat::Ok));
-    }
-}
-
-fn find_subpatch(canvas: &Canvas) -> Option<NodeId> {
-    canvas.snarl.nodes_ids_data()
-        .find(|(_, n)| n.value.module_id == "subpatch")
-        .map(|(id, _)| id)
+/// The sub-patch Easy mode shows: the tab row's pick, else the primary.
+fn find_subpatch(canvas: &Canvas, easy_state: &EasyState) -> Option<NodeId> {
+    super::subpatches::shown(&canvas.snarl, easy_state.shown)
 }
 
 /// The Easy sub-patch whose layout is being edited, if it is.
-pub(crate) fn layout_editing_subpatch(canvas: &Canvas) -> Option<NodeId> {
-    find_subpatch(canvas)
+pub(crate) fn layout_editing_subpatch(canvas: &Canvas, easy_state: &EasyState) -> Option<NodeId> {
+    find_subpatch(canvas, easy_state)
         .filter(|&id| canvas.snarl.get_node(id).is_some_and(|n| n.extra.layout_unlocked))
 }
 
@@ -1310,6 +1325,7 @@ fn nav_focus_id(outer_id: NodeId) -> egui::Id {
 fn render_subpatch_body(
     ui: &mut egui::Ui,
     canvas: &mut Canvas,
+    outer_id: NodeId,
     _defaults: DeviceParamDefaults,
     _descriptors: &[ModuleDescriptor],
     _physical_devices: &[PhysicalDevice],
@@ -1319,7 +1335,7 @@ fn render_subpatch_body(
     _device_rates: &HashMap<String, u32>,
     nav_cursor: Option<egui::Pos2>,
 ) {
-    let Some(outer_id) = find_subpatch(canvas) else { return; };
+    if canvas.snarl.get_node(outer_id).is_none() { return; }
 
     // Measure the sub-patch's natural body bbox so we can pick a
     // scale that fits the panel width without overflow.
@@ -1337,26 +1353,8 @@ fn render_subpatch_body(
         })
         .unwrap_or((120.0, 40.0));
 
-    // With two tabs or more, their row across the top of the panel - staying put as the layout
-    // scrolls, and not scaled with it - and the layout beneath.
-    let (row_tabs, row_active, row_edit) = canvas.snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref().map(|sp| (sp.layout_tabs.clone(), sp.active_tab, n.extra.layout_unlocked)))
-        .unwrap_or_default();
-    if row_tabs.len() >= 2 {
-        let (row_rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), crate::canvas::viewer::TAB_ROW_H),
-            egui::Sense::hover(),
-        );
-        let act = crate::canvas::viewer::tab_row(
-            ui, row_rect, &row_tabs, row_active, row_edit, egui::Id::new(("easy_tab_row", outer_id.0)),
-        );
-        if act.any() {
-            if let Some(sp) = canvas.snarl.get_node_mut(outer_id).and_then(|n| n.subpatch.as_mut()) {
-                act.apply(&mut sp.layout_tabs, &mut sp.items, &mut sp.active_tab, &mut sp.selected_item, &mut sp.selected_items);
-            }
-        }
-    }
-
+    // The row of tabs (`section_row`, drawn by the caller) is across the top of the panel,
+    // staying put as the layout scrolls and not scaled with it; the layout is beneath.
     let panel_rect = ui.available_rect_before_wrap();
     let panel_w = panel_rect.width().max(40.0);
     let panel_h = panel_rect.height().max(40.0);
@@ -1713,7 +1711,8 @@ fn render_subpatch_body(
 /// or a second: long enough for an indicator, but anything that acts on the answer
 /// asks [`is_subpatch_dirty`] itself.
 fn is_subpatch_dirty_cached(canvas: &Canvas, easy_state: &mut EasyState, presets: &[PresetInfo]) -> bool {
-    let key = (canvas.mutation_gen, easy_state.loaded_preset.as_ref().map(|(_, h)| *h));
+    let outer_id = find_subpatch(canvas, easy_state);
+    let key = (canvas.mutation_gen, outer_id.map(|id| id.0), easy_state.link(outer_id).map(|(_, h)| *h));
     if let Some((at, k, dirty)) = easy_state.dirty_cache {
         if k == key && at.elapsed() < std::time::Duration::from_secs(1) {
             return dirty;
@@ -1725,12 +1724,12 @@ fn is_subpatch_dirty_cached(canvas: &Canvas, easy_state: &mut EasyState, presets
 }
 
 fn is_subpatch_dirty(canvas: &Canvas, easy_state: &EasyState, presets: &[PresetInfo]) -> bool {
-    let Some(outer_id) = find_subpatch(canvas) else { return false; };
+    let Some(outer_id) = find_subpatch(canvas, easy_state) else { return false; };
     let Some(sp) = canvas.snarl.get_node(outer_id).and_then(|n| n.subpatch.as_ref()) else {
         return false;
     };
     let current_hash = hash_subpatch(sp);
-    if let Some((_, loaded_hash)) = &easy_state.loaded_preset {
+    if let Some((_, loaded_hash)) = easy_state.link(Some(outer_id)) {
         if *loaded_hash == current_hash { return false; }
     }
     !presets.iter().any(|p| p.content_hash == current_hash)
@@ -1815,7 +1814,7 @@ fn show_gamepad_preset_nav(
     if std::mem::take(&mut gamepad_nav.preset_nav_select) {
         let path = order[gamepad_nav.preset_nav_index].clone();
         if let Some(p) = presets.iter().find(|p| p.path == path) {
-            let active = easy_state.loaded_preset.as_ref()
+            let active = easy_state.link(find_subpatch(canvas, easy_state))
                 .map(|(p2, _)| p2.as_path()) == Some(p.path.as_path());
             if !active {
                 if is_subpatch_dirty(canvas, easy_state, presets) {
@@ -1848,7 +1847,8 @@ fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo)
     };
     let Ok(file): Result<crate::app::SubPatchFile, _> = serde_json::from_slice(&bytes) else { return; };
 
-    let existing: Option<NodeId> = find_subpatch(canvas);
+    // Into the sub-patch showing; a new one (the primary) on a canvas with none.
+    let existing: Option<NodeId> = find_subpatch(canvas, easy_state);
     let node_id = match existing {
         Some(id) => id,
         None => {
@@ -1876,8 +1876,12 @@ fn apply_preset(canvas: &mut Canvas, easy_state: &mut EasyState, p: &PresetInfo)
         n.display_name = p.display_name.clone();
         mirror_pins(n, &file.sub_patch);
     }
+    // Wires Advanced mode made into a secondary sub-patch stay where its new pins
+    // still have them; any on a pin that's gone go.
+    super::wiring::drop_stale_wires(&mut canvas.snarl, node_id);
 
-    easy_state.loaded_preset = Some((p.path.clone(), p.content_hash));
+    easy_state.loaded_preset.insert(node_id.0, (p.path.clone(), p.content_hash));
+    easy_state.shown = Some(node_id.0);
     // The freshly-loaded sub-patch carries its own overlay/config pins — ask
     // `show` to re-materialize them onto the tab overlays for this node.
     easy_state.overlay_reload_node = Some(node_id.0);
@@ -1897,43 +1901,45 @@ fn mirror_pins(node: &mut NodeData, sp: &UiSubPatch) {
 
 /// Lazy restore of `easy_state.loaded_preset` after app reopen.
 ///
-/// `PersistedTab`/`UiPatch` stores only the preset path; the in-memory
-/// hash is initialized to 0 as a sentinel. On first frame after load
-/// we either confirm the link by hashing the saved file's contents
-/// against the live sub-patch, or — if the file is gone or its bytes
-/// no longer match — search the preset index for a content-hash match
-/// and link to whichever preset still matches.
+/// `PersistedTab`/`UiPatch` stores only the preset paths; the in-memory
+/// hashes are initialized to 0 as a sentinel. On first frame after load
+/// we either confirm each sub-patch's link by hashing the saved file's
+/// contents against the live sub-patch, or — if the file is gone or its
+/// bytes no longer match — search the preset index for a content-hash
+/// match and link to whichever preset still matches. A link whose
+/// sub-patch is gone goes.
 fn restore_preset_link(canvas: &Canvas, easy_state: &mut EasyState, presets: &[PresetInfo]) {
-    let Some((_, hash)) = easy_state.loaded_preset.as_ref() else { return; };
-    if *hash != 0 { return; } // already restored this session
-    let Some(outer_id) = find_subpatch(canvas) else {
-        easy_state.loaded_preset = None;
-        return;
-    };
-    let live_hash = canvas.snarl.get_node(outer_id)
-        .and_then(|n| n.subpatch.as_ref())
-        .map(|sp| hash_subpatch(sp));
-    let Some(live_hash) = live_hash else {
-        easy_state.loaded_preset = None;
-        return;
-    };
-    let saved_path = easy_state.loaded_preset.as_ref().unwrap().0.clone();
-    // Path-first match: same file still on disk and bytes match live.
-    if let Ok(bytes) = std::fs::read(&saved_path) {
-        if let Ok(file) = serde_json::from_slice::<crate::app::SubPatchFile>(&bytes) {
-            if hash_subpatch(&file.sub_patch) == live_hash {
-                easy_state.loaded_preset = Some((saved_path, live_hash));
-                return;
+    let pending: Vec<usize> = easy_state.loaded_preset.iter()
+        .filter(|(_, (_, hash))| *hash == 0) // the rest were restored this session
+        .map(|(id, _)| *id)
+        .collect();
+    for id in pending {
+        let live_hash = canvas.snarl.get_node(NodeId(id))
+            .filter(|n| n.module_id == "subpatch")
+            .and_then(|n| n.subpatch.as_ref())
+            .map(|sp| hash_subpatch(sp));
+        let Some(live_hash) = live_hash else {
+            easy_state.loaded_preset.remove(&id);
+            continue;
+        };
+        let saved_path = easy_state.loaded_preset[&id].0.clone();
+        // Path-first match: same file still on disk and bytes match live.
+        if let Ok(bytes) = std::fs::read(&saved_path) {
+            if let Ok(file) = serde_json::from_slice::<crate::app::SubPatchFile>(&bytes) {
+                if hash_subpatch(&file.sub_patch) == live_hash {
+                    easy_state.loaded_preset.insert(id, (saved_path, live_hash));
+                    continue;
+                }
             }
         }
-    }
-    // Hash fallback: any preset in the index whose disk hash matches
-    // the live sub-patch wins. Loses the link only if the user has
-    // edited the sub-patch in any way that changes its serialization.
-    if let Some(p) = presets.iter().find(|p| p.content_hash == live_hash) {
-        easy_state.loaded_preset = Some((p.path.clone(), live_hash));
-    } else {
-        easy_state.loaded_preset = None;
+        // Hash fallback: any preset in the index whose disk hash matches
+        // the live sub-patch wins. Loses the link only if the user has
+        // edited the sub-patch in any way that changes its serialization.
+        if let Some(p) = presets.iter().find(|p| p.content_hash == live_hash) {
+            easy_state.loaded_preset.insert(id, (p.path.clone(), live_hash));
+        } else {
+            easy_state.loaded_preset.remove(&id);
+        }
     }
 }
 
@@ -2069,7 +2075,7 @@ mod nav_scroll_tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.scope_builder(egui::UiBuilder::new().max_rect(PANEL), |ui| {
                         render_subpatch_body(
-                            ui, canvas, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
+                            ui, canvas, outer, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
                             &HashMap::new(), &PanicShortcut::default(), &HashMap::new(), None,
                         );
                     });
@@ -2234,7 +2240,7 @@ mod nav_scroll_tests {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             ui.scope_builder(egui::UiBuilder::new().max_rect(PANEL), |ui| {
                                 render_subpatch_body(
-                                    ui, canvas, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
+                                    ui, canvas, outer, DeviceParamDefaults::default(), &[], &[], &HashSet::new(),
                                     &HashMap::new(), &PanicShortcut::default(), &HashMap::new(), None,
                                 );
                             });
@@ -3731,7 +3737,7 @@ mod layout_editor_shots {
                         let center = egui::Rect::from_min_max(egui::pos2(left.right() + 6.0, total.top()), total.max);
                         ui.painter().rect_filled(left, 0.0, egui::Color32::from_gray(0x1a));
                         ui.scope_builder(egui::UiBuilder::new().max_rect(left.shrink2(egui::vec2(10.0, 0.0))), |ui| {
-                            match layout_editing_subpatch(&canvas) {
+                            match layout_editing_subpatch(&canvas, &easy_state) {
                                 Some(id) => show_layout_inspector(ui, &mut canvas, id),
                                 None => {
                                     ui.add_space(44.0);
@@ -3757,6 +3763,77 @@ mod layout_editor_shots {
                 (true, _) => "easy_header_editing",
                 _ => "easy_header_browse",
             };
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/module_shots")
+                .join(format!("{name}.png"));
+            shot.save(&ctx, &shapes, screen, 1.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
+    }
+
+    /// Two sub-patches in Easy mode: the primary with two layout tabs, a second one
+    /// ticked for Easy mode, each with an icon, on a patch with a module of its own
+    /// beside them (which once made the patch "incompatible"). The row's sections, the
+    /// second's tab showing, browsing and editing. Writes
+    /// `target/module_shots/easy_section_tabs{,_editing}.png`.
+    #[test]
+    #[ignore]
+    fn shoot_easy_section_tabs() {
+        let _index = super::super::presets::INDEX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let desc = |id: &str| flexinput_modules::all_modules()
+            .into_iter()
+            .map(|r| r.descriptor)
+            .find(|d| d.id == id)
+            .expect("the module");
+        for editing in [false, true] {
+            let ctx = egui::Context::default();
+            crate::app::fonts::setup_fonts(&ctx);
+            let mut canvas = Canvas::new();
+            let mut add = |name: &str, tabs: &[&str], icon: &str, color: [u8; 4]| {
+                let oid = canvas.snarl.insert_node(egui::pos2(0.0, 0.0), NodeData::from(&desc("subpatch")));
+                let n = canvas.snarl.get_node_mut(oid).unwrap();
+                let mut sp = UiSubPatch::default();
+                sp.display_name = name.into();
+                n.display_name = name.into();
+                sp.layout_tabs = tabs.iter().map(|t| t.to_string()).collect();
+                let mut rect = crate::canvas::viewer::make_default_decoration("rect");
+                if let crate::canvas::node::LayoutDecoration::Rect { size, fill, .. } = &mut rect {
+                    *size = [260.0, 140.0];
+                    *fill = color;
+                }
+                sp.items.push(LayoutItem::Deco(rect));
+                n.subpatch = Some(Box::new(sp));
+                super::super::subpatches::set_icon(&mut canvas.snarl, oid, icon.into());
+                oid
+            };
+            let _main = add("Shooter", &["Aim", "Move"], "🎯", [40, 120, 255, 255]);
+            let drive = add("Driving", &[], "🚗", [255, 140, 40, 255]);
+            canvas.snarl.insert_node(egui::pos2(0.0, 300.0), NodeData::from(&desc("module.response_curve")));
+            super::super::subpatches::set_in_easy(&mut canvas.snarl, drive, true);
+            canvas.snarl.get_node_mut(drive).unwrap().extra.layout_unlocked = editing;
+            let mut easy_state = EasyState { shown: Some(drive.0), ..Default::default() };
+            let (mut overlay, mut config) = Default::default();
+            let mut nav = crate::gamepad_nav::GamepadNav::default();
+            let mut favorites = Vec::new();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 360.0));
+            let mut shot = crate::canvas::shot::Shot::default();
+            let mut shapes = Vec::new();
+            for i in 0..8 {
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(i as f64 / 30.0), ..Default::default() };
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show(
+                            ui, &mut canvas, &mut easy_state, &mut overlay, &mut config, None,
+                            Default::default(), &[], &[], &Default::default(), &Default::default(),
+                            &Default::default(), &Default::default(), &mut favorites, &mut nav,
+                        );
+                    });
+                });
+                shot.absorb(&out.textures_delta);
+                shapes = out.shapes;
+            }
+            assert_eq!(easy_state.shown, Some(drive.0), "the second sub-patch shows");
+            let name = if editing { "easy_section_tabs_editing" } else { "easy_section_tabs" };
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target/module_shots")
                 .join(format!("{name}.png"));

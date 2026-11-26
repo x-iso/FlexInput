@@ -328,7 +328,11 @@ Simplified preset-driven workflow:
 **Characteristics:**
 - Left panel slides in/out with collapse animation
 - No direct graph editing
-- Preset-based workflow (`.fxsp` files)
+- Any patch: Easy mode shows the top-level sub-patches ticked for it (`easy/subpatches.rs`),
+  each a section of the tab row above the body holding its own layout tabs; LB / RB walk
+  them all. The Devices panel wires only into and out of the **primary** sub-patch, and only
+  its own device nodes (`easy/wiring.rs` `Managed`); wiring made in Advanced mode is kept
+- Preset-based workflow (`.fxsp` files), a preset link per sub-patch
 - Pinned widgets for parameter access
 - Gamepad navigation optimized
 

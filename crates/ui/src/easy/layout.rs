@@ -48,7 +48,47 @@ pub fn reposition_io_nodes(canvas: &mut Canvas) {
     reposition_io_nodes_with_ctx(canvas, None);
 }
 
+/// Put a device node Easy mode just added to a canvas it doesn't arrange (see
+/// [`reposition_io_nodes_with_ctx`]) beside the primary sub-patch: a source
+/// under the last of Easy mode's sources at its left, a sink under the last sink
+/// at its right. Nothing else moves.
+pub fn place_beside_primary(canvas: &mut Canvas, id: NodeId) {
+    if super::subpatches::is_easy_shaped(&canvas.snarl) {
+        return; // `reposition_io_nodes` lays the columns out.
+    }
+    let snarl = &canvas.snarl;
+    let Some(p) = super::subpatches::primary(snarl) else { return };
+    let Some(p_pos) = snarl.get_node_info(p).map(|i| i.pos) else { return };
+    let is_source = snarl.get_node(id).is_some_and(|n| n.module_id == "device.source");
+    let column = if is_source {
+        super::wiring::managed_sources(snarl, Some(p))
+    } else {
+        super::wiring::managed_sinks(snarl, Some(p))
+    };
+    let (fb_h, x) = if is_source {
+        (FALLBACK_DEVICE_H, p_pos.x - EDGE_GAP - FALLBACK_DEVICE_W)
+    } else {
+        (FALLBACK_SINK_H, p_pos.x + FALLBACK_SUBPATCH_W + EDGE_GAP)
+    };
+    let y = column
+        .iter()
+        .filter(|&&n| n != id)
+        .filter_map(|&n| snarl.get_node_info(n).map(|i| i.pos.y + fb_h + STACK_GAP))
+        .fold(p_pos.y, f32::max);
+    if let Some(info) = canvas.snarl.get_node_info_mut(id) {
+        info.pos = egui::pos2(x, y);
+    }
+}
+
 pub fn reposition_io_nodes_with_ctx(canvas: &mut Canvas, ctx: Option<&egui::Context>) {
+    // Only a canvas Easy mode builds on its own - device nodes around one
+    // sub-patch - is Easy mode's to arrange. On any other the device nodes stay
+    // where the user put them: this runs every frame, and once Easy mode took
+    // canvases of every shape it would have gathered every pad on one into a
+    // column beside the first sub-patch.
+    if !super::subpatches::is_easy_shaped(&canvas.snarl) {
+        return;
+    }
     // Pull this canvas's measured node rects (canvas-space w/h), stashed by
     // `viewer::final_node_rect` each frame. With real sizes the I/O nodes hug
     // the sub-patch correctly AND reflow after the Layout editor resizes it. On

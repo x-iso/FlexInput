@@ -331,21 +331,11 @@ impl FlexInputApp {
     /// Toggle a virtual output sink on/off by kind prefix (xinput/ds4/keymouse),
     /// honoring the xinput⇄ds4 mutual exclusion the io_panel enforces.
     pub(crate) fn nav_toggle_output_sink(&mut self, kind: &str) {
-        use flexinput_virtual::kind_prefix;
+        // Easy mode's own outputs only - those the primary sub-patch feeds - as the
+        // card click does: a pad Advanced mode feeds from elsewhere stays.
         let canvas = &mut self.tabs[self.active_tab].canvas;
-        let has = canvas.snarl.nodes_ids_data().any(|(_, n)| {
-            n.value.module_id == "device.sink"
-                && n.value.params.get("device_id").and_then(|v| v.as_str())
-                    .map(|d| kind_prefix(d) == kind).unwrap_or(false)
-        });
-        let remove_kind = |canvas: &mut Canvas, k: &str| {
-            let ids: Vec<egui_snarl::NodeId> = canvas.snarl.nodes_ids_data()
-                .filter(|(_, n)| n.value.module_id == "device.sink"
-                    && n.value.params.get("device_id").and_then(|v| v.as_str())
-                        .map(|d| kind_prefix(d) == k).unwrap_or(false))
-                .map(|(id, _)| id).collect();
-            for id in ids { canvas.snarl.remove_node(id); }
-        };
+        let has = crate::easy::io_panel::has_sink_of_kind(canvas, kind);
+        let remove_kind = |canvas: &mut Canvas, k: &str| crate::easy::io_panel::remove_sinks_of_kind(canvas, k);
         if has {
             remove_kind(canvas, kind);
         } else {

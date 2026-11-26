@@ -1114,6 +1114,11 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
 
                 if is_subpatch {
                     let _ = has_pinned;
+                    // On the tab's own canvas: whether Easy mode shows this sub-patch,
+                    // which one is primary, and the icon its tabs carry there.
+                    if !self.is_inner_canvas {
+                        subpatch_easy_controls(ui, snarl, node);
+                    }
                     let edit_tooltip = format!("{} module{} inside", inner_count, if inner_count == 1 { "" } else { "s" });
                     if ui.small_button("Edit…").on_hover_text(edit_tooltip).clicked() {
                         self.edit_subpatch_request = Some(node);
@@ -2895,6 +2900,51 @@ pub(crate) fn module_has_body(module_id: &str) -> bool {
         | "module.touch_zones" | "module.input_viewer" | "module.menu"
         | "subpatch" | "subpatch.inlet" | "subpatch.outlet"
     )
+}
+
+/// A tab canvas's sub-patch header, for Easy mode: an "Easy" box showing the sub-patch
+/// there (the primary is always shown), and once the canvas has more than one sub-patch,
+/// "Primary" - the one Easy mode's Devices panel wires into - and the icon its tabs carry.
+fn subpatch_easy_controls(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node: NodeId) {
+    use crate::easy::subpatches as sps;
+    let is_primary = sps::primary(snarl) == Some(node);
+    let several = sps::all(snarl).len() >= 2;
+    let mut shown = sps::in_easy(snarl, node);
+    let resp = ui
+        .add_enabled(!is_primary, egui::Checkbox::new(&mut shown, egui::RichText::new("Easy").small()))
+        .on_hover_text("Show this sub-patch in Easy mode, as tabs of its own in the row above the layout. \
+                        It runs either way.")
+        .on_disabled_hover_text("The primary sub-patch is always in Easy mode: its Devices panel wires into it.");
+    if resp.changed() {
+        sps::set_in_easy(snarl, node, shown);
+    }
+    if !several {
+        return;
+    }
+    let resp = ui
+        .add(egui::Button::selectable(is_primary, egui::RichText::new("Primary").small()))
+        .on_hover_text(if is_primary {
+            "Easy mode's Devices panel wires input devices into this sub-patch, and output devices out of it."
+        } else {
+            "Make this the sub-patch Easy mode's Devices panel wires into: its devices move here."
+        });
+    if resp.clicked() && !is_primary {
+        crate::easy::wiring::move_primary(snarl, node);
+    }
+    let icon = sps::icon(snarl, node).to_string();
+    let label = if icon.is_empty() { "Icon".to_string() } else { icon.clone() };
+    let picked = crate::touch::menu_button(ui, egui::RichText::new(label).small(), |ui| {
+        let pick = sps::icon_grid(ui, &icon);
+        if pick.is_some() {
+            ui.close();
+        }
+        pick
+    })
+    .inner
+    .flatten();
+    if let Some(p) = picked {
+        sps::set_icon(snarl, node, p);
+    }
 }
 
 /// Where the header's first row is (`show_header` records it), for a socket drawn on it.

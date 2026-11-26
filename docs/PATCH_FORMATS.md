@@ -48,7 +48,9 @@ pub struct UiPatch {
     #[serde(default)]
     pub auto_bypass: bool,            // bypass output when bound process unfocused
     #[serde(default)]
-    pub easy_preset_path: Option<PathBuf>,  // re-link the Easy-mode preset on reopen
+    pub easy_preset_path: Option<PathBuf>,  // re-link the primary sub-patch's Easy-mode preset on reopen
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub easy_presets: BTreeMap<usize, PathBuf>, // the same per Easy sub-patch, by outer node id
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
     pub overlay: OverlayLayout,       // info-overlay pinned elements
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
@@ -57,7 +59,10 @@ pub struct UiPatch {
 ```
 
 Written by `Canvas::save_patch(..)`, read by `Canvas::load_patch()` (which also accepts
-`.fxsp`, see below). On load the snarl is passed through `migrate_loaded_snarl` +
+`.fxsp`, see below). Which top-level sub-patches Easy mode shows, which one is primary, and
+the icon their tabs carry are params on each outer `subpatch` node (`easy_show`,
+`easy_primary`, `easy_icon`; see `easy/subpatches.rs`). Unset, the first sub-patch is the
+primary and the only one shown, so older patches open as they did. On load the snarl is passed through `migrate_loaded_snarl` +
 `migrate_ds4_pin_ids`. On save it is passed through `sanitize_snarl_for_save` (strips
 transient/secret fields such as network passphrases — see `sanitize_node_for_save`).
 

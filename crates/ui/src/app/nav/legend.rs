@@ -473,10 +473,8 @@ impl FlexInputApp {
     /// the active tab), if any. Used by the legend to inspect the selected
     /// widget kind.
     pub(crate) fn nav_active_outer_id(&self) -> Option<egui_snarl::NodeId> {
-        self.tabs.get(self.active_tab)?.canvas.snarl
-            .nodes_ids_data()
-            .find(|(_, n)| n.value.module_id == "subpatch")
-            .map(|(id, _)| id)
+        let tab = self.tabs.get(self.active_tab)?;
+        crate::easy::subpatches::shown(&tab.canvas.snarl, tab.easy_state.shown)
     }
 
     /// Legend hint groups for the CONFIG OVERLAY, pre-rasterized to controller

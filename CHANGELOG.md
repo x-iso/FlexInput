@@ -69,6 +69,24 @@ All notable changes to FlexInput are documented here. This project adheres to
   touchpad passing on, can give the ticks for a pointer driven elsewhere. A pad without
   trackpad haptics feels each as a short rumble.
 
+- **Easy mode takes any patch, and shows several sub-patches as tabs.** Easy mode no longer
+  says a patch is incompatible because it has modules besides one sub-patch: it shows the
+  sub-patches ticked for it and leaves the rest of the patch to Advanced mode. In Advanced
+  mode, each sub-patch's header has an Easy box. A patch's first sub-patch is ticked and is the
+  primary, the one the Devices panel wires pads into and output devices out of, so existing
+  patches look as they did. A sub-patch added beside it shows in Easy mode once ticked. With
+  more than one, the row above the layout has a section per sub-patch, the primary's first,
+  holding that sub-patch's own layout tabs. LB / RB walk every tab in order, from one
+  sub-patch into the next. Each sub-patch can have an icon in front of its tabs' names, picked
+  from its header or by right-clicking a tab. That menu can also make a sub-patch primary
+  (its pads and outputs move to it) or hide it from Easy mode. While a layout is edited,
+  every section has its own + for another tab, and a section's first tab, the sub-patch
+  itself, has no ×. All sub-patches run whether shown or not, and the preset bar loads a
+  preset into the one showing, which keeps its own preset link. The Devices panel touches
+  only its own wiring: a pad or module wired elsewhere in Advanced mode stays wired, and an
+  input of the primary a module feeds is listed as wired in Advanced mode, where no pad can
+  take it.
+
 ### Fixed
 
 - **Crashes with a Bluetooth dongle's search running.** The title-bar Bluetooth button looks

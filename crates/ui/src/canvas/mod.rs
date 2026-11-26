@@ -1616,6 +1616,10 @@ pub struct UiPatch {
     /// matching against the preset index when the path is stale.
     #[serde(default)]
     pub easy_preset_path: Option<std::path::PathBuf>,
+    /// The same for each sub-patch Easy mode shows, by outer node id. The field
+    /// above stays the primary's, for builds that read only that.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub easy_presets: std::collections::BTreeMap<usize, std::path::PathBuf>,
     /// Screen-overlay layout for this patch (pinned module elements +
     /// decorations on the transparent info overlay). Default-empty so
     /// pre-overlay .fxp files keep loading.
@@ -2144,7 +2148,12 @@ impl Canvas {
             _ => egui::vec2(40.0, 40.0),
         };
         let new_ids: Vec<NodeId> = clipboard.nodes.iter()
-            .map(|(pos, data)| self.snarl.insert_node_placed(*pos + offset, data.clone()))
+            .map(|(pos, data)| {
+                let mut data = data.clone();
+                // A pasted sub-patch is a new one, not a second primary.
+                crate::easy::subpatches::strip_marks(&mut data);
+                self.snarl.insert_node_placed(*pos + offset, data)
+            })
             .collect();
         for (from_idx, from_pin, to_idx, to_pin) in clipboard.internal_wires {
             // Bounds-check node indices first.
@@ -3365,6 +3374,7 @@ impl Canvas {
         bound_exes: Vec<String>,
         auto_bypass: bool,
         easy_preset_path: Option<std::path::PathBuf>,
+        easy_presets: std::collections::BTreeMap<usize, std::path::PathBuf>,
         overlay: OverlayLayout,
         config: OverlayLayout,
     ) -> Option<std::path::PathBuf> {
@@ -3382,6 +3392,7 @@ impl Canvas {
             bound_exes,
             auto_bypass,
             easy_preset_path,
+            easy_presets,
             overlay,
             config,
             device_memory: self.device_memory.clone(),
@@ -3393,8 +3404,8 @@ impl Canvas {
     }
 
     /// Open a `.fxp` file and return the loaded Canvas, virtual device IDs,
-    /// bound exes, auto-bypass flag, the path, and the Easy-mode preset path
-    /// (if the file recorded one).
+    /// bound exes, auto-bypass flag, the path, and the Easy-mode preset links
+    /// (the primary's path older files kept, and each sub-patch's).
     /// Returns `None` if the user cancels or the file is invalid.
     pub fn load_patch() -> Option<(
         Canvas,
@@ -3402,7 +3413,7 @@ impl Canvas {
         Vec<String>,
         bool,
         std::path::PathBuf,
-        Option<std::path::PathBuf>,
+        (Option<std::path::PathBuf>, std::collections::BTreeMap<usize, std::path::PathBuf>),
         OverlayLayout,
         OverlayLayout,
     )> {
@@ -3471,8 +3482,9 @@ impl Canvas {
                 Vec::new(),    // bound_exes
                 false,         // auto_bypass
                 path.clone(),
-                Some(path),    // record fxsp path so Easy mode's
-                               // restore_preset_link can re-link
+                // Record the fxsp path so Easy mode's restore_preset_link
+                // can re-link (the lone sub-patch is the primary).
+                (Some(path), Default::default()),
                 OverlayLayout::default(), // presets carry no overlay
                 OverlayLayout::default(), // …and no config overlay
             ));
@@ -3502,7 +3514,7 @@ impl Canvas {
             patch.bound_exes,
             patch.auto_bypass,
             path,
-            patch.easy_preset_path,
+            (patch.easy_preset_path, patch.easy_presets),
             patch.overlay,
             patch.config,
         ))

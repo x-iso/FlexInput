@@ -577,12 +577,13 @@ impl FlexInputApp {
                 snarl_virtual_device_ids(&self.tabs[self.active_tab].canvas.snarl);
             let bound = self.tabs[self.active_tab].bound_exes.clone();
             let auto_bypass = self.tabs[self.active_tab].auto_bypass;
-            let preset_path = self.tabs[self.active_tab]
-                .easy_state.loaded_preset.as_ref().map(|(p, _)| p.clone());
+            let tab = &self.tabs[self.active_tab];
+            let preset_path = tab.easy_state.primary_link(&tab.canvas.snarl);
+            let preset_links = tab.easy_state.saved_links();
             let overlay = self.tabs[self.active_tab].overlay.clone();
             let config = self.tabs[self.active_tab].config.clone();
             if let Some(saved_path) = self.tabs[self.active_tab].canvas
-                .save_patch(vids, bound, auto_bypass, preset_path, overlay, config)
+                .save_patch(vids, bound, auto_bypass, preset_path, preset_links, overlay, config)
             {
                 let tab = &mut self.tabs[self.active_tab];
                 tab.title = saved_path.file_stem()
@@ -592,7 +593,7 @@ impl FlexInputApp {
             }
         }
         if do_load {
-            if let Some((new_canvas, vids, bound, auto_bypass, path, preset_path, overlay, config)) =
+            if let Some((new_canvas, vids, bound, auto_bypass, path, (preset_path, preset_links), overlay, config)) =
                 crate::canvas::Canvas::load_patch()
             {
                 // If the loaded file was a .fxsp wrapped into an
@@ -625,7 +626,7 @@ impl FlexInputApp {
                 // from the live sub-patch. If the saved path is gone,
                 // EasyState will fall back to hash-matching against the
                 // current preset index (see center_panel::restore_link).
-                tab.easy_state.loaded_preset = preset_path.map(|p| (p, 0));
+                tab.easy_state = EasyState::restored(&tab.canvas.snarl, preset_path, preset_links, None);
                 // Queue the configured on-load camera action. The canvas
                 // consumes this on its next render — it can't apply now
                 // because SnarlState / snarl_rect aren't in scope here.
@@ -711,10 +712,8 @@ impl FlexInputApp {
                         // salt for legacy (`0`) workspaces. See startup loader.
                         let view_salt = if pt.view_salt != 0 { pt.view_salt } else { crate::canvas::next_canvas_salt() };
                         canvas.set_view_salt(view_salt);
-                        let easy_state = EasyState {
-                            loaded_preset: pt.easy_preset_path.map(|p| (p, 0)),
-                            ..EasyState::default()
-                        };
+                        let easy_state = EasyState::restored(
+                            &canvas.snarl, pt.easy_preset_path, pt.easy_presets, pt.easy_shown);
                         let mut overlay = pt.overlay;
                         let mut config = pt.config;
                         crate::canvas::node::materialize_subpatch_overlays(
@@ -1134,7 +1133,7 @@ impl FlexInputApp {
                         ui.set_clip_rect(left_rect);
                         puffin::profile_scope!("easy_io_panel_show");
                         // While the layout is being edited the panel is its Inspector.
-                        if let Some(oid) = crate::easy::center_panel::layout_editing_subpatch(canvas) {
+                        if let Some(oid) = crate::easy::center_panel::layout_editing_subpatch(canvas, easy_state) {
                             ui.scope_builder(
                                 egui::UiBuilder::new().max_rect(panel_full_rect.shrink2(egui::vec2(10.0, 0.0))),
                                 |ui| crate::easy::center_panel::show_layout_inspector(ui, canvas, oid),
@@ -1166,7 +1165,7 @@ impl FlexInputApp {
                 let (tab_resp, tab_rect) = crate::panels::physical_devices::draw_devices_tab(
                     ctx,
                     "easy_devices_tab",
-                    if crate::easy::center_panel::layout_editing_subpatch(canvas).is_some() {
+                    if crate::easy::center_panel::layout_editing_subpatch(canvas, easy_state).is_some() {
                         "Inspector"
                     } else {
                         "Devices"

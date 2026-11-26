@@ -240,6 +240,273 @@ pub(crate) fn tab_row(ui: &mut egui::Ui, rect: egui::Rect, names: &[String], act
     act
 }
 
+/// One sub-patch's tabs in Easy mode's row of tabs ([`section_tab_row`]).
+pub(crate) struct TabSection {
+    /// The emoji before each of its tabs' names ("" for none).
+    pub icon: String,
+    /// Its tabs' names - one at least.
+    pub names: Vec<String>,
+    /// The primary sub-patch's section: its menu can't make it primary or hide it.
+    pub primary: bool,
+}
+
+/// What was done on Easy mode's row of tabs in a frame; tabs are (section, tab).
+#[derive(Default, Debug, Clone, PartialEq)]
+pub(crate) struct SectionRowAct {
+    /// A tab clicked: it shows.
+    pub show: Option<(usize, usize)>,
+    /// A tab renamed (editing), and its new name.
+    pub rename: Option<((usize, usize), String)>,
+    /// A tab's × clicked (editing) - never a section's first tab.
+    pub remove: Option<(usize, usize)>,
+    /// A section's + clicked (editing): another tab for it.
+    pub add: Option<usize>,
+    /// An icon picked for a section from a tab's menu ("" takes it off).
+    pub icon: Option<(usize, String)>,
+    /// "Make primary" picked from a section's tab menu.
+    pub make_primary: Option<usize>,
+    /// "Hide from Easy mode" picked from a section's tab menu.
+    pub hide: Option<usize>,
+}
+
+/// The gap between two sections of the row, with a rule down its middle.
+const SECTION_GAP: f32 = 12.0;
+
+/// Where Easy mode's row at `rect` puts each section's tabs, and its + while `edit`: each tab
+/// as wide as its icon and name want (the one showing room for its × where it has one), all
+/// of them narrowed alike where they'd run past the row.
+fn section_row_cells(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    sections: &[TabSection],
+    active: (usize, usize),
+    edit: bool,
+) -> Vec<(Vec<egui::Rect>, Option<egui::Rect>)> {
+    let font = tab_row_font(rect);
+    let (pad, close_w, gap) = (12.0, 16.0, 2.0);
+    let plus_w = if edit { rect.height() - 4.0 } else { 0.0 };
+    let want: Vec<Vec<f32>> = sections
+        .iter()
+        .enumerate()
+        .map(|(s, sec)| {
+            sec.names
+                .iter()
+                .enumerate()
+                .map(|(k, n)| {
+                    let w = ui.painter().layout_no_wrap(section_tab_label(sec, n), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+                    (w + 2.0 * pad + if edit && (s, k) == active && k > 0 { close_w } else { 0.0 }).max(64.0)
+                })
+                .collect()
+        })
+        .collect();
+    let tabs: usize = want.iter().map(Vec::len).sum();
+    let fixed = 8.0
+        + gap * tabs as f32
+        + SECTION_GAP * sections.len().saturating_sub(1) as f32
+        + if edit { (plus_w + gap) * sections.len() as f32 } else { 0.0 };
+    let room = (rect.width() - fixed).max(0.0);
+    let total: f32 = want.iter().flatten().sum();
+    let k = if total > room && total > 0.0 { room / total } else { 1.0 };
+    let top = rect.top() + 4.0;
+    let mut x = rect.left() + 4.0;
+    want.iter()
+        .enumerate()
+        .map(|(s, ws)| {
+            if s > 0 {
+                x += SECTION_GAP - gap;
+            }
+            let cells: Vec<egui::Rect> = ws
+                .iter()
+                .map(|w| {
+                    let cell = egui::Rect::from_min_size(egui::pos2(x, top), egui::vec2(w * k, rect.bottom() - top));
+                    x += w * k + gap;
+                    cell
+                })
+                .collect();
+            let plus = edit.then(|| {
+                let r = egui::Rect::from_min_size(egui::pos2(x, top + 1.0), egui::vec2(plus_w, rect.bottom() - top - 3.0));
+                x += plus_w + gap;
+                r
+            });
+            (cells, plus)
+        })
+        .collect()
+}
+
+/// A tab's label in Easy mode's row: its sub-patch's icon, then its name.
+fn section_tab_label(sec: &TabSection, name: &str) -> String {
+    if sec.icon.is_empty() { name.to_string() } else { format!("{} {name}", sec.icon) }
+}
+
+/// Easy mode's row of tabs across `rect`: a section per sub-patch it shows, each its own
+/// tabs with the sub-patch's icon before their names, and a rule between sections. The tab
+/// showing (`active`: section, tab) is lit and a click shows another. While a layout is edited
+/// (`edit`) a double click renames a tab, the tab showing has a × unless it's its section's
+/// first, and each section ends in a + adding a tab of its own. A tab's context menu picks its
+/// sub-patch's icon, makes it primary, or hides it from Easy mode. Nothing is drawn for fewer
+/// than two tabs in all.
+pub(crate) fn section_tab_row(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    sections: &[TabSection],
+    active: (usize, usize),
+    edit: bool,
+    id: egui::Id,
+) -> SectionRowAct {
+    let mut act = SectionRowAct::default();
+    if sections.iter().map(|s| s.names.len()).sum::<usize>() < 2 {
+        return act;
+    }
+    let v = ui.visuals().clone();
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    painter.rect_filled(rect, 0.0, v.panel_fill);
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, v.widgets.noninteractive.bg_stroke);
+    let font = tab_row_font(rect);
+    let cells = section_row_cells(ui, rect, sections, active, edit);
+    let rename_id = id.with("rename");
+    // The tab being renamed, what's typed so far, and whether its box has had focus yet.
+    let mut renaming: Option<((usize, usize), String, bool)> = if edit { ui.ctx().data(|d| d.get_temp(rename_id)) } else { None };
+    let top_round = egui::CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 };
+    for (s, (sec, (tab_cells, plus))) in sections.iter().zip(&cells).enumerate() {
+        // The rule before every section but the first.
+        if s > 0 {
+            if let Some(first) = tab_cells.first() {
+                let x = first.left() - SECTION_GAP * 0.5;
+                painter.vline(x, (rect.top() + 7.0)..=(rect.bottom() - 5.0), v.widgets.noninteractive.bg_stroke);
+            }
+        }
+        for (k, (cell, name)) in tab_cells.iter().zip(&sec.names).enumerate() {
+            let at = (s, k);
+            let lit = at == active;
+            // Click and drag, so a press here is the tab's and not the layout's under it.
+            let resp = ui.interact(*cell, id.with(("tab", s, k)), egui::Sense::click_and_drag());
+            let fill = if lit {
+                v.selection.bg_fill
+            } else if resp.hovered() {
+                v.widgets.hovered.weak_bg_fill
+            } else {
+                v.widgets.inactive.weak_bg_fill
+            };
+            painter.rect_filled(*cell, top_round, fill);
+            let text_col = if lit { v.strong_text_color() } else { v.text_color() };
+            // A section's first tab is the sub-patch itself: it has no ×.
+            let close = (edit && lit && k > 0).then(|| {
+                let sz = 14.0_f32.min(cell.height() - 4.0);
+                egui::Rect::from_center_size(egui::pos2(cell.right() - 6.0 - sz * 0.5, cell.center().y), egui::vec2(sz, sz))
+            });
+            let text_rect = egui::Rect::from_min_max(
+                egui::pos2(cell.left() + 6.0, cell.top()),
+                egui::pos2(close.map_or(cell.right() - 6.0, |c| c.left() - 2.0), cell.bottom()),
+            );
+            match renaming.as_mut().filter(|(r, _, _)| *r == at) {
+                Some((_, text, focused)) => {
+                    let edit_resp = ui.put(
+                        text_rect.shrink2(egui::vec2(0.0, 3.0)),
+                        egui::TextEdit::singleline(text)
+                            .id(id.with(("rename_box", s, k)))
+                            .font(font.clone())
+                            .margin(egui::vec2(2.0, 1.0)),
+                    );
+                    if !*focused {
+                        edit_resp.request_focus();
+                        *focused = true;
+                    } else if edit_resp.lost_focus() {
+                        if !ui.input(|inp| inp.key_pressed(egui::Key::Escape)) {
+                            act.rename = Some((at, text.clone()));
+                        }
+                        renaming = None;
+                    }
+                }
+                None => {
+                    let g = painter.layout_no_wrap(section_tab_label(sec, name), font.clone(), text_col);
+                    // A label wider than its tab is cut at the tab's edge; one that fits sits in
+                    // the middle of it.
+                    let x = if g.size().x <= text_rect.width() { text_rect.center().x - g.size().x * 0.5 } else { text_rect.left() };
+                    painter.with_clip_rect(text_rect.intersect(painter.clip_rect())).galley(
+                        egui::pos2(x, text_rect.center().y - g.size().y * 0.5),
+                        g,
+                        text_col,
+                    );
+                }
+            }
+            if let Some(c) = close {
+                let cr = ui.interact(c, id.with(("tab_x", s, k)), egui::Sense::click_and_drag());
+                if cr.hovered() {
+                    painter.circle_filled(c.center(), c.width() * 0.5 + 1.0, v.widgets.hovered.bg_fill);
+                }
+                let d = c.width() * 0.22;
+                let xs = egui::Stroke::new(1.3_f32, text_col);
+                painter.line_segment([c.center() + egui::vec2(-d, -d), c.center() + egui::vec2(d, d)], xs);
+                painter.line_segment([c.center() + egui::vec2(d, -d), c.center() + egui::vec2(-d, d)], xs);
+                if cr.on_hover_text("Take this tab off: what's on it goes to the tab before").clicked() {
+                    act.remove = Some(at);
+                    renaming = None;
+                }
+            }
+            let hover = match (edit, sec.primary) {
+                (true, true) => "Double-click to rename. The primary sub-patch: the Devices panel wires into it. Right-click for its icon.",
+                (true, false) => "Double-click to rename. Right-click for its icon, to make it primary, or to hide it.",
+                (false, true) => "The primary sub-patch: the Devices panel wires into it. Right-click for its icon.",
+                (false, false) => "Right-click for its icon, to make it primary, or to hide it from Easy mode.",
+            };
+            let resp = resp.on_hover_text(hover);
+            resp.context_menu(|ui| {
+                ui.label(egui::RichText::new("Icon").small().weak());
+                if let Some(icon) = crate::easy::subpatches::icon_grid(ui, &sec.icon) {
+                    act.icon = Some((s, icon));
+                    ui.close();
+                }
+                if !sec.primary {
+                    ui.separator();
+                    if ui.button("Make primary")
+                        .on_hover_text("The Devices panel wires into the primary sub-patch: its devices move here.")
+                        .clicked()
+                    {
+                        act.make_primary = Some(s);
+                        ui.close();
+                    }
+                    if ui.button("Hide from Easy mode")
+                        .on_hover_text("Its tabs leave this row. It keeps running; tick Easy on its header in Advanced mode to bring it back.")
+                        .clicked()
+                    {
+                        act.hide = Some(s);
+                        ui.close();
+                    }
+                }
+            });
+            // A quick click after a click counts as a third (egui's triple click): rename on either.
+            if edit && (resp.double_clicked() || resp.triple_clicked()) {
+                renaming = Some((at, name.clone(), false));
+            } else if resp.clicked() && !lit {
+                act.show = Some(at);
+            }
+        }
+        if let Some(p) = plus.filter(|_| sec.names.len() < MAX_LAYOUT_TABS) {
+            let resp = ui.interact(p, id.with(("tab_add", s)), egui::Sense::click_and_drag());
+            if resp.hovered() {
+                painter.rect_filled(p, 4.0, v.widgets.hovered.weak_bg_fill);
+            }
+            let c = p.center();
+            let d = (p.height() * 0.22).max(3.0);
+            let st = egui::Stroke::new(1.5_f32, v.text_color());
+            painter.line_segment([c - egui::vec2(d, 0.0), c + egui::vec2(d, 0.0)], st);
+            painter.line_segment([c - egui::vec2(0.0, d), c + egui::vec2(0.0, d)], st);
+            if resp.on_hover_text("Another tab for this sub-patch, at the end of its own").clicked() {
+                act.add = Some(s);
+            }
+        }
+    }
+    if edit {
+        ui.ctx().data_mut(|d| match renaming {
+            Some(r) => d.insert_temp(rename_id, r),
+            None => {
+                d.remove_temp::<((usize, usize), String, bool)>(rename_id);
+            }
+        });
+    }
+    act
+}
+
 /// Add a tab to a layout's `names` and return its index. The first one added makes two -
 /// what the layout had is on the first. `None` past [`MAX_LAYOUT_TABS`].
 pub(crate) fn add_layout_tab(names: &mut Vec<String>) -> Option<usize> {
@@ -437,5 +704,77 @@ mod tests {
         assert!(!shown && active == 0, "only another tab showing");
         assert_eq!(tab_row_h(1), 0.0);
         assert_eq!(tab_row_h(2), TAB_ROW_H);
+    }
+
+    fn sections() -> Vec<TabSection> {
+        vec![
+            TabSection { icon: "🎮".into(), names: vec!["Main".into()], primary: true },
+            TabSection { icon: String::new(), names: vec!["Aim".into(), "Move".into()], primary: false },
+        ]
+    }
+
+    /// One frame of Easy mode's row at `rect`, with `events`: what was done, and where its
+    /// cells were.
+    fn row_frame(
+        ctx: &egui::Context,
+        t: f64,
+        events: Vec<egui::Event>,
+        active: (usize, usize),
+        edit: bool,
+    ) -> (SectionRowAct, Vec<(Vec<egui::Rect>, Option<egui::Rect>)>) {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(700.0, TAB_ROW_H));
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 200.0))),
+            time: Some(t),
+            events,
+            ..Default::default()
+        };
+        let (mut act, mut cells) = (SectionRowAct::default(), Vec::new());
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let secs = sections();
+                cells = section_row_cells(ui, rect, &secs, active, edit);
+                act = section_tab_row(ui, rect, &secs, active, edit, egui::Id::new("test_row"));
+            });
+        });
+        (act, cells)
+    }
+
+    /// Sections follow one another with a gap; while editing each has its own +, and the
+    /// tab showing has room for a × only past its section's first tab.
+    #[test]
+    fn sections_lay_out_with_their_own_plus() {
+        let ctx = egui::Context::default();
+        let (_, cells) = row_frame(&ctx, 0.0, Vec::new(), (1, 0), true);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1].0.len(), 2);
+        assert!(cells.iter().all(|(_, plus)| plus.is_some()), "a + per section");
+        let (main_plus, aim) = (cells[0].1.unwrap(), cells[1].0[0]);
+        assert!(aim.left() - main_plus.right() >= SECTION_GAP - 2.5, "the gap between sections");
+        let (_, not_editing) = row_frame(&ctx, 0.1, Vec::new(), (1, 0), false);
+        assert!(not_editing.iter().all(|(_, plus)| plus.is_none()));
+        // The first tab showing has no × to make room for; the second does.
+        let (_, first) = row_frame(&ctx, 0.2, Vec::new(), (1, 0), true);
+        let (_, second) = row_frame(&ctx, 0.3, Vec::new(), (1, 1), true);
+        assert!(second[1].0[1].width() > first[1].0[1].width());
+        assert_eq!(second[1].0[0].width(), first[1].0[0].width());
+    }
+
+    /// A click on another section's tab shows it.
+    #[test]
+    fn a_click_shows_a_tab_of_another_section() {
+        let ctx = egui::Context::default();
+        let (_, cells) = row_frame(&ctx, 0.0, Vec::new(), (0, 0), false);
+        let at = cells[1].0[1].center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        row_frame(&ctx, 0.1, vec![egui::Event::PointerMoved(at)], (0, 0), false);
+        row_frame(&ctx, 0.2, vec![button(true)], (0, 0), false);
+        let (act, _) = row_frame(&ctx, 0.25, vec![button(false)], (0, 0), false);
+        assert_eq!(act.show, Some((1, 1)));
     }
 }
