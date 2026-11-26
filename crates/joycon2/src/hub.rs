@@ -182,8 +182,8 @@ pub struct PadState {
 /// Outbound requests to a connected pad.
 #[derive(Debug, Clone)]
 enum PadCommand {
-    /// Raw 16-byte HD rumble payload for this half's LRA.
-    Rumble(Vec<u8>),
+    /// What this half's LRA should play from now on — see [`crate::rumble`].
+    Rumble(crate::rumble::Rumble),
     /// Player LED bitmask, bits 0–3.
     PlayerLed(u8),
 }
@@ -312,10 +312,10 @@ impl Joycon2Hub {
             .collect()
     }
 
-    /// Queue a raw 16-byte HD rumble payload. Silently dropped if the pad is
-    /// not connected — the caller writes every tick and must not care.
-    pub fn send_rumble(&self, key: PadKey, payload: Vec<u8>) {
-        self.send(key, PadCommand::Rumble(payload));
+    /// Set what a half's rumble plays; its task paces the frames. Silently
+    /// dropped if the pad is not connected here.
+    pub fn set_rumble(&self, key: PadKey, rumble: crate::rumble::Rumble) {
+        self.send(key, PadCommand::Rumble(rumble));
     }
 
     /// Set the player-LED bitmask (bits 0–3).
@@ -1175,6 +1175,12 @@ async fn run_session(
     let mut last_input = tokio::time::Instant::now();
     let mut led_mask: u8 = 0x01;
 
+    // Rumble frames go out on their own cadence, and only while something
+    // plays — the tick's branch is disabled otherwise.
+    let mut rumble = crate::rumble::Player::default();
+    let mut rumble_tick = tokio::time::interval(crate::rumble::FRAME_GAP);
+    rumble_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     // One 1 Hz ticker drives three independent duties — keep-alive, status
     // line, and waking the loop so the watchdog can fire — so that changing the
     // keep-alive period from the environment does not silently change the
@@ -1285,9 +1291,13 @@ async fn run_session(
                     break;
                 };
                 match cmd {
-                    PadCommand::Rumble(payload) => {
-                        if let Some(c) = &rumble_char {
-                            let _ = p.write(c, &payload, WriteType::WithoutResponse).await;
+                    PadCommand::Rumble(r) => {
+                        rumble.set(r);
+                        if let Some(b) = rumble.poll(std::time::Instant::now()) {
+                            if let Some(c) = &rumble_char {
+                                let frame = crate::rumble::ble_frame(&b);
+                                let _ = p.write(c, &frame, WriteType::WithoutResponse).await;
+                            }
                         }
                     }
                     PadCommand::PlayerLed(mask) => {
@@ -1300,6 +1310,14 @@ async fn run_session(
                             &[mask, 0, 0, 0, 0, 0, 0, 0],
                         );
                         let _ = p.write(&cmd_char, &frame, WriteType::WithoutResponse).await;
+                    }
+                }
+            }
+            _ = rumble_tick.tick(), if rumble.busy() => {
+                if let Some(b) = rumble.poll(std::time::Instant::now()) {
+                    if let Some(c) = &rumble_char {
+                        let frame = crate::rumble::ble_frame(&b);
+                        let _ = p.write(c, &frame, WriteType::WithoutResponse).await;
                     }
                 }
             }

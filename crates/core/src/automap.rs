@@ -580,6 +580,10 @@ pub const PITCH_HZ_PINS: [(&str, &str); 6] = [
 /// most.
 pub const SWITCH_RUMBLE_HZ: f32 = 123.0;
 
+/// The pitch a Joy-Con 2's rumble plays when nothing gives it one: SDL's high
+/// band on these pads (frequency code `0x187`).
+pub const JOYCON2_RUMBLE_HZ: f32 = 168.0;
+
 /// The `hd_*_amp` value that plays `level` (0–1 of full strength, as a click's
 /// dB gives it) on a Switch Pro.
 ///

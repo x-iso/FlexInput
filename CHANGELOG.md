@@ -87,6 +87,16 @@ All notable changes to FlexInput are documented here. This project adheres to
   input of the primary a module feeds is listed as wired in Advanced mode, where no pad can
   take it.
 
+- **Joy-Con 2 rumble.** A Joy-Con 2 half now plays rumble, over the Bluetooth dongle, Windows
+  Bluetooth or USB. A game's ordinary rumble arrives on two new pins, Rumble (strong) and
+  Rumble (weak), played as SDL plays them on these pads: the strong motor low (~72 Hz), the
+  weak one higher (~168 Hz). Both now reach the half; before, only the strong motor had a pin
+  to land on. HD rumble from a game's haptics or from Audio Stream Haptics plays on the HD
+  pins, its first carrier on the actuator's low oscillator and the second on its high one, at
+  the pitch each carries. While HD plays, it wins over the classic motors. Strength is capped
+  where SDL caps it, so nothing sent can drive the actuator harder. The HD frequency pins now
+  say the range they really play, 80–500 Hz; the labels promised the Switch Pro's.
+
 ### Fixed
 
 - **Crashes with a Bluetooth dongle's search running.** The title-bar Bluetooth button looks

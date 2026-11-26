@@ -35,6 +35,7 @@ pub mod hub;
 pub mod pairing;
 pub mod protocol;
 pub mod reports;
+pub mod rumble;
 pub mod usb;
 #[cfg(windows)]
 pub mod win_pair;

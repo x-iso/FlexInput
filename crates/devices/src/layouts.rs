@@ -481,17 +481,27 @@ fn joycon_pair_outputs() -> Vec<DevicePin> {
     pins
 }
 
-/// Joy-Con 2 has a single LRA per half, driven by the same dual-carrier HD
-/// rumble encoding as the Switch Pro. The pin names match `switch_pro_inputs`
-/// so an Audio Stream Haptics patch built for a Pro Controller drives a Joy-Con
-/// unchanged — there is just one actuator instead of two, so only the `_l` pins
-/// exist regardless of which half this is.
+/// Joy-Con 2 has a single LRA per half, playing two oscillators at once
+/// (`flexinput_joycon2::rumble`): carrier 1 on its low band, carrier 2 on its
+/// high band. The pin names match `switch_pro_inputs` so an Audio Stream
+/// Haptics patch built for a Pro Controller drives a Joy-Con unchanged — there
+/// is just one actuator instead of two, so only the `_l` pins exist regardless
+/// of which half this is.
+///
+/// ❗ The frequency pins read on the DualSense scale, 80–500 Hz straight
+/// across: that is what `PitchScale::of_pin` makes of a layout without the
+/// Switch Pro's legacy pin, and the encoder asks it rather than assuming.
+///
+/// The classic pins take a game's ordinary rumble the way SDL plays it on these
+/// pads, strong motor low, weak motor high; HD wins while it plays.
 fn joycon2_inputs() -> Vec<DevicePin> {
     vec![
-        fl("hd_l_amp", "HD Rumble: Amplitude (perceptual 0–1)"),
-        fl("hd_l_freq", "HD Rumble: Frequency (0=82Hz 0.5=320Hz 1=1253Hz)"),
-        fl("hd2_l_amp", "HD Rumble: Amp (HF carrier)"),
-        fl("hd2_l_freq", "HD Rumble: Freq (HF carrier)"),
+        fl("hd_l_amp", "HD Rumble: Amplitude (0–1)"),
+        fl("hd_l_freq", "HD Rumble: Frequency (0=80Hz 0.5=290Hz 1=500Hz)"),
+        fl("hd2_l_amp", "HD Rumble: Amp (carrier 2)"),
+        fl("hd2_l_freq", "HD Rumble: Freq (carrier 2, 0=80Hz 1=500Hz)"),
+        fl("rumble_strong", "Rumble (strong)"),
+        fl("rumble_weak", "Rumble (weak)"),
         // player_led: bits 0–3 select which of the 4 LEDs light.
         // 0=off, 0.25=P1, 0.5=P2, 0.75=P3, 1.0=P4 — same encoding as DualSense.
         fl("player_led", "Player LED (0=off 0.25=P1 0.5=P2 0.75=P3 1=P4)"),

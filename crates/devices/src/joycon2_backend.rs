@@ -5,7 +5,11 @@
 //! device id. The hub runs on its own thread, so `poll` and `enumerate` here
 //! only ever touch an in-memory snapshot and never block on Bluetooth.
 
+use std::time::{Duration, Instant};
+
+use flexinput_core::automap::PitchScale;
 use flexinput_core::Signal;
+use flexinput_joycon2::rumble::{Band, Rumble};
 use flexinput_joycon2::{Joycon2DongleHub, Joycon2Hub, Joycon2UsbHub, PadKey, PadState, Side};
 
 use crate::gyro::{ACCEL_REF_G, GYRO_REF_DPS};
@@ -36,6 +40,75 @@ pub struct Joycon2Backend {
     /// out `PadState` BY VALUE each poll — there is no per-pad struct here that
     /// lives across polls to hang it on. Entries are pruned in `enumerate`.
     spike: std::collections::HashMap<String, SpikeFilter>,
+    /// Each half's rumble pins as last sent, keyed by device id; handed to the
+    /// transports once per output pass (`end_output_pass`).
+    rumble: std::collections::HashMap<String, RumbleOut>,
+}
+
+/// How often a rumble that keeps playing unchanged is handed over again, so a
+/// half that reconnects mid-rumble picks it back up.
+const RUMBLE_REFRESH: Duration = Duration::from_millis(250);
+
+/// The rumble pins of one half, as last sent.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct RumblePins {
+    hd_amp: f32,
+    hd_freq: f32,
+    hd2_amp: f32,
+    hd2_freq: f32,
+    strong: f32,
+    weak: f32,
+}
+
+impl RumblePins {
+    /// Take one pin's value; `false` for a pin that is not rumble.
+    fn set(&mut self, pin: &str, v: f32) -> bool {
+        let v = if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+        match pin {
+            "hd_l_amp" => self.hd_amp = v,
+            "hd_l_freq" => self.hd_freq = v,
+            "hd2_l_amp" => self.hd2_amp = v,
+            "hd2_l_freq" => self.hd2_freq = v,
+            "rumble_strong" => self.strong = v,
+            "rumble_weak" => self.weak = v,
+            _ => return false,
+        }
+        true
+    }
+
+    /// What the half plays. HD wins whenever either carrier sounds, as on the
+    /// Switch Pro, so the two paths never fight: carrier 1 on the low band,
+    /// carrier 2 on the high band, each at its pin's pitch. Otherwise the
+    /// classic motors, the way SDL plays them on these pads.
+    fn rumble(&self) -> Rumble {
+        if self.hd_amp > 0.0 || self.hd2_amp > 0.0 {
+            let scale = jc2_pitch_scale();
+            Rumble {
+                low: Band { hz: scale.hz(self.hd_freq), amp: self.hd_amp },
+                high: Band { hz: scale.hz(self.hd2_freq), amp: self.hd2_amp },
+            }
+        } else {
+            Rumble::classic(self.strong, self.weak)
+        }
+    }
+}
+
+/// The scale a Joy-Con 2 reads its `hd*_freq` pins on — the engine's own
+/// answer for this layout, so a pitch the engine converts for the pad and the
+/// pitch the encoder plays can never disagree.
+fn jc2_pitch_scale() -> PitchScale {
+    static SCALE: std::sync::OnceLock<PitchScale> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let pins: Vec<String> = layouts::inputs_for(ControllerKind::JoyCon2L).into_iter().map(|p| p.id).collect();
+        PitchScale::of_pin("hd_l_freq", pins.iter().map(String::as_str)).unwrap_or(PitchScale::DualSense)
+    })
+}
+
+#[derive(Debug, Default)]
+struct RumbleOut {
+    pins: RumblePins,
+    pushed: Option<Rumble>,
+    pushed_at: Option<Instant>,
 }
 
 impl Joycon2Backend {
@@ -81,6 +154,7 @@ impl Joycon2Backend {
             usb: Joycon2UsbHub::new(),
             dongle,
             spike: std::collections::HashMap::new(),
+            rumble: std::collections::HashMap::new(),
         }
     }
 }
@@ -439,6 +513,8 @@ impl DeviceBackend for Joycon2Backend {
         let live: std::collections::HashSet<String> =
             self.all_pads().iter().map(|p| device_id(&p.key)).collect();
         self.spike.retain(|dev, _| live.contains(dev));
+        // A half that comes back starts from nothing pushed, so it is told again.
+        self.rumble.retain(|dev, _| live.contains(dev));
 
         self.all_pads()
             .into_iter()
@@ -525,6 +601,23 @@ impl DeviceBackend for Joycon2Backend {
     }
 
     fn send(&mut self, device_id_in: &str, pin_id: &str, signal: Signal) {
+        // ❗ Every backend is handed every pad's pins; only ours are kept, or
+        // the rumble table fills with other backends' pads.
+        if !device_id_in.starts_with("jc2:") {
+            return;
+        }
+        // Rumble is gathered here and handed over once per output pass.
+        if let Some(out) = self.rumble.get_mut(device_id_in) {
+            if out.pins.set(pin_id, signal.as_float()) {
+                return;
+            }
+        } else {
+            let mut pins = RumblePins::default();
+            if pins.set(pin_id, signal.as_float()) {
+                self.rumble.insert(device_id_in.to_string(), RumbleOut { pins, ..Default::default() });
+                return;
+            }
+        }
         let Some(pad) = self
             .hub
             .pads()
@@ -542,9 +635,35 @@ impl DeviceBackend for Joycon2Backend {
             };
             self.hub.set_player_led(pad.key, mask);
         }
-        // HD rumble is declared in the layout but not encoded yet — the
-        // 16-byte LRA packing is a separate reverse-engineering job from the
-        // Switch Pro's, and sending a malformed frame is worse than silence.
+    }
+
+    /// Hand each half's rumble to its transport: on a change, and again every
+    /// [`RUMBLE_REFRESH`] while it keeps playing. Each transport ignores a key
+    /// it does not hold, so all three are told.
+    fn end_output_pass(&mut self) {
+        let now = Instant::now();
+        let due = |out: &RumbleOut, r: &Rumble| {
+            out.pushed != Some(*r)
+                || (r.is_active() && out.pushed_at.is_none_or(|t| now.duration_since(t) >= RUMBLE_REFRESH))
+        };
+        if !self.rumble.values().any(|out| due(out, &out.pins.rumble())) {
+            return;
+        }
+        let pads = self.all_pads();
+        for (dev, out) in self.rumble.iter_mut() {
+            let r = out.pins.rumble();
+            if !due(out, &r) {
+                continue;
+            }
+            let Some(pad) = pads.iter().find(|p| device_id(&p.key) == *dev) else {
+                continue;
+            };
+            self.dongle.set_rumble(pad.key, r);
+            self.hub.set_rumble(pad.key, r);
+            self.usb.set_rumble(pad.key, r);
+            out.pushed = Some(r);
+            out.pushed_at = Some(now);
+        }
     }
 }
 
@@ -589,6 +708,33 @@ fn emitted_pins(side: Side) -> Vec<(String, String, Signal)> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// HD wins while either carrier sounds; otherwise the classic motors, the
+    /// strong one low and the weak one high. Pitches read on the layout's own
+    /// scale, the one its labels promise.
+    #[test]
+    fn rumble_pins_pick_hd_over_classic_on_the_layouts_scale() {
+        assert_eq!(jc2_pitch_scale(), PitchScale::DualSense, "the hd*_freq labels say 80-500 Hz");
+        let mut p = RumblePins::default();
+        assert!(p.set("rumble_strong", 0.8));
+        assert!(p.set("rumble_weak", 0.2));
+        assert!(!p.set("player_led", 0.25), "not a rumble pin");
+        assert_eq!(p.rumble(), Rumble::classic(0.8, 0.2));
+
+        p.set("hd_l_amp", 0.5);
+        p.set("hd_l_freq", 0.0);
+        let r = p.rumble();
+        assert_eq!(r.low, Band { hz: 80.0, amp: 0.5 });
+        assert_eq!(r.high.amp, 0.0, "carrier 2 silent: the classic weak motor does not leak in");
+
+        p.set("hd_l_amp", 0.0);
+        p.set("hd2_l_amp", 0.3);
+        p.set("hd2_l_freq", 1.0);
+        assert_eq!(p.rumble().high, Band { hz: 500.0, amp: 0.3 });
+
+        p.set("hd2_l_amp", f32::NAN);
+        assert_eq!(p.rumble(), Rumble::classic(0.8, 0.2), "a bad value is silence, not noise");
+    }
 
     /// Every pin the backend emits must be declared in the layout, or a sink
     /// can never bind it and the signal is silently discarded. This is the

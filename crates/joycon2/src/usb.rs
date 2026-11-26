@@ -40,6 +40,7 @@ use hidapi::{HidApi, HidDevice};
 use crate::hub::{PadKey, PadState};
 use crate::protocol::{self, Side};
 use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
+use crate::rumble::{self, Player, Rumble};
 
 /// How often to look for newly plugged controllers.
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
@@ -57,7 +58,13 @@ struct Shared {
     pads: Mutex<std::collections::HashMap<PadKey, PadState>>,
     open: Mutex<HashSet<String>>,
     shutdown: AtomicBool,
+    /// What each half's rumble should play; its thread paces the frames.
+    rumble: Mutex<std::collections::HashMap<PadKey, Rumble>>,
 }
+
+/// Read timeout while a rumble is playing or stopping, so its frames keep
+/// their cadence even when no report arrives.
+const RUMBLE_READ_TIMEOUT_MS: i32 = 4;
 
 /// USB HID transport for Joy-Con 2 controllers.
 pub struct Joycon2UsbHub {
@@ -87,6 +94,13 @@ impl Joycon2UsbHub {
         let mut v: Vec<PadState> = self.shared.pads.lock().unwrap().values().cloned().collect();
         v.sort_by_key(|p| p.key);
         v
+    }
+
+    /// Set what a wired half's rumble plays. Ignored for a pad not wired here.
+    pub fn set_rumble(&self, key: PadKey, r: Rumble) {
+        if self.shared.pads.lock().unwrap().contains_key(&key) {
+            self.shared.rumble.lock().unwrap().insert(key, r);
+        }
     }
 
     /// Drain per-pad report counts, for the live polling-rate display.
@@ -268,8 +282,25 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
     let mut wrong_id = 0u64;
     let mut unparsed = 0u64;
     let mut last_report_log = std::time::Instant::now();
+    // Rumble rides output report 0x01, rumble region only — what SDL sends.
+    let mut player = Player::default();
+    let mut rumble_failures = 0u32;
 
     while !shared.shutdown.load(Ordering::Relaxed) {
+        let target = shared.rumble.lock().unwrap().get(&key).copied();
+        player.set(target.unwrap_or(Rumble::SILENT));
+        if let Some(b) = player.poll(std::time::Instant::now()) {
+            if let Err(e) = device.write(&rumble::usb_frame(&b)) {
+                rumble_failures += 1;
+                if rumble_failures <= 3 || rumble_failures % 500 == 0 {
+                    eprintln!(
+                        "[jc2-usb] {} rumble write failed (#{rumble_failures}): {e}",
+                        side.display_name(),
+                    );
+                }
+            }
+        }
+        let read_timeout = if player.busy() { RUMBLE_READ_TIMEOUT_MS } else { READ_TIMEOUT_MS };
         if last_report_log.elapsed() >= Duration::from_secs(5) {
             last_report_log = std::time::Instant::now();
             eprintln!(
@@ -278,7 +309,7 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
                 side.display_name(),
             );
         }
-        match device.read_timeout(&mut buf, READ_TIMEOUT_MS) {
+        match device.read_timeout(&mut buf, read_timeout) {
             Ok(0) => {
                 timeouts += 1;
                 continue; // idle, not an error
@@ -362,6 +393,7 @@ fn drive_device(shared: &Arc<Shared>, side: Side, device: HidDevice, path: &str,
         side.display_name(),
     );
     shared.pads.lock().unwrap().remove(&key);
+    shared.rumble.lock().unwrap().remove(&key);
 }
 
 #[cfg(test)]

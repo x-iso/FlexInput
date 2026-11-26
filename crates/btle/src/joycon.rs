@@ -70,6 +70,12 @@ pub const HANDLE_CMD_WRITE_COMMON: u16 = 0x0014;
 /// any new code reaches for by default.
 pub const HANDLE_CMD_WRITE: u16 = 0x0016;
 
+/// Per-side rumble characteristic, write without response: a zero byte, then
+/// the 16-byte rumble block (`flexinput_joycon2::rumble`). Where both
+/// reference implementations send HD rumble; not yet tried on the M12-S, which
+/// ignores the common command channel ([`HANDLE_CMD_WRITE_COMMON`]).
+pub const HANDLE_RUMBLE: u16 = 0x0012;
+
 /// Input report characteristic. Notifications arrive here at the connection
 /// interval, carrying the 63-byte report `flexinput_joycon2::reports` parses.
 pub const HANDLE_INPUT_VALUE: u16 = 0x000E;

@@ -39,6 +39,7 @@ use flexinput_btle::{acl, joycon as jc, Dongle, Event};
 use crate::hub::{PadKey, PadState};
 use crate::protocol::{self, Side};
 use crate::reports::{self, OrientationTracker, PadSnapshot, StickCalib};
+use crate::rumble::{self, Player, Rumble};
 
 /// Most halves to hold at once. Two is a full pair.
 const MAX_LINKS: usize = 2;
@@ -90,6 +91,9 @@ struct Shared {
     /// In memory only, so it survives a reconnect but not an app restart —
     /// which still removes the great majority of writes.
     paired: Mutex<HashMap<[u8; 6], [u8; 16]>>,
+    /// What each half's rumble should play, set by the backend; the worker
+    /// paces the frames (`Link::rumble`).
+    rumble: Mutex<HashMap<PadKey, Rumble>>,
 }
 
 /// A live connection to one half.
@@ -102,6 +106,7 @@ struct Link {
     /// Reports that failed to parse. Silent failure here reads as a dead
     /// controller everywhere downstream, so it is counted and reported.
     unparsed: u32,
+    rumble: Player,
 }
 
 /// Joy-Con 2 transport over a dedicated BLE dongle.
@@ -168,6 +173,14 @@ impl Joycon2DongleHub {
 
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    /// Set what a half's rumble plays. Ignored for a pad this transport does
+    /// not hold.
+    pub fn set_rumble(&self, key: PadKey, r: Rumble) {
+        if self.shared.pads.lock().unwrap().contains_key(&key) {
+            self.shared.rumble.lock().unwrap().insert(key, r);
+        }
     }
 }
 
@@ -840,6 +853,7 @@ fn connect_and_init(
         orientation: OrientationTracker::default(),
         last_input: Instant::now(),
         unparsed: 0,
+        rumble: Player::default(),
     })
 }
 
@@ -889,6 +903,7 @@ fn pump(
                         link.key.side.display_name()
                     );
                     shared.pads.lock().unwrap().remove(&link.key);
+                    shared.rumble.lock().unwrap().remove(&link.key);
                 }
             }
             Event::LeAdvertisingReport(r) if scanning && found.is_none() => {
@@ -950,6 +965,22 @@ fn pump(
         }
     }
 
+    // Rumble: each half's latest target, paced by its player. One short write
+    // per frame, the way the classic transport sends its output reports.
+    {
+        let targets = shared.rumble.lock().unwrap();
+        for link in links.iter_mut() {
+            link.rumble.set(targets.get(&link.key).copied().unwrap_or(Rumble::SILENT));
+        }
+    }
+    let now = Instant::now();
+    for link in links.iter_mut() {
+        if let Some(b) = link.rumble.poll(now) {
+            let pdu = acl::write_command(jc::HANDLE_RUMBLE, &rumble::ble_frame(&b));
+            let _ = sub.radio().with_dongle(|d| d.send_att(link.conn, &pdu));
+        }
+    }
+
     // Liveness watchdog: a link can stop delivering without a disconnect event,
     // and a pad frozen at its last values is worse than one that disappears.
     let mut i = 0;
@@ -964,6 +995,7 @@ fn pump(
             // fan-out like any other event.
             let _ = sub.radio().with_dongle(|d| d.disconnect(link.conn));
             shared.pads.lock().unwrap().remove(&link.key);
+            shared.rumble.lock().unwrap().remove(&link.key);
         } else {
             i += 1;
         }

@@ -80,11 +80,12 @@ impl IoTimingAcc {
 /// amplitude (a game's rumble, the ping): a Switch Pro its own default pitch on
 /// its own scale, any other pad 0.6 of its range.
 fn default_hd_freq(device_id: &str) -> f32 {
-    use flexinput_core::automap::{switch_hd_freq, SWITCH_RUMBLE_HZ};
-    if crate::canvas::remapper_icons::phys_pad_slug(device_id) == Some("switch_pro") {
-        switch_hd_freq(SWITCH_RUMBLE_HZ)
-    } else {
-        0.6
+    use flexinput_core::automap::{switch_hd_freq, PitchScale, JOYCON2_RUMBLE_HZ, SWITCH_RUMBLE_HZ};
+    match crate::canvas::remapper_icons::phys_pad_slug(device_id) {
+        Some("switch_pro") => switch_hd_freq(SWITCH_RUMBLE_HZ),
+        // Its `hd*_freq` pins read on the DualSense scale (`layouts::joycon2_inputs`).
+        Some("joycon2_l" | "joycon2_r") => PitchScale::DualSense.value(JOYCON2_RUMBLE_HZ),
+        _ => 0.6,
     }
 }
 

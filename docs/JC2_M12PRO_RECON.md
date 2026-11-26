@@ -460,6 +460,15 @@ changes).
 FlexInput's init already sends the `0x0A/0x08` "send vibration data" frame verbatim
 (`hub.rs:1087-1094`), so the encoding context is shared.
 
+**Lifted (2026-11-26), not tried on hardware yet:** `crates/joycon2/src/rumble.rs`. The two
+profiles above are SDL 3.4's 5-byte sample (`EncodeHDRumble`, `SDL_hidapi_switch2.c`): four
+10-bit fields little endian, high band freq / amp, low band freq / amp. Frequency is
+`round(log2(Hz/10) * 96)` (community-measured), so "strong" is 183 + 260 Hz and "weak"
+109 + 213 Hz at small amplitudes. Amplitude is capped at SDL's 453 of 1023. Frames go to
+`0x0012` as the fork sends them, the USB `0x01` report as SDL does. One frame every 12 ms
+while playing, then a stop frame twice. If the M12-S ignores `0x0012`, try the same block in
+the rumble region of a `0x0016` frame next.
+
 ---
 
 ## 11. Discovery and identity — the blocker
