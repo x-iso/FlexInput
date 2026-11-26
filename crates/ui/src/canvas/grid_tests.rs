@@ -5175,8 +5175,8 @@ fn both_pinned_3dof_mode_rows_answer_the_mouse() {
         let s = |k: &str| n.params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
         (s("family"), s("axis"))
     };
-    // World (the fourth choice) on the Pointer row, then Orient (the fifth) on the Steering row.
-    for (el, cell, want) in [("pointer_mode", 3usize, ("pointer", "world")), ("steering_mode", 4usize, ("steering", "orient"))] {
+    // World (the fourth choice) on the Pointer row, then Player (the third) on the Steering row.
+    for (el, cell, want) in [("pointer_mode", 3usize, ("pointer", "world")), ("steering_mode", 2usize, ("steering", "player"))] {
         let r = rig
             .ctx
             .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, el, 0usize), cell)))
@@ -5187,6 +5187,58 @@ fn both_pinned_3dof_mode_rows_answer_the_mouse() {
     }
     let clashes = rig.painted_all("🔥");
     assert!(clashes.is_empty(), "widgets share ids: {clashes:?}");
+}
+
+// Player and World take no roll mix, so its place picks their sub-mode. Pinned in Style 2: a
+// click on its second cell turns Player into Jason; World picked on the Pointer row, the same
+// cell turns it into Orient, and the Pointer row's World cell is then Orient's.
+#[test]
+fn the_pinned_roll_mix_row_picks_player_and_worlds_sub_modes() {
+    let (mut rig, ids) = Rig::with_pins("subpatch", &[], &[], &[egui::pos2(100.0, 120.0)]);
+    rig.screen = egui::vec2(3200.0, 2800.0);
+    let host = ids[0];
+    let desc = flexinput_modules::all_modules().into_iter().map(|r| r.descriptor).find(|d| d.id == "processing.gyro_3dof").expect("registered");
+    let mut inner: Snarl<NodeData> = Snarl::new();
+    let mut node = NodeData::from(&desc);
+    node.params.insert("family".into(), serde_json::json!("pointer"));
+    node.params.insert("axis".into(), serde_json::json!("player"));
+    let inner_id = inner.insert_node(egui::Pos2::ZERO, node);
+    let mut sp = crate::canvas::node::UiSubPatch::default();
+    sp.snarl = Box::new(inner);
+    for (el, y) in [("roll_mix", 8), ("pointer_mode", 48)] {
+        let pin: crate::canvas::node::ExposedModule = serde_json::from_str(&format!(
+            r#"{{"inner_node_id":{},"element_id":"{el}","pos":[8,{y}],"size":[420,30],"pin_style":2}}"#,
+            inner_id.0
+        ))
+        .expect("a pin");
+        sp.items.push(crate::canvas::node::LayoutItem::Module(pin));
+    }
+    rig.canvas.snarl.get_node_mut(host).expect("host").subpatch = Some(Box::new(sp));
+    rig.idle(10);
+    let mode = |rig: &Rig| {
+        let n = rig.canvas.snarl.get_node(host).and_then(|n| n.subpatch.as_ref()).and_then(|sp| sp.snarl.get_node(inner_id)).unwrap();
+        let s = |k: &str| n.params.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        (s("family"), s("axis"))
+    };
+    let click = |rig: &mut Rig, el: &str, cell: usize| {
+        let r = rig
+            .ctx
+            .read_response(egui::Id::new(("segmented", ("ps2_field", inner_id.0, el, 0usize), cell)))
+            .unwrap_or_else(|| panic!("{el}'s cell {cell} wasn't drawn"));
+        rig.click(r.rect.center());
+        rig.idle(3);
+    };
+    click(&mut rig, "roll_mix", 1);
+    assert_eq!(mode(&rig), ("pointer".to_string(), "jason".to_string()), "Player's second cell is Jason");
+    click(&mut rig, "pointer_mode", 3);
+    assert_eq!(mode(&rig), ("pointer".to_string(), "world".to_string()));
+    click(&mut rig, "roll_mix", 1);
+    assert_eq!(mode(&rig), ("pointer".to_string(), "orient".to_string()), "World's second cell is Orient");
+    let orients = rig.painted_all("Orient");
+    assert!(orients.len() >= 2, "the Pointer row's World cell says Orient too: {orients:?}");
+    // The Pointer row's third cell is Player again, and picking it leaves Orient.
+    click(&mut rig, "pointer_mode", 2);
+    assert_eq!(mode(&rig), ("pointer".to_string(), "player".to_string()));
 }
 
 /// Arrange lays a real patch out along its signal: a curve and the knob on the gain it

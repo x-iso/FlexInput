@@ -195,8 +195,8 @@ pub const LICENSES: &[License] = &[
     License {
         name: "GamepadMotionHelpers",
         what: "Which way is down, for everything that measures against \
-               gravity - the JSM Config module, 3DOF to 2D's Player, World \
-               and Orient, Gyro to Stick Rotation's World - is the estimate \
+               gravity - the JSM Config module, 3DOF to 2D's Player, Jason, \
+               World and Orient, Gyro to Stick Rotation's World - is the estimate \
                this library keeps for JoyShockMapper, ported step for step.",
         spdx: "MIT",
         url: "https://github.com/JibbSmart/GamepadMotionHelpers",

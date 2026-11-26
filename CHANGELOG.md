@@ -29,6 +29,19 @@ All notable changes to FlexInput are documented here. This project adheres to
   turning a stick, `ORIENT`), how tabs and layers behave, and every JSM setting and command
   the module leaves to another part of FlexInput or doesn't run yet, with the reason.
 
+- **3DOF to 2D: Jason mode, under Player.** Jason space, an idea of
+  [GyroVibing](https://github.com/GyroVibing)'s: X is the pad's own yaw, sped up by how far its
+  nose is pitched from level. Turning round with the pad tilted then reads whole, as it does
+  in Player, but rolling the pad moves nothing. Player makes up the turn a tilted pad loses
+  with its roll, which is one more axis to hold steady; Jason makes it up with the speed-up
+  instead, so the aim is steadier. The speed-up stops at twice as fast (60°); steeper than
+  that, roll makes up only what is still missing, so a turn still reads whole. Jason keeps
+  its own sense of level, which turning your body doesn't tip: swinging the pad round you
+  feels to the accelerometer like the nose dipping. Y is the pad's own pitch, as in Player.
+  You pick it where Pitch+Yaw has its roll mix, which Player has no use for. In
+  World the same place picks Orient, which no longer has a cell of its own, so the mode rows
+  have four cells. Saved patches keep their mode.
+
 - **Touch Zones: Trackball mode.** Beside Synced, Per-card and Touchpad, a zone can be a
   trackball: it follows the finger's motion as Touchpad does, and a flick (lifting your finger
   while it moves fast) keeps the pointer rolling that way at the flick's speed, as a trackball

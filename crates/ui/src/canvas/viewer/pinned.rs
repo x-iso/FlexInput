@@ -2640,11 +2640,16 @@ pub(crate) fn render_gyro_mode_row(
     {
         let font = egui::TextStyle::Button.resolve(ui.style());
         let pad = ui.spacing().button_padding.x;
-        let words: f32 = GYRO_AXIS_OPTIONS
+        // Each cell as wide as the longest of the modes it stands for, so picking Jason or
+        // Orient doesn't resize the row.
+        let word_w = |id: &str| {
+            ui.painter().layout_no_wrap(super::gyro_body::gyro_axis_label(id).to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x
+        };
+        let words: f32 = super::gyro_body::GYRO_MODE_CELLS
             .iter()
-            .map(|(_, l)| ui.painter().layout_no_wrap(l.to_string(), font.clone(), egui::Color32::PLACEHOLDER).size().x + 2.0 * pad)
+            .map(|modes| modes.iter().map(|id| word_w(id)).fold(0.0, f32::max) + 2.0 * pad)
             .sum();
-        let natural = egui::vec2(words + 2.0 * (GYRO_AXIS_OPTIONS.len() - 1) as f32 + 4.0, ui.spacing().interact_size.y.max(18.0));
+        let natural = egui::vec2(words + 2.0 * (super::gyro_body::GYRO_MODE_CELLS.len() - 1) as f32 + 4.0, ui.spacing().interact_size.y.max(18.0));
         let scale = (container.y / natural.y).min(container.x / natural.x).clamp(0.5, 4.0);
         if (scale - 1.0).abs() >= 0.02 {
             super::scale::scale_ui_style(ui, scale);
@@ -2652,9 +2657,9 @@ pub(crate) fn render_gyro_mode_row(
     }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
-        for (id, lbl) in GYRO_AXIS_OPTIONS {
+        for id in super::gyro_body::gyro_mode_cells(&axis) {
             let selected = family == target_family && axis == id;
-            if ui.selectable_label(selected, egui::RichText::new(lbl)).clicked() {
+            if ui.selectable_label(selected, egui::RichText::new(super::gyro_body::gyro_axis_label(id))).clicked() {
                 family = target_family.to_string();
                 axis   = id.to_string();
                 changed = true;
@@ -2785,11 +2790,33 @@ pub(crate) fn render_gyro_roll_mix_row(
 ) {
     let snap = snarl.get_node(inner_id);
     let mut mix = snap.and_then(|n| n.params.get("roll_contribution").and_then(|v| v.as_f64())).unwrap_or(0.0) as f32;
-    let pitch_yaw = snap.map(|n| super::gyro_body::gyro_read_family_axis(n).1 == "pitch_yaw").unwrap_or(true);
+    let (family, axis) = snap.map(super::gyro_body::gyro_read_family_axis).unwrap_or_else(|| ("pointer".into(), "pitch_yaw".into()));
+    let pitch_yaw = axis == "pitch_yaw";
     let mut changed = false;
     ui.set_max_width(container.x);
     apply_widget_scale(ui, container, egui::vec2(140.0, 22.0));
     let mut fr = [egui::Rect::NOTHING; 1];
+    // Player and World take no roll mix: here they pick their sub-mode (Jason, Orient).
+    if let Some(subs) = super::gyro_body::gyro_sub_modes(&axis) {
+        let mut picked = None;
+        let row = ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for id in subs {
+                if ui.selectable_label(axis == id, super::gyro_body::gyro_axis_label(id)).clicked() && axis != id {
+                    picked = Some(id);
+                }
+            }
+        });
+        fr[0] = row.response.rect;
+        publish_nav_field_rects(ui, inner_id, &fr);
+        if let (Some(id), Some(node)) = (picked, snarl.get_node_mut(inner_id)) {
+            // The family too: a patch from before the split has only the legacy `mode`.
+            node.params.insert("family".into(), Value::String(family));
+            node.params.insert("axis".into(), Value::String(id.into()));
+            node.params.remove("mode");
+        }
+        return;
+    }
     ui.add_enabled_ui(pitch_yaw, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;

@@ -2720,21 +2720,40 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
     use NavStep::{Decade, Fixed, FixedScaled, Linear};
     let param_str = |n: &NodeData, k: &str| n.params.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let param_bool = |n: &NodeData, k: &str| n.params.get(k).and_then(|v| v.as_bool());
-        // Gyro axis options (family, axis) for the pointer/steering mode rows.
-        const GYRO_PTR: &[(&str, &str, &str)] = &[
-            ("Pitch+Yaw", "pointer", "pitch_yaw"),
-            ("Pitch+Roll", "pointer", "pitch_roll"),
-            ("Player", "pointer", "player"),
-            ("World", "pointer", "world"),
-            ("Orient", "pointer", "orient"),
-        ];
-        const GYRO_STEER: &[(&str, &str, &str)] = &[
-            ("Pitch+Yaw", "steering", "pitch_yaw"),
-            ("Pitch+Roll", "steering", "pitch_roll"),
-            ("Player", "steering", "player"),
-            ("World", "steering", "world"),
-            ("Orient", "steering", "orient"),
-        ];
+        // Gyro axis options (family, axis) for the pointer/steering mode rows: four cells,
+        // Player's and World's standing for whichever of their sub-modes is in use, as the
+        // body draws them (`gyro_body::gyro_mode_cells`).
+        macro_rules! gyro_cells {
+            ($fam:literal, $p:literal, $pl:literal, $w:literal, $wl:literal) => {
+                &[("Pitch+Yaw", $fam, "pitch_yaw"), ("Pitch+Roll", $fam, "pitch_roll"), ($pl, $fam, $p), ($wl, $fam, $w)]
+            };
+        }
+        const GYRO_PTR: &[(&str, &str, &str)] = gyro_cells!("pointer", "player", "Player", "world", "World");
+        const GYRO_PTR_JASON: &[(&str, &str, &str)] = gyro_cells!("pointer", "jason", "Jason", "world", "World");
+        const GYRO_PTR_ORIENT: &[(&str, &str, &str)] = gyro_cells!("pointer", "player", "Player", "orient", "Orient");
+        const GYRO_STEER: &[(&str, &str, &str)] = gyro_cells!("steering", "player", "Player", "world", "World");
+        const GYRO_STEER_JASON: &[(&str, &str, &str)] = gyro_cells!("steering", "jason", "Jason", "world", "World");
+        const GYRO_STEER_ORIENT: &[(&str, &str, &str)] = gyro_cells!("steering", "player", "Player", "orient", "Orient");
+        // Player's and World's sub-modes, picked where Pitch+Yaw has its roll mix.
+        const GYRO_SUB_PTR_PLAYER: &[(&str, &str, &str)] = &[("Player", "pointer", "player"), ("Jason", "pointer", "jason")];
+        const GYRO_SUB_PTR_WORLD: &[(&str, &str, &str)] = &[("World", "pointer", "world"), ("Orient", "pointer", "orient")];
+        const GYRO_SUB_STEER_PLAYER: &[(&str, &str, &str)] = &[("Player", "steering", "player"), ("Jason", "steering", "jason")];
+        const GYRO_SUB_STEER_WORLD: &[(&str, &str, &str)] = &[("World", "steering", "world"), ("Orient", "steering", "orient")];
+        let gyro_mode = || {
+            node.map(crate::canvas::viewer::gyro_body::gyro_read_family_axis)
+                .unwrap_or_else(|| ("pointer".into(), "pitch_yaw".into()))
+        };
+        let gyro_cells = |steering: bool| {
+            let (_, axis) = gyro_mode();
+            match (steering, axis.as_str()) {
+                (false, "jason") => GYRO_PTR_JASON,
+                (false, "orient") => GYRO_PTR_ORIENT,
+                (false, _) => GYRO_PTR,
+                (true, "jason") => GYRO_STEER_JASON,
+                (true, "orient") => GYRO_STEER_ORIENT,
+                (true, _) => GYRO_STEER,
+            }
+        };
         let v = |key, lo, hi, default, step| NavField::Value { key, lo, hi, default, step };
         macro_rules! f { ($l:expr, $field:expr) => { NavFieldDef { label: $l.into(), field: $field } }; }
         // RWS Mouse Scale steps in the unit the header shows it in: 1 dot/°
@@ -2914,16 +2933,26 @@ pub(crate) fn element_fields(mid: &str, elem: &str, node: Option<&NodeData>) -> 
                 f!("Max", v("max_param",-1_000_000.0,1_000_000.0,10.0,Linear)),
             ],
             ("processing.gyro_3dof", "pointer_mode") | ("processing.gyro_3dof", "mode") =>
-                vec![f!("Pointer", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_PTR})],
+                vec![f!("Pointer", EnumPair{key_a:"family",key_b:"axis",opts:gyro_cells(false)})],
             ("processing.gyro_3dof", "steering_mode") =>
-                vec![f!("Steering", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_STEER})],
+                vec![f!("Steering", EnumPair{key_a:"family",key_b:"axis",opts:gyro_cells(true)})],
             ("processing.gyro_3dof", "steering_opts") => vec![
                 f!("Exclude Y", Toggle{key:"steering_exclude_y"}),
                 f!("Recenter", v("recenter_strength",0.0,4.0,0.0,Linear)),
                 f!("Reset ease", v("reset_ease_in",0.0,2.0,0.25,Linear)),
             ],
-            ("processing.gyro_3dof", "roll_mix") =>
-                vec![f!("Roll mix", v("roll_contribution",-100.0,100.0,0.0,Fixed(5.0)))],
+            // Player and World take no roll mix: in its place they pick their sub-mode.
+            ("processing.gyro_3dof", "roll_mix") => {
+                let (family, axis) = gyro_mode();
+                let steering = family == "steering";
+                match (steering, axis.as_str()) {
+                    (false, "player" | "jason") => vec![f!("Player", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_SUB_PTR_PLAYER})],
+                    (false, "world" | "orient") => vec![f!("World", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_SUB_PTR_WORLD})],
+                    (true, "player" | "jason") => vec![f!("Player", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_SUB_STEER_PLAYER})],
+                    (true, "world" | "orient") => vec![f!("World", EnumPair{key_a:"family",key_b:"axis",opts:GYRO_SUB_STEER_WORLD})],
+                    _ => vec![f!("Roll mix", v("roll_contribution",-100.0,100.0,0.0,Fixed(5.0)))],
+                }
+            }
             ("processing.gyro_3dof", "hold_offset") => vec![
                 f!("Hold pitch", v("hold_pitch",-180.0,180.0,0.0,Fixed(5.0))),
                 f!("Hold yaw", v("hold_yaw",-180.0,180.0,0.0,Fixed(5.0))),

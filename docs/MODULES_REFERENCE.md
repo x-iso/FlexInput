@@ -478,6 +478,17 @@ pub struct ModuleDescriptor {
   - Output 0: Orientation quaternion (Vec4)
   - Outputs 1..N: Lean mappings (Bool/Float per configured mapping)
 - **Parameters:**
+  - `family: String` - `pointer` (default) or `steering` (the turns added up)
+  - `axis: String` - What X and Y are read from: `pitch_yaw` (default), `pitch_roll`,
+    `player` (JSM's `PLAYER_TURN`), `jason` (Player's Jason mode, Jason space by
+    [GyroVibing](https://github.com/GyroVibing): X = yaw ÷ cos of the nose's pitch from
+    gravity, no roll; at most ×2 (60°), and steeper the roll makes up the rest of a turn about
+    gravity. The pitch is Jason's own gravity estimate, carried by the gyro through a turn and
+    corrected by the accelerometer only while the pad is nearly still, so turning your body
+    (the pad swung round you) doesn't read as the nose dipping; Y = pitch),
+    `world` (JSM's `WORLD_TURN`) or `orient`
+    (World's Orient mode: follows where the nose points). The mode rows show four cells;
+    Jason and Orient are picked in the roll mix's place
   - `roll_contribution: f64` - Roll mix, % (−100..100, default 0). Pitch+Yaw only:
     X = yaw − roll × share, the JSM module's `ROLL_CONTRIBUTION` (same sign)
   - `orient_source: String` - Pose for the Orientation output and Edge turn: `auto`
@@ -497,7 +508,7 @@ pub struct ModuleDescriptor {
     `edge_x_only` drops pitch from both the zone and the turn
   - `hold_pitch` / `hold_yaw` / `hold_roll: f64` - Neutral hold, degrees (default 0;
     + = far edge raised / nose right / right grip down). The 2D outputs and Lean
-    are measured from this hold: Pitch+Yaw / Pitch+Roll rotate gyro AND gravity
+    are measured from this hold: Pitch+Yaw / Pitch+Roll / Jason rotate gyro AND gravity
     (JSM's `LOCAL_AXIS_OFFSET` on three axes); Player / World rotate gravity only.
     The Orientation output ignores it. All zero = stock, bit-exact
   - `lean_left: Array<Mapping>` - Left lean mappings

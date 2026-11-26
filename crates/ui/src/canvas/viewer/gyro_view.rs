@@ -1158,7 +1158,7 @@ mod tests {
         assert!(proj("pitch_yaw", 0.5, [false; 3]).reads(Rate::Roll));
         assert!(proj("pitch_roll", 0.0, [false; 3]).reads(Rate::Roll));
         assert!(!proj("pitch_roll", 0.0, [false; 3]).reads(Rate::Yaw), "Pitch+Roll reads no yaw");
-        for axis in ["player", "world", "orient"] {
+        for axis in ["player", "jason", "world", "orient"] {
             assert!(!proj(axis, 0.5, [false; 3]).reads(Rate::Roll), "{axis}");
         }
     }

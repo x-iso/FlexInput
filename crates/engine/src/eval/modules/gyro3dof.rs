@@ -12,6 +12,7 @@ pub(crate) fn gyro_resolve_mode(params: &HashMap<String, Value>) -> (&'static st
         let a: &'static str = match axis {
             "pitch_roll" => "pitch_roll",
             "player"     => "player",
+            "jason"      => "jason",
             "world"      => "world",
             "orient"     => "orient",
             _            => "pitch_yaw",
@@ -46,6 +47,89 @@ pub(crate) fn gyro_hold_rotation(params: &HashMap<String, Value>) -> Option<glam
             * glam::Quat::from_rotation_y(pitch.to_radians())
             * glam::Quat::from_rotation_x(roll.to_radians()),
     )
+}
+
+/// The most Jason space speeds the pad's own yaw up by: 1 / cos 60°, JoyShockMapper's
+/// PLAYER_TURN buffer. Past 60° of pitch a turn about the vertical has gone mostly into
+/// roll, and a bigger gain would mostly be magnifying noise: the roll makes up the rest.
+const JASON_MAX_GAIN: f32 = 2.0;
+
+/// Jason space's turn: the pad's own `yaw` sped up by 1 / cos of how far its nose is
+/// pitched from level, `down` in the gyro's (forward, right, down) basis. A pad pitched
+/// θ that turns about the vertical feels the turn as yaw only by cos θ, the rest as roll;
+/// Player takes that roll back in, while Jason puts it back as a gain, so rolling the pad
+/// moves nothing. The pitch is the nose's alone: a roll doesn't change the gain, as it
+/// doesn't change what Player recovers. 1 with no gravity.
+///
+/// The gain stops at [`JASON_MAX_GAIN`], and steeper than that the pad's `roll` makes up
+/// the rest of a turn about the vertical, only as much of it as the capped gain leaves
+/// out: none at the cap, all of it pointing straight up, so a turn still reads whole.
+///
+/// Jason space is GyroVibing's idea (github.com/GyroVibing).
+pub(crate) fn jason_turn(yaw: f32, roll: f32, down: glam::Vec3) -> f32 {
+    let d = down.normalize_or_zero();
+    let level = (1.0 - d.x * d.x).max(0.0).sqrt();
+    if level * JASON_MAX_GAIN >= 1.0 {
+        yaw / level
+    } else {
+        // A turn w about the vertical reads w·level as yaw and w·d.x as roll; the capped
+        // gain takes w·level·cap of it, and this much roll the rest. |d.x| > 0.86 here.
+        yaw * JASON_MAX_GAIN + roll * (1.0 - JASON_MAX_GAIN * level) / d.x
+    }
+}
+
+/// Where in `aux_f32` Jason keeps its own down (`jason_down`): x, y, z, then whether it
+/// has one.
+const JASON_AUX: usize = 61;
+
+/// How fast the accelerometer pulls Jason's down in with the pad still: a share of the gap
+/// a second (GamepadMotionHelpers' still speed).
+const JASON_PULL: f32 = 1.0;
+/// The turn rate (°/s) that cuts that pull to half; it falls with the square of the rate.
+const JASON_CALM_DPS: f32 = 10.0;
+
+/// Which way is down for Jason's gain, in the gyro's (forward, right, down) basis.
+///
+/// The gain is 1 / cos of the pitch, so a pitch read a few degrees out is a turn read
+/// several percent out - where Player, which projects the turn on the vertical, barely
+/// notices the same error. And the fused gravity (`GravityFusion`, JSM's) does read a few
+/// degrees out exactly when Jason is used: turning your body swings the pad round you,
+/// the accelerometer feels that as the nose dipping, and the fusion follows it (5° at
+/// 90°/s with the pad 35 cm out, a turn read 5-12% short).
+///
+/// So this down is carried by the gyro alone through a turn, which is exact - a turn
+/// about the vertical doesn't move gravity in the pad's frame at all - and the
+/// accelerometer only pulls it in while the pad is nearly still, where all it reads is
+/// gravity: at [`JASON_PULL`] a second still, a fiftieth of it turning at 70°/s. That
+/// takes out the gyro's drift and its small errors in carrying a tilt, between moves.
+/// `accel` is the bus's, in g, (forward, left, up). `None` until the accelerometer has
+/// said anything.
+fn jason_down(s: &mut [f32], gyro_dps: glam::Vec3, accel: glam::Vec3, dt: f32) -> Option<glam::Vec3> {
+    let mut d = glam::Vec3::new(s[0], s[1], s[2]);
+    let known = s[3] > 0.5;
+    let rate = gyro_dps.length();
+    if known && rate > 0.0 && dt > 0.0 {
+        // Fixed in the world, it turns back by the pad's turn.
+        d = glam::Quat::from_axis_angle(gyro_dps / rate, -(rate * dt).to_radians()) * d;
+    }
+    // Into (forward, right, down); the accelerometer reads up.
+    let a = glam::Vec3::new(accel.x, -accel.y, -accel.z);
+    let len = a.length();
+    if len > 0.05 {
+        let target = -a / len;
+        if known {
+            let calm = 1.0 / (1.0 + (rate / JASON_CALM_DPS).powi(2));
+            // A push or a shake changes how hard the accelerometer reads, gravity doesn't.
+            let steady = 1.0 / (1.0 + ((len - 1.0) / 0.1).powi(2));
+            let k = (JASON_PULL * calm * steady * dt.max(0.0)).clamp(0.0, 1.0);
+            d = (d + (target - d) * k).try_normalize().unwrap_or(target);
+        } else {
+            d = target;
+            s[3] = 1.0;
+        }
+    }
+    s[..3].copy_from_slice(&d.to_array());
+    (s[3] > 0.5).then_some(d)
 }
 
 /// A canonical accel reading in the orientation's model frame (X = right,
@@ -378,6 +462,9 @@ pub(crate) fn compute_gyro_3dof(
     //       axes. A handheld tilted back 40°: yaw becomes the turn about the
     //       tilted hold's up rather than the face normal, and Lean stops reading
     //       the tilt as half a lean.
+    //   Jason                   both too, as Pitch+Yaw: its yaw is the pad's own,
+    //       so the hold names the neutral it is measured about, and the gain
+    //       then makes up only for pitching away from the hold.
     //   Player / World          gravity ONLY. These already adapt to how the
     //       pad is held, and rotating the gyro with gravity would cancel out of
     //       their projection anyway. What the offset changes is which way is
@@ -485,7 +572,7 @@ pub(crate) fn compute_gyro_3dof(
 
     // ── Which way is down, as JoyShockMapper knows it ─────────────────────
     //
-    // Player, World and Orient measure against gravity, and take it from the
+    // Player, Jason, World and Orient measure against gravity, and take it from the
     // estimate JSM's motion library keeps (`GravityFusion`): carried by the
     // gyro through every turn, pulled in by the accelerometer. Fed the physical
     // readings; the hold then names which way is "down", as it always has.
@@ -503,6 +590,7 @@ pub(crate) fn compute_gyro_3dof(
     // Orient's pad, in the hold's frame: the orientation itself (the preview's pad).
     let orient_now = (axis == "orient").then(|| nose_angles(pad_q, hold));
     while state.aux_f32.len() < ORIENT_AUX + ORIENT_CAMERA_LEN + 1 { state.aux_f32.push(0.0); }
+    while state.aux_f32.len() < JASON_AUX + 4 { state.aux_f32.push(0.0); }
     // A pad with no accelerometer is taken as held flat.
     let down = down_held.unwrap_or(glam::Vec3::Z);
 
@@ -510,7 +598,8 @@ pub(crate) fn compute_gyro_3dof(
     //
     // Player and World are JSM's PLAYER_TURN and WORLD_TURN, by JSM's own
     // maths (the JSM module's, which is JSM's line for line); Orient follows
-    // where the nose points. Pitch+Yaw and Pitch+Roll take the gyro rates.
+    // where the nose points. Pitch+Yaw and Pitch+Roll take the gyro rates, and
+    // Jason Pitch+Yaw's with the yaw sped up by the nose's pitch.
     //
     // Lean is derived separately below from accel tilt (NOT a gyro rate) so
     // that holding a tilted controller still asserts a steady lean signal
@@ -531,6 +620,16 @@ pub(crate) fn compute_gyro_3dof(
             let space = if axis == "player" { JsmSpace::PlayerTurn } else { JsmSpace::WorldTurn };
             let (mx, my) = jsm_gravity_space(space, g, r);
             (mx, -my, 0.0)
+        }
+        "jason" => {
+            // Jason space: Pitch+Yaw's yaw, sped up by how far the nose is pitched from
+            // level, so a turn about the vertical reads whole as Player reads it, with no
+            // roll in it to wobble the aim. Down is Jason's own, which a body turn's pull
+            // outward doesn't tip (the fused one if it has none yet); the gyro and gravity
+            // are both in the hold's frame.
+            let own = jason_down(&mut state.aux_f32[JASON_AUX..JASON_AUX + 4], gyro_dps, glam::Vec3::new(ax, ay, az), dt);
+            let d = own.map_or(down, |d| hold.map_or(d, |q| q * d));
+            (jason_turn(hgz, hgx, d), hgy, 0.0)
         }
         "orient" => {
             // A camera kept looking where the nose points (`OrientCamera`): the gyro's own
@@ -557,6 +656,10 @@ pub(crate) fn compute_gyro_3dof(
     if axis != "orient" {
         // Back to Orient later, it starts afresh.
         state.aux_f32[ORIENT_AUX..ORIENT_AUX + ORIENT_CAMERA_LEN].fill(0.0);
+    }
+    if axis != "jason" {
+        // And Jason from the accelerometer.
+        state.aux_f32[JASON_AUX + 3] = 0.0;
     }
 
     // ── Steering integration + auto-recentering ───────────────────────────
@@ -586,8 +689,8 @@ pub(crate) fn compute_gyro_3dof(
         // against where it was at the last Reset, is how far the wheel is
         // turned, and the turn added up is pulled toward it, at
         // `recenter_strength` a second, scaled by how squarely gravity crosses
-        // the axis. In Player, World and Orient the wheel turns about gravity
-        // itself, which gravity can't see: only a Reset centres those.
+        // the axis. In Player, Jason, World and Orient the wheel turns about
+        // gravity itself, which gravity can't see: only a Reset centres those.
         //
         // (This compared an angle in radians with a turn measured in units 35
         // times smaller, from a reference 90° off for an upright pad: set, it
@@ -1026,7 +1129,7 @@ pub(crate) fn compute_gyro_3dof(
         (Some(_), Some(_)) => 2.0,
         (Some(_), None) => 1.0,
     };
-    let mode = match axis { "pitch_roll" => 2.0, "player" => 3.0, "world" => 4.0, "orient" => 5.0, _ => 1.0 };
+    let mode = match axis { "pitch_roll" => 2.0, "player" => 3.0, "world" => 4.0, "orient" => 5.0, "jason" => 6.0, _ => 1.0 };
     let inv3 = [inv("inv_yaw"), inv("inv_pitch"), inv("inv_roll")];
     // Steering puts out an angle of its own - added up, centred, eased home by
     // a Reset - so the preview shows that, in degrees, as it goes out.
@@ -1072,7 +1175,7 @@ pub(crate) fn compute_gyro_3dof(
         // multiplier in them. A device's pose is physical; a computed one turns
         // by the 3D rot ×.
         let k = GYRO_REF_DPS / dev_gyro_mult * dt * if device_q.is_some() { 1.0 } else { orient_disp_scale };
-        let base_rate = match axis { "pitch_roll" => 0.0, "player" | "world" | "orient" => raw_x, _ => hgz };
+        let base_rate = match axis { "pitch_roll" => 0.0, "player" | "jason" | "world" | "orient" => raw_x, _ => hgz };
         let wrap = |d: f32| (d + 180.0).rem_euclid(360.0) - 180.0;
         // Over the poles too: past straight up is over the top, where the nose went.
         a[0] = wrap(a[0] + raw_x * inv3[0] * k);
@@ -1255,7 +1358,7 @@ fn aim_start(q: glam::Quat, axis: &str, roll_share: f32, inv: [f32; 3], device: 
     let (yaw, pitch, roll) = if device { (a.x * iy, a.y * ip, a.z * ir * iy) } else { (a.x, a.y, a.z * iy) };
     match axis {
         "pitch_roll" => (roll, pitch, 0.0),
-        "player" | "world" | "orient" => (yaw, pitch, yaw),
+        "player" | "jason" | "world" | "orient" => (yaw, pitch, yaw),
         _ => (yaw - roll * roll_share, pitch, yaw),
     }
 }
@@ -1392,6 +1495,49 @@ mod hold_offset_tests {
             let (x, y, _, _) = run(&player, g, a);
             assert!((x - w).abs() < 1e-4, "{deg}° nose-up: a turn about gravity read {x}");
             assert!(y.abs() < 1e-4, "{deg}° nose-up: and leaked {y} into pitch");
+        }
+    }
+
+    // Jason space reads a turn about the vertical whole on a pitched pad, as Player
+    // does, but from the pad's yaw alone: a roll of the same pad moves nothing, where
+    // Player turns by it. Past 60° of pitch the gain stops at 2 and the roll makes up
+    // the rest of the turn - only that much of a roll comes in.
+    #[test]
+    fn jason_reads_a_whole_turn_on_a_pitched_pad_and_no_roll() {
+        let w = 0.1;
+        let jason = [("family", json!("pointer")), ("axis", json!("jason"))];
+        for deg in [0.0, 30.0, 45.0, 60.0, 75.0, 85.0] {
+            let (g, a) = nose_up_turn(deg, w);
+            let (x, y, _, _) = run(&jason, g, a);
+            assert!((x - w).abs() < 1e-4, "{deg}° nose-up: a turn about gravity read {x}");
+            assert!(y.abs() < 1e-4, "{deg}° nose-up: and leaked {y} into pitch");
+        }
+        // A roll alone, the pad 30° nose-up: nothing in Jason, a turn in Player.
+        let player = [("family", json!("pointer")), ("axis", json!("player"))];
+        let (_, a) = nose_up_turn(30.0, w);
+        let (x, _, _, _) = run(&jason, [w, 0.0, 0.0], a);
+        assert!(x.abs() < 1e-4, "Jason took a roll in: {x}");
+        let (xp, _, _, _) = run(&player, [w, 0.0, 0.0], a);
+        assert!(xp.abs() > 0.5 * w, "Player reads that roll as a turn: {xp}");
+        // 75° nose-up, past the cap: part of a roll, the same way as Player's, less of it.
+        let (_, a) = nose_up_turn(75.0, w);
+        let (x, _, _, _) = run(&jason, [w, 0.0, 0.0], a);
+        let (xp, _, _, _) = run(&player, [w, 0.0, 0.0], a);
+        assert!(x.abs() > 0.1 * w && x.abs() < 0.75 * xp.abs() && x.signum() == xp.signum(), "75°: Jason {x}, Player {xp}");
+    }
+
+    // The hold names Jason's neutral, as it does Pitch+Yaw's: a pad held as the hold
+    // says turns about the vertical whole with no gain, and pitched past it the gain
+    // makes up for what it pitched away from the hold.
+    #[test]
+    fn jason_measures_about_the_hold() {
+        let w = 0.1;
+        let held = [("family", json!("pointer")), ("axis", json!("jason")), ("hold_pitch", json!(30.0))];
+        for deg in [30.0, 50.0, 10.0] {
+            let (g, a) = nose_up_turn(deg, w);
+            let (x, y, _, _) = run(&held, g, a);
+            assert!((x - w).abs() < 1e-4, "{deg}° nose-up, held at 30°: {x}");
+            assert!(y.abs() < 1e-4, "{deg}° nose-up, held at 30°: leaked {y} into pitch");
         }
     }
 
@@ -1916,6 +2062,36 @@ mod aim_tests {
             self.turn(axis, deg, dps);
         }
 
+        /// Turn the body `deg` right about the world's up with the pad `r` metres out in
+        /// front, up to `peak` °/s and smoothly back down: the accelerometer feels the
+        /// pull outward and the push along the way too. The X output added up, degrees.
+        fn body_turn(&mut self, deg: f32, peak: f32, r: f32) -> f32 {
+            let bias = self.accel_bias;
+            // A sin² speed averages half its peak.
+            let n = (2.0 * deg / peak / DT).round() as usize;
+            let (mut sum, mut prev) = (0.0, 0.0);
+            for i in 0..n {
+                let s = (std::f32::consts::PI * (i as f32 + 0.5) / n as f32).sin();
+                let w = peak * s * s;
+                let axis = self.q.inverse() * Vec3::NEG_Z;
+                self.q = (self.q * Quat::from_axis_angle(axis, (w * DT).to_radians())).normalize();
+                // Out from the body along the nose, laid level; a right turn carries the
+                // pad toward its right.
+                let f = self.q * Vec3::X;
+                let out = Vec3::new(f.x, f.y, 0.0).normalize_or_zero();
+                let right = Vec3::new(out.y, -out.x, 0.0);
+                let (wr, ar) = (w.to_radians(), ((w - prev) / DT).to_radians());
+                prev = w;
+                self.accel_bias = bias + self.q.inverse() * ((right * ar - out * wr * wr) * r / 9.81);
+                self.tick(axis * w, false);
+                if let Some(Signal::Float(x)) = self.out[1] {
+                    sum += x * 2000.0 * DT;
+                }
+            }
+            self.accel_bias = bias;
+            sum
+        }
+
         fn set(&mut self, k: &str, v: Value) {
             self.p.insert(k.into(), v);
             self.tick(Vec3::ZERO, false);
@@ -2020,7 +2196,7 @@ mod aim_tests {
     // turn at about half.
     #[test]
     fn player_and_world_keep_up_with_a_quick_tilt() {
-        for axis in ["player", "world"] {
+        for axis in ["player", "jason", "world"] {
             let mut pad = Pad::new(&[("axis", json!(axis))]);
             pad.turn(NOSE_UP, 60.0, 600.0);
             pad.turn_world(45.0, 180.0);
@@ -2087,7 +2263,8 @@ mod aim_tests {
 
     // The nose 60° up, twisted a quarter turn about itself: it points where it
     // did. World turns the camera by the twist's share about gravity (sin 60°),
-    // Player - JSM's PLAYER_TURN, relaxed - by all of it; Orient not at all.
+    // Player - JSM's PLAYER_TURN, relaxed - by all of it; Orient not at all, and
+    // nor does Jason, whose turn is the pad's own yaw.
     #[test]
     fn a_twist_about_a_raised_nose_turns_world_and_player_but_not_orient() {
         let twist = |axis: &str| {
@@ -2098,6 +2275,7 @@ mod aim_tests {
             (pad.aim().0 - before).abs()
         };
         assert!(twist("orient") < 1.0, "Orient: {}", twist("orient"));
+        assert!(twist("jason") < 1.0, "Jason: {}", twist("jason"));
         assert!((twist("world") - 90.0 * 60f32.to_radians().sin()).abs() < 1.5, "World: {}", twist("world"));
         assert!((twist("player") - 90.0).abs() < 1.5, "Player: {}", twist("player"));
     }
@@ -2333,6 +2511,33 @@ mod aim_tests {
                 assert!(near(pad.aim(), at, 0.01), "a still pad's pointer moved: {at:?} -> {:?}", pad.aim());
             }
         }
+    }
+
+    // Turning your body swings the pad round you, and the accelerometer feels the pull
+    // outward as the nose dipping. The fused gravity follows it, and Jason's gain, read off
+    // the pitch, read a 360° turn 3-12% short with the pad 35 cm out (Player, which
+    // projects the turn on the vertical, barely notices). Jason's own down rides the gyro
+    // through a turn. Steeper than the gain's cap, the roll makes up the rest: a 70° pad
+    // read 246°.
+    #[test]
+    fn jason_reads_a_body_turn_whole() {
+        for pitch in [30.0, 45.0, 60.0, 70.0] {
+            for (peak, r) in [(90.0, 0.0), (90.0, 0.35), (180.0, 0.35), (360.0, 0.35), (180.0, 0.6)] {
+                let mut pad = Pad::new(&[("axis", json!("jason"))]);
+                pad.turn(NOSE_UP, pitch, 200.0);
+                pad.hold_still(1.5);
+                let x = pad.body_turn(360.0, peak, r);
+                assert!((x - 360.0).abs() < 1.0, "{pitch}° nose-up, {peak}°/s with the pad {r} m out: {x}");
+            }
+        }
+        // Half a turn on a pad whose gyro is set a degree askew against its accelerometer:
+        // gravity carried by the gyro alone goes that much off by halfway, and comes back.
+        let mut pad = Pad::new(&[("axis", json!("jason"))]);
+        pad.gyro_skew = Quat::from_rotation_y(1f32.to_radians());
+        pad.turn(NOSE_UP, 45.0, 200.0);
+        pad.hold_still(1.5);
+        let x = pad.body_turn(180.0, 180.0, 0.35);
+        assert!((x - 180.0).abs() < 4.0, "askew: {x}");
     }
 
     // Panic mode's reset (`request_gyro_reset` sets `reset_request`) is a Reset:

@@ -2137,6 +2137,10 @@ impl FlexInputApp {
             ui.hyperlink_to(t("ndeadly"), "https://github.com/ndeadly/switch2_controller_research");
             ui.label(t("(Switch 2 / Joy-Con 2)."));
         });
+        credit(ui, &mut |ui| {
+            ui.label(t("3DOF to 2D's Jason mode is Jason space, the idea of"));
+            ui.hyperlink_to(t("GyroVibing"), "https://github.com/GyroVibing");
+        });
         form_gap(ui);
         if ui.button("Third-party licenses…")
             .on_hover_text("Full licence text for everything FlexInput redistributes")

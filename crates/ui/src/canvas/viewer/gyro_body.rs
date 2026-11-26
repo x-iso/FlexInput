@@ -18,11 +18,12 @@ pub(crate) fn gyro_read_family_axis(n: &NodeData) -> (String, String) {
 }
 
 /// The drawing on each mode's cell, in the order of `GYRO_AXIS_OPTIONS`: the turn Pitch+Yaw
-/// and Pitch+Roll take X from, a figure for Player (turns about your own up), a globe for
-/// World (turns about the world's), a compass for Orient (where the nose points).
-const GYRO_AXIS_ICONS: [&[u8]; 5] = [
+/// and Pitch+Roll take X from, a figure for Player and its Jason (turns about your own up), a
+/// globe for World (turns about the world's), a compass for its Orient (where the nose points).
+const GYRO_AXIS_ICONS: [&[u8]; 6] = [
     include_bytes!("../../../../../app/assets/Motion/gyro_yaw.svg"),
     include_bytes!("../../../../../app/assets/Motion/gyro_roll.svg"),
+    include_bytes!("../../../../../app/assets/general/UI/human-target.svg"),
     include_bytes!("../../../../../app/assets/general/UI/human-target.svg"),
     include_bytes!("../../../../../app/assets/general/UI/wireframe-globe.svg"),
     include_bytes!("../../../../../app/assets/general/UI/compass.svg"),
@@ -37,13 +38,41 @@ pub(crate) fn gyro_axis_icon(axis: &str) -> Option<&'static [u8]> {
 const POINTER_ICON: &[u8] = include_bytes!("../../../../../app/assets/general/UI/crosshair.svg");
 const STEERING_ICON: &[u8] = include_bytes!("../../../../../app/assets/general/UI/steering-wheel.svg");
 
-pub(crate) const GYRO_AXIS_OPTIONS: [(&str, &str); 5] = [
+/// Every axis mode the module stores, with its name. Jason is a sub-mode of Player and
+/// Orient of World: the mode rows show four cells (`GYRO_MODE_CELLS`), and the sub-mode is
+/// picked where the roll mix stands in Pitch+Yaw (`gyro_sub_modes`).
+pub(crate) const GYRO_AXIS_OPTIONS: [(&str, &str); 6] = [
     ("pitch_yaw",  "Pitch+Yaw"),
     ("pitch_roll", "Pitch+Roll"),
     ("player",     "Player"),
+    ("jason",      "Jason"),
     ("world",      "World"),
     ("orient",     "Orient"),
 ];
+
+/// The mode rows' four cells, each the modes it stands for: the first is the one picked
+/// from elsewhere, the rest are its sub-modes.
+pub(crate) const GYRO_MODE_CELLS: [&[&str]; 4] = [&["pitch_yaw"], &["pitch_roll"], &["player", "jason"], &["world", "orient"]];
+
+/// The axis mode each of the mode rows' cells stands for with `axis` in use: the sub-mode
+/// in use in its own cell, the plain mode in the others.
+pub(crate) fn gyro_mode_cells(axis: &str) -> [&'static str; 4] {
+    GYRO_MODE_CELLS.map(|modes| modes.iter().copied().find(|m| *m == axis).unwrap_or(modes[0]))
+}
+
+/// The two sub-modes `axis` picks between where Pitch+Yaw has its roll mix - Player and
+/// Jason, or World and Orient - or `None` in a mode that has none.
+pub(crate) fn gyro_sub_modes(axis: &str) -> Option<[&'static str; 2]> {
+    GYRO_MODE_CELLS
+        .iter()
+        .find(|modes| modes.len() == 2 && modes.contains(&axis))
+        .map(|modes| [modes[0], modes[1]])
+}
+
+/// A mode's name, as `GYRO_AXIS_OPTIONS` has it.
+pub(crate) fn gyro_axis_label(axis: &str) -> &'static str {
+    GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == axis).map_or("Pitch+Yaw", |(_, l)| l)
+}
 
 pub(crate) fn show_gyro_3dof_body(
     node_id: NodeId,
@@ -131,20 +160,22 @@ pub(crate) fn show_gyro_3dof_body(
     ];
     /// What each axis family does, in the order of `GYRO_AXIS_OPTIONS`: the hover text of
     /// the cell that chooses it, and the same list the viewport's arrows are drawn from.
-    const GYRO_AXIS_TIPS: [&str; 5] = [
+    const GYRO_AXIS_TIPS: [&str; 6] = [
         "Yaw turns X and pitch turns Y — the plain gyro aim.",
         "Roll turns X and pitch turns Y — for a grip that steers by rolling.",
-        "JoyShockMapper's PLAYER_TURN: turning about gravity is X, however the pad\nis held (yaw and roll both count, up to how fast the pad is turning), and\nY is the pad's own pitch. Forgiving of how you hold it.",
-        "JoyShockMapper's WORLD_TURN: turning about gravity is X, and Y is pitch\nmeasured level with the world, faded out as the pad goes onto its side.",
+        "JoyShockMapper's PLAYER_TURN: turning about gravity is X, however the pad\nis held (yaw and roll both count, up to how fast the pad is turning), and\nY is the pad's own pitch. Forgiving of how you hold it. Its Jason mode\nleaves the roll out.",
+        "Jason mode, Jason space by GyroVibing (github.com/GyroVibing): X is the\npad's own yaw, sped up by how far its nose is pitched from level, so a\nturn about gravity reads whole, as in Player. Rolling the pad moves\nnothing, so there's one axis fewer to hold steady. The speed-up stops at\n2× (60°); steeper, roll makes up only what is still missing. Y is the\npad's own pitch.",
+        "JoyShockMapper's WORLD_TURN: turning about gravity is X, and Y is pitch\nmeasured level with the world, faded out as the pad goes onto its side.\nIts Orient mode follows where the nose points instead.",
         "Follows where the pad's nose points: X is how fast its heading changes,\nY its elevation, so adding them up lands where it points whatever path it\ntook. Twisting the pad about its nose does nothing. Above 75° up or\ndown the heading stops speeding up (straight up it has none). While\nthe pad moves, Y is held level with gravity, so turning round doesn't\nspiral it up or down; a still pad's pointer never moves.",
     ];
     /// The same choices in the Steering row, which adds the turns up into a wheel's angle.
     /// JoyShockMapper has nothing like it (its lean steering, LEFT_STEER_X, is a tilt read off
     /// gravity, not a turn added up); what each reads as turning is the Pointer row's.
-    const GYRO_STEER_TIPS: [&str; 5] = [
+    const GYRO_STEER_TIPS: [&str; 6] = [
         "The wheel's angle is the pad's yaw, added up: hold it upright like a\nwheel and turn it in its own face. Upright, gravity can see the wheel,\nso ctr keeps it centred where Reset put it.",
         "The wheel's angle is the pad's roll, added up: hold it flat and roll it.\nFlat, gravity can see the wheel, so ctr keeps it centred where Reset\nput it.",
         "The wheel's angle is the turn about gravity (as Pointer's Player reads it),\nadded up: turn the pad about the vertical however it is held. Gravity\ncan't see a turn about itself, so only Reset centres it.",
+        "The wheel's angle is the turn about gravity as Pointer's Jason reads it\n(the pad's yaw, sped up by its pitch, no roll), added up. Gravity can't\nsee a turn about itself, so only Reset centres it.",
         "The wheel's angle is the turn about gravity (as Pointer's World reads it),\nadded up, and Y the pitch measured level. Gravity can't see a turn about\nitself, so only Reset centres it.",
         "X and Y are where the pad's nose points from where Reset put it, as a\nheading and an elevation. Gravity can't see a heading, so only Reset\ncentres X.",
     ];
@@ -155,13 +186,7 @@ pub(crate) fn show_gyro_3dof_body(
     let hold_q = glam::Quat::from_rotation_z(hold[1].to_radians())
         * glam::Quat::from_rotation_y(hold[0].to_radians())
         * glam::Quat::from_rotation_x(hold[2].to_radians());
-    let axis_id: &'static str = match axis.as_str() {
-        "pitch_roll" => "pitch_roll",
-        "player" => "player",
-        "world" => "world",
-        "orient" => "orient",
-        _ => "pitch_yaw",
-    };
+    let axis_id: &'static str = GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == axis).map_or("pitch_yaw", |(id, _)| id);
 
     // The model the viewport wears when the header says so: the same trace the 3D viewer
     // makes, up the Device wire and out through a sub-patch inlet if it has to, so the two
@@ -408,14 +433,26 @@ pub(crate) fn show_gyro_3dof_body(
             row_fields.push(("hold_offset", fields));
         }
 
-        // Roll mixed into the turn, and the Lean threshold with its live reading beside it.
+        // Roll mixed into the turn, in Pitch+Yaw. Player and World take no roll mix, so there
+        // the same place picks their sub-mode: Player or Jason, World or Orient.
         {
             let r = cell(1);
             let pr = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - ctrl * 0.5), egui::vec2(r.width(), ctrl));
-            let shown = format!("{roll_mix:+.0} %");
-            changed |= pill_in(ui, roll_mix_on, node_id, "gyro_roll_mix", pr, "mix|roll mix", &mut roll_mix, &shown, -100.0..=100.0, 0.4, GYRO_ROLL_MIX_TIP, 0.0);
+            if let Some(subs) = gyro_sub_modes(axis_id) {
+                let tips = if family == "steering" { GYRO_STEER_TIPS } else { GYRO_AXIS_TIPS };
+                let tip = |id: &str| GYRO_AXIS_OPTIONS.iter().position(|(o, _)| *o == id).map_or("", |i| tips[i]);
+                let opts = subs.map(|id| (id, gyro_axis_label(id), tip(id)));
+                if let Some(pick) = super::curve_rows::segmented(ui, pr, &axis_id, &opts, ("gyro_sub_mode", node_id)) {
+                    axis = pick.to_string();
+                    changed = true;
+                }
+                row_fields.push(("roll_mix", vec![pr]));
+            } else {
+                let shown = format!("{roll_mix:+.0} %");
+                changed |= pill_in(ui, roll_mix_on, node_id, "gyro_roll_mix", pr, "mix|roll mix", &mut roll_mix, &shown, -100.0..=100.0, 0.4, GYRO_ROLL_MIX_TIP, 0.0);
+                row_fields.push(("roll_mix", vec![on(roll_mix_on, pr)]));
+            }
             roll_mix_rect = Some(r);
-            row_fields.push(("roll_mix", vec![on(roll_mix_on, pr)]));
         }
         // The steering accumulators: what pulls them toward a heading, and how fast a Reset
         // lets go.
@@ -777,13 +814,7 @@ pub(crate) fn render_gyro_preview_pinned(
     let hold_q = glam::Quat::from_rotation_z(hold[1].to_radians())
         * glam::Quat::from_rotation_y(hold[0].to_radians())
         * glam::Quat::from_rotation_x(hold[2].to_radians());
-    let axis_id: &'static str = match axis.as_str() {
-        "pitch_roll" => "pitch_roll",
-        "player" => "player",
-        "world" => "world",
-        "orient" => "orient",
-        _ => "pitch_yaw",
-    };
+    let axis_id: &'static str = GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == axis).map_or("pitch_yaw", |(id, _)| id);
     let edge = GyroEdge::read(n);
     let look = match style.and_then(|s| s.gyro_look.as_deref()) {
         Some("icon") => "icon",
@@ -896,6 +927,7 @@ fn gyro_pad_svg(devs: &[String]) -> Option<&'static [u8]> {
 
 pub(crate) const GYRO_ROLL_MIX_TIP: &str =
     "Pitch+Yaw only: mix a share of roll into the turn (X).\n\
+     In Player and World this place picks their sub-mode.\n\
      Same setting as the JSM module's ROLL_CONTRIBUTION.\n\
      Positive puts back the turn a far-edge-raised grip loses\n\
      into roll; negative makes rolling right turn right, like\n\
@@ -906,9 +938,10 @@ pub(crate) const GYRO_HOLD_TIP: &str =
      The 2D outputs and Lean are measured from this hold\n\
      instead of from flat. The 3D Orientation output is not.\n\
      \n\
-     Pitch+Yaw / Pitch+Roll: gyro axes and gravity are both\n\
-     re-measured about the hold (JSM's LOCAL_AXIS_OFFSET, on\n\
-     all three axes). E.g. a handheld tilted back 40° → P 40.\n\
+     Pitch+Yaw / Pitch+Roll / Jason: gyro axes and gravity are\n\
+     both re-measured about the hold (JSM's LOCAL_AXIS_OFFSET,\n\
+     on all three axes). E.g. a handheld tilted back 40° → P 40.\n\
+     Jason's speed-up then makes up for pitch away from the hold.\n\
      \n\
      Player / World: only gravity is rotated, shifting which\n\
      way counts as down. E.g. lying on your right side with\n\
@@ -1279,10 +1312,11 @@ fn pill_in(
     false
 }
 
-/// One mode row: the caption, then the four axis choices as equal cells. Picking a cell sets
-/// the family that row stands for as well as the axis, which is the pair the module stores;
-/// the row of the family not in use lights no cell.
-fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, family: &str, axis: &str, want: &str, tips: [&'static str; 5]) -> Option<&'static str> {
+/// One mode row: the caption, then the four axis choices as equal cells, Player's and World's
+/// standing for whichever of their sub-modes is in use (`gyro_mode_cells`). Picking a cell
+/// sets the family that row stands for as well as the axis, which is the pair the module
+/// stores; the row of the family not in use lights no cell.
+fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, family: &str, axis: &str, want: &str, tips: [&'static str; 6]) -> Option<&'static str> {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let weak = ui.visuals().weak_text_color();
     // The row's drawing, then its word.
@@ -1303,16 +1337,17 @@ fn mode_row(ui: &mut egui::Ui, node: NodeId, rect: egui::Rect, caption: &str, fa
             _ => lbl,
         }
     };
-    let opts: Vec<(String, &'static str, &'static str)> = GYRO_AXIS_OPTIONS
+    let index = |id: &str| GYRO_AXIS_OPTIONS.iter().position(|(o, _)| *o == id).unwrap_or(0);
+    let shown = gyro_mode_cells(axis);
+    let opts: Vec<(String, &'static str, &'static str)> = shown
         .iter()
-        .zip(tips)
-        .map(|((id, lbl), tip)| (id.to_string(), word(id, lbl), tip))
+        .map(|id| (id.to_string(), word(id, GYRO_AXIS_OPTIONS[index(id)].1), tips[index(id)]))
         .collect();
     let ctrl = rect.height() - 4.0;
     let cells = egui::Rect::from_min_size(egui::pos2(cells.left(), rect.center().y - ctrl * 0.5), egui::vec2(cells.width(), ctrl));
     // The node in the id: two 3DOF modules on one canvas had the same rows, and egui gave a
     // click on either to neither.
-    let icons = GYRO_AXIS_ICONS.map(Some);
+    let icons = shown.map(|id| Some(GYRO_AXIS_ICONS[index(id)]));
     if let Some(picked) = super::curve_rows::segmented_icons(ui, cells, &current, &opts, &icons, ("gyro_mode_row", want, node.0)) {
         return Some(GYRO_AXIS_OPTIONS.iter().find(|(id, _)| *id == picked).map(|(id, _)| *id).unwrap_or("pitch_yaw"));
     }
