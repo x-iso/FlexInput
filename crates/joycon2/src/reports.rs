@@ -520,12 +520,31 @@ pub struct Motion {
     /// The device tick of a console-report block: bits 0-11 of
     /// [`Motion::timestamp`], 1.25 ms units, wrapping every 4096 without a carry.
     ///
-    /// ❗ The rest of that word is NOT clock. Bits 15-16 count how many IMU
-    /// samples the report covers, so differencing the whole word turned every
-    /// report that bundled two samples — and every 12-bit wrap — into an
-    /// out-of-range gap. `dt` then fell back to host arrival time, and a two-
-    /// sample rotation divided by one report's worth of time is a spike. Links
-    /// that bundle more often (one half further from the radio) looked noisy.
+    /// ❗ The rest of that word is NOT the running clock. Measured on the 19-min
+    /// M12-S warm-up capture (2026-10-13, 400k reports, both halves):
+    ///
+    /// * bits 12-19 = **ticks since the pad's previous report** — the tick delta
+    ///   the pad counted itself. It equals the measured tick difference in every
+    ///   report on the left half and in all but 4 of 228 218 on the right; those
+    ///   4 are reports missing from the capture, where the field still reads one
+    ///   report's span (4) and the tick jumped 8. Usually 4 at 200 Hz, 3/5 when a
+    ///   connection event slips, up to 13 on a congested link.
+    /// * bits 24-31 = constant `0x0C` (joycon2cpp's block-validity tag).
+    ///
+    /// Differencing the whole word made every change of that delta field — and
+    /// every 12-bit wrap — an out-of-range gap. `dt` then fell back to host
+    /// arrival time, and a long report's rotation divided by one report's worth
+    /// of time is a spike. Links whose delta varied more (one half further from
+    /// the radio) looked noisy.
+    ///
+    /// ⚠️ An earlier reading called this "bits 15-16 count IMU samples". Wrong
+    /// position and wrong meaning — it is a span in ticks, not a sample count.
+    /// Unused: a mismatch between it and the tick difference would flag a lost
+    /// report.
+    ///
+    /// Nothing else in the report is a slow quantity — in particular there is
+    /// no temperature on the M12-S (every unused byte is constant zero, under
+    /// every feature mask tried).
     pub tick: Option<u16>,
     /// Accelerometer from the standard block, in counts, `None` when absent.
     ///
@@ -3791,18 +3810,18 @@ mod tests {
         );
     }
 
-    /// The console tick is 12 bits with sample-count bits above it: a wrap and
-    /// a two-sample report must both be ordinary steps, the second one twice
-    /// as long.
+    /// The console tick is 12 bits with a per-report tick-delta field above it
+    /// (see [`Motion::tick`]): a wrap and a long report must both be ordinary
+    /// steps, the second one longer.
     #[test]
-    fn the_console_tick_wraps_at_4096_and_counts_bundled_samples() {
+    fn the_console_tick_wraps_at_4096_and_ignores_the_delta_field() {
         let mut c = TickClock::default();
         assert_eq!(c.dt_mod(4090, 4096, 100.0), None);
         let one = c.dt_mod(6, 4096, 100.0).expect("4090 -> 6 is a 12-tick step");
         assert!((one - 0.01).abs() < 1e-6, "fallback until calibrated, got {one}");
-        // A raw word with the sample-count bits flipping is what used to break.
-        let w1 = 0x0C00_8000u32 | 18;
-        let w2 = 0x0C01_0000u32 | 42; // two samples, 24 ticks later
+        // A raw word whose delta field (bits 12-19) changes is what used to break.
+        let w1 = 0x0C00_8000u32 | 18; // 8 ticks since the report before
+        let w2 = 0x0C01_8000u32 | 42; // 24 ticks later, and the field says 24
         let (t1, t2) = ((w1 & 0xFFF) as u32, (w2 & 0xFFF) as u32);
         let mut c = TickClock::default();
         c.dt_mod(t1, 4096, 100.0);
