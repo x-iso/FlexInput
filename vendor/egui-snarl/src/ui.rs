@@ -1274,6 +1274,7 @@ where
         }
 
         // show_node(node_idx);
+        viewer.before_node(node_idx, snarl);
         let response = draw_node(
             snarl,
             &mut ui,
@@ -1286,6 +1287,7 @@ where
             modifiers,
             &mut output_info,
         );
+        viewer.after_node(node_idx, snarl);
 
         if faded {
             ui.set_opacity(1.0);

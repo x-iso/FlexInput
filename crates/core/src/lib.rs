@@ -5,6 +5,7 @@ pub mod imu;
 pub mod automap;
 pub mod busmap;
 pub mod flick;
+pub mod layers;
 pub mod macros;
 pub mod media;
 pub mod menu;

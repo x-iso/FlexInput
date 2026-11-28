@@ -48,6 +48,10 @@ pub struct NodeState {
     /// Physical pad with its trigger click on (Calibration window), where the
     /// engine plays it: each trigger's crossing and click. Created on first use.
     pub trigger_clicks: Option<Box<crate::eval::TriggerClicks>>,
+    /// AutoMap Selector / Fork: what it selected on its last tick - the input
+    /// port a Selector passes on, the output a Fork sends to - for the game
+    /// feedback gated on it (`graph::FeedbackGate`).
+    pub automap_select: usize,
     /// Snapped digital triggers (on the reserved carry entry only): where each
     /// device's stand between ticks. See `device_cal::preprocess_dev_sigs_into`.
     pub digital_triggers: Option<Box<crate::eval::DigitalTriggers>>,

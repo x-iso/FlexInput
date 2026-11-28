@@ -216,36 +216,12 @@ pub(crate) fn show_page(snarl: &mut Snarl<NodeData>, chosen: &mut Option<usize>,
     current_page(snarl, *chosen) != before
 }
 
-/// The emoji offered for a sub-patch's icon.
-pub(crate) const ICONS: &[&str] = &[
-    "🎮", "🕹", "🎯", "🖱", "⌨", "✋", "👆", "🔫", "⚔", "🛡", "🏹", "💣",
-    "🚗", "🏎", "✈", "🚀", "⛵", "🐎", "⚽", "🏀", "🎵", "🎹", "🎧", "🎤",
-    "⭐", "❤", "🔥", "💧", "⚡", "❄", "☀", "🌙", "🔧", "⚙", "🔒", "👁",
-    "🅰", "🅱", "1⃣", "2⃣", "3⃣", "4⃣", "🔴", "🟢", "🔵", "🟡", "🟣", "⚫",
-];
-
-/// An icon picker: the emoji in a grid, the one in use lit, and taking it off.
-/// Returns the pick - `Some("")` to take the icon off.
+/// An icon picker: the shared icon set (`menu_body::icon_picker_body`), the one in use
+/// lit, and taking it off. Returns the pick - `Some("")` to take the icon off. An icon
+/// picked before is an emoji, still drawn as text.
 pub(crate) fn icon_grid(ui: &mut eframe::egui::Ui, current: &str) -> Option<String> {
-    use eframe::egui;
-    let mut pick = None;
-    let size = crate::settings::ui_size(18.0);
-    egui::Grid::new("subpatch_icon_grid").spacing([2.0, 2.0]).show(ui, |ui| {
-        for (i, icon) in ICONS.iter().enumerate() {
-            let b = egui::Button::selectable(*icon == current, egui::RichText::new(*icon).size(size));
-            if ui.add_sized([size + 10.0, size + 8.0], b).clicked() {
-                pick = Some(icon.to_string());
-            }
-            if i % 12 == 11 {
-                ui.end_row();
-            }
-        }
-    });
-    ui.add_space(4.0);
-    if ui.add_enabled(!current.is_empty(), egui::Button::new("No icon")).clicked() {
-        pick = Some(String::new());
-    }
-    pick
+    crate::canvas::menu_body::icon_picker_body(ui, eframe::egui::Id::new("subpatch_icon_grid"), current, "", false)
+        .map(|(key, _)| key)
 }
 
 /// Set sub-patch `id`'s icon.

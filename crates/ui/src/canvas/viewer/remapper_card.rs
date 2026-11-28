@@ -928,6 +928,9 @@ pub(crate) fn remapper_mapping_card_pixel(
             .on_hover_text(cf.tooltip());
     }
 
+    // A layer on screen changes or adds this card: framed in its colour.
+    crate::layers::tint_card(ui, node_id.0, nav_scope, mapping, natural_rect);
+
     MappingCardResult {
         delete_clicked, changed,
         drag_handle, rect: natural_rect,

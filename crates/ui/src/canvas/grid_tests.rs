@@ -4699,6 +4699,21 @@ fn shoot_modules() {
                     n.extra.last_out[at + 1] = Some(b);
                 }
             }
+            // `SHOOT_LAYER_TINT=delay_ms;freq_param=2.5;points=[[0,0],[0.5,0.9],[1,1]]` shows
+            // those params as a layer on sets them (0.5 unless given): the module framed and
+            // badged, the controls tinted and showing the layer's values, a curve drawn over.
+            if let Ok(keys) = std::env::var("SHOOT_LAYER_TINT") {
+                let mut tints = crate::layers::LayerTints::default();
+                let settings: Vec<crate::layers::LayerSetting> = keys.split(';')
+                    .map(|k| {
+                        let (key, value) = k.split_once('=').map_or((k, None), |(k, v)| (k, Some(v)));
+                        let value = value.and_then(|v| serde_json::from_str(v).ok()).unwrap_or(serde_json::Value::from(0.5));
+                        crate::layers::LayerSetting { path: vec![ids[0].0], key: key.trim().into(), value }
+                    })
+                    .collect();
+                tints.add(&rig.canvas.snarl, &[], "aa", "🎯 Aim", egui::Color32::from_rgb(236, 150, 54), &settings, false);
+                crate::layers::publish_tints(&rig.ctx, tints);
+            }
             rig.idle(8);
             if fold {
                 rig.canvas.snarl.open_node(ids[0], false);

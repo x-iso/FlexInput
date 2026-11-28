@@ -4,6 +4,7 @@ pub(crate) mod merge;
 mod curve;
 pub mod header_controls;
 pub(crate) mod input_viewer;
+mod layers_arm;
 pub(crate) mod menu_body;
 pub mod node;
 pub(crate) mod overlay_body;
@@ -1632,6 +1633,9 @@ pub struct UiPatch {
     /// The calibration of pads taken off the patch (see [`DeviceMemory`]).
     #[serde(default, skip_serializing_if = "DeviceMemory::is_empty")]
     pub device_memory: DeviceMemory,
+    /// The patch's own layers (`crate::layers`); a sub-patch's are in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<crate::layers::Layer>,
 }
 
 #[derive(Clone)]
@@ -1727,6 +1731,13 @@ pub struct Canvas {
     pub(crate) view_salt: u64,
     /// The calibration of pads taken off this tab (see [`DeviceMemory`]).
     pub device_memory: DeviceMemory,
+    /// The patch's own layers; a sub-patch's live in its `UiSubPatch`. See
+    /// `crate::layers`.
+    pub layers: Vec<crate::layers::Layer>,
+    /// The layer being edited, if one is (`arm_layer`).
+    armed: Option<Box<layers_arm::ArmedLayer>>,
+    /// What a sub-patch header's layer chip asked for, done at the next `show`.
+    pending_layer_request: Option<(crate::layers::LayerScope, crate::layers::LayerAct)>,
 }
 
 impl Canvas {
@@ -1796,6 +1807,9 @@ impl Canvas {
             spawn_glow: std::collections::HashMap::new(),
             view_salt: next_canvas_salt(),
             device_memory: DeviceMemory::default(),
+            layers: Vec::new(),
+            armed: None,
+            pending_layer_request: None,
         }
     }
 
@@ -1843,6 +1857,8 @@ impl Canvas {
     pub(crate) fn undo_clone(&self) -> Snarl<NodeData> {
         let mut snap = self.snarl.clone();
         crate::app::graph::strip_display_buffers(&mut snap);
+        // Layer values shown in the canvas for gamepad nav are the layer's, not the patch's.
+        crate::layers::unshow(&mut snap);
         snap
     }
 
@@ -1851,7 +1867,8 @@ impl Canvas {
     /// (snapshot on enter-edit, commit on exit) — its direct `node.params`
     /// writes don't go through the pointer/keyboard `track_value_edits` path.
     pub(crate) fn commit_undo_if_changed(&mut self, baseline: Snarl<NodeData>) {
-        if self.snarl_fingerprint() != Self::fingerprint_of(&baseline) {
+        // The canvas as the patch has it: layer values shown for nav aren't a change of it.
+        if Self::fingerprint_of(&self.undo_clone()) != Self::fingerprint_of(&baseline) {
             self.push_snapshot(baseline);
         }
     }
@@ -2229,6 +2246,13 @@ impl Canvas {
     ) -> Option<NodeId> {
         let ctx = ui.ctx().clone();
 
+        // What a sub-patch header's layer chip asked for last frame.
+        if let Some((scope, act)) = self.pending_layer_request.take() {
+            self.layer_act(scope, act);
+        }
+        // Module controls drawn now belong to this canvas, for the layer tints.
+        crate::layers::set_tint_prefix(&ctx, crate::canvas::viewer::glow_parent_prefix(automap_parent.as_ref()));
+
         // Clear any stale AutoMap-chip header-rect stash for nodes that
         // were ADDED THIS FRAME. Slab reuses freed NodeId slots, so a
         // newly-spawned device.source / device.sink can inherit the
@@ -2394,6 +2418,9 @@ impl Canvas {
             remove_request: None,
             edit_subpatch_request: None,
             save_subpatch_request: None,
+            armed_layer: self.armed_layer().map(|(s, id)| (s.clone(), id.to_string())),
+            layer_request: None,
+            layer_shown: None,
             is_inner_canvas: self.is_inner,
             expose_module_request: None,
             pinned_inner_ids: self.pinned_inner_ids.clone(),
@@ -2615,6 +2642,7 @@ impl Canvas {
 
         self.pending_edit_subpatch  = viewer.edit_subpatch_request;
         self.pending_save_subpatch  = viewer.save_subpatch_request;
+        self.pending_layer_request = viewer.layer_request.take();
         self.pending_expose_module  = viewer.expose_module_request;
         // Stash group_request flag; acted on after `selected` is fetched below.
         let group_from_menu = viewer.group_request;
@@ -3387,7 +3415,8 @@ impl Canvas {
 
         let patch = UiPatch {
             version: 1,
-            snarl: sanitize_snarl_for_save(&self.snarl),
+            // The patch's own settings, a layer being edited or not.
+            snarl: sanitize_snarl_for_save(&self.base_snarl()),
             virtual_device_ids,
             bound_exes,
             auto_bypass,
@@ -3396,6 +3425,7 @@ impl Canvas {
             overlay,
             config,
             device_memory: self.device_memory.clone(),
+            layers: self.saved_layers(),
         };
         if let Ok(json) = serde_json::to_string_pretty(&patch) {
             let _ = std::fs::write(&path, json);
@@ -3495,6 +3525,7 @@ impl Canvas {
         let mut canvas = Canvas::new();
         canvas.snarl = patch.snarl;
         canvas.device_memory = patch.device_memory;
+        canvas.layers = patch.layers;
         migrate_ds4_pin_ids(&mut canvas);
         migrate_loaded_snarl(&mut canvas.snarl);
         // Migrate the legacy device-id list the same way as the snarl, so the
@@ -4613,6 +4644,7 @@ pub fn group_into_subpatch(
         items: vec![],
         overlay_items: vec![],
         config_items: vec![],
+        layers: Vec::new(),
         overlay_authored_size: None,
         config_authored_size: None,
         exposed_modules: vec![],

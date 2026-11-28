@@ -747,13 +747,14 @@ pub(crate) fn band_pos_to_hz(pos: f32) -> f32 {
     flexinput_core::automap::PitchScale::Wide.hz(pos)
 }
 
+/// Publishes the Fork's selected output; returns which one that is.
 pub(crate) fn automap_fork_publish(
     snap: &NodeSnap,
     key_uid: usize,
     computed: &[Vec<Option<Signal>>],
     dev_sigs: &BusMap,
     collector_sigs: &mut BusMap,
-) {
+) -> usize {
     let dev_id = snap.params.get("_automap_device_id").and_then(|v| v.as_str()).unwrap_or("");
     let collector_id_upstream = snap.params.get("_automap_collector_id").and_then(|v| v.as_str()).unwrap_or("");
     // inputs[0] = select, inputs[1] = AutoMap (ignored as value)
@@ -776,6 +777,7 @@ pub(crate) fn automap_fork_publish(
         }
         fill_raw_dynamic(dev_sigs, dev_id, &key, collector_sigs);
     }
+    select
 }
 
 pub(crate) fn automap_combiner_publish(
@@ -1145,6 +1147,7 @@ pub(crate) fn automap_combiner_publish(
     }
 }
 
+/// Publishes the Selector's selected input; returns which port that is.
 pub(crate) fn automap_selector_publish(
     snap: &NodeSnap,
     key_uid: usize,
@@ -1152,7 +1155,7 @@ pub(crate) fn automap_selector_publish(
     dev_sigs: &BusMap,
     collector_sigs: &mut BusMap,
     fb_routes: &mut HashMap<String, String>,
-) {
+) -> usize {
     let n_inputs = snap.input_sources.len().saturating_sub(1).max(1);
     let select = match snap.input_sources.get(0)
         .and_then(|src| src.and_then(|(si, op)| computed.get(si).and_then(|v| v.get(op)).copied().flatten()))
@@ -1188,6 +1191,7 @@ pub(crate) fn automap_selector_publish(
         collector_sigs.copy_bus_extras(&selected_collector, &key);
     }
     fill_raw_dynamic(dev_sigs, &selected_dev, &key, collector_sigs);
+    select
 }
 
 // ── Sub-patch inner evaluation ────────────────────────────────────────────────

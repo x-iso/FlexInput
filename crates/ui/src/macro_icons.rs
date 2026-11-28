@@ -35,6 +35,8 @@ pub struct MacroDisplayEntry {
     /// Custom icon SVG text embedded in the patch; non-empty wins over `icon`.
     pub icon_svg: String,
     pub signal_type: SignalType,
+    /// A layer's colour, for its cells and chips; `None` for everything else.
+    pub tint: Option<[u8; 3]>,
 }
 
 static REGISTRY: std::sync::RwLock<Option<Arc<Vec<MacroDisplayEntry>>>> =
@@ -50,8 +52,26 @@ pub fn registry() -> Arc<Vec<MacroDisplayEntry>> {
     REGISTRY.read().unwrap().clone().unwrap_or_default()
 }
 
-/// Look up one macro pin id in the registry.
+static LAYER_REGISTRY: std::sync::RwLock<Option<Arc<Vec<MacroDisplayEntry>>>> =
+    std::sync::RwLock::new(None);
+
+/// Publish this frame's layer pins (`crate::layers::display_entries`). Kept apart
+/// from the macro ports: JSM configs bind `@` names to those, and a layer's pins
+/// aren't such names.
+pub fn publish_layer_registry(entries: Arc<Vec<MacroDisplayEntry>>) {
+    *LAYER_REGISTRY.write().unwrap() = Some(entries);
+}
+
+/// The current layer pins: four per layer (Hold, Toggle, On, Off).
+pub fn layer_registry() -> Arc<Vec<MacroDisplayEntry>> {
+    LAYER_REGISTRY.read().unwrap().clone().unwrap_or_default()
+}
+
+/// Look up one macro pin id - or a layer pin - in the registry.
 pub fn registry_entry(pin: &str) -> Option<MacroDisplayEntry> {
+    if flexinput_core::layers::parse_layer_pin(pin).is_some() {
+        return layer_registry().iter().find(|e| e.pin == pin).cloned();
+    }
     registry().iter().find(|e| e.pin == pin).cloned()
 }
 
@@ -67,6 +87,19 @@ pub fn registry_entry(pin: &str) -> Option<MacroDisplayEntry> {
 // `category` is the prettified immediate sub-folder under `general/` (loose
 // files are "Uncategorized") and drives the icon picker's category dropdown.
 include!(concat!(env!("OUT_DIR"), "/generated_macro_icons.rs"));
+
+/// Whether `s` is an icon of the shared set (or a pad glyph, `gp:…`), drawn as an image,
+/// rather than an emoji picked before the set was used, drawn as text.
+pub fn is_icon_key(s: &str) -> bool {
+    !s.is_empty() && (macro_icon_svg(s).is_some() || s.starts_with("gp:"))
+}
+
+/// Paint icon `key` of the shared set in `rect`, in `tint`.
+pub fn paint_icon(ctx: &egui::Context, painter: &egui::Painter, key: &str, rect: egui::Rect, tint: egui::Color32) {
+    if let Some(tex) = macro_port_icon_texture(ctx, key, "", rect.height()) {
+        painter.image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+    }
+}
 
 /// Resolve an icon key to its embedded SVG bytes.
 pub fn macro_icon_svg(key: &str) -> Option<&'static [u8]> {

@@ -539,6 +539,17 @@ pub(crate) fn draw_reshape_curve_editor(
                 let col = if editing_gain { Color32::from_rgb(120, 220, 140) } else { Color32::from_rgb(120, 180, 255) };
                 for w in line.windows(2) { painter.line_segment([w[0], w[1]], egui::Stroke::new(1.5_f32, col)); }
             }
+            // A layer on screen changing the curve shown: its curve over this one, in its colour.
+            let shown: (&str, &str, &[[f32; 2]], &[f32]) = if editing_gain {
+                ("gain_pts", "gain_biases", &p.gain, &p.gain_biases)
+            } else {
+                ("boundary_pts", "", &p.boundary, &[])
+            };
+            crate::layers::paint_curve_overlays(ui.ctx(), &painter, node_id.0, &[shown],
+                |lp, lb| (0..=100).map(|i| {
+                    let x = i as f32 / 100.0;
+                    c2s(x, sample_curve(lp, x, lb).clamp(y_lo, y_hi))
+                }).collect());
 
             // Bias handles (Alt) — gain curve only.
             let alt_held = ui.input(|i| i.modifiers.alt);

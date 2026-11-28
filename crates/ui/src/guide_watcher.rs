@@ -109,6 +109,9 @@ pub struct ChordWatchConfig {
     /// The previous / next patch tab: from the nav pads, like the window shortcuts.
     pub tab_prev: Option<ShortcutSpec>,
     pub tab_next: Option<ShortcutSpec>,
+    /// The active patch's own chords with a leader in them: a mapping card on
+    /// Home + B (turning a layer on, say). See [`patch_chords_held`].
+    pub patch_chords: Vec<Vec<String>>,
 }
 
 /// The buttons FlexInput's gamepad nav is using right now - the widget being worked in, or a
@@ -419,6 +422,76 @@ fn owned_pins(
 
 type Keys = HashSet<(String, String)>;
 
+/// A D-pad direction's hat keys go with it.
+fn with_hat(snap: &SignalMap, dev: &str, pin: &str, out: &mut Keys) {
+    out.insert((dev.to_string(), pin.to_string()));
+    if pin.starts_with("dpad_") && pin != "dpad_x" && pin != "dpad_y" {
+        for hat in ["dpad", "dpad_x", "dpad_y"] {
+            let key = (dev.to_string(), hat.to_string());
+            if snap.contains_key(&key) { out.insert(key); }
+        }
+    }
+}
+
+/// The patch's own leader chords ([`ChordWatchConfig::patch_chords`]) held whole on a
+/// controller right now: their buttons, which go to the patch rather than being withheld
+/// for a shortcut. A leader is withheld while it's held, so a card on Home + B never saw
+/// Home: it never fired, and B went to the game. A shortcut over one of the chord's
+/// buttons held whole as well wins: then the chord isn't let through.
+fn patch_chords_held(snap: &SignalMap, chords: &[Vec<String>], targets: &[Target]) -> Keys {
+    let mut out = Keys::new();
+    for chord in chords.iter().filter(|c| c.len() >= 2) {
+        for (group, held) in held_by_group(snap, chord, None) {
+            if held.len() < chord.len() { continue; }
+            let shortcut_too = targets.iter().any(|&(s, f)| s.as_ref().is_some_and(|s| {
+                s.combo.iter().any(|p| chord.contains(p))
+                    && held_by_group(snap, &s.combo, f).get(group).is_some_and(|h| h.len() >= s.combo.len())
+            }));
+            if shortcut_too { continue; }
+            for ((dev, pin), val) in snap {
+                if chord_group(dev) == group && device_eligible(dev, None)
+                    && matches!(val, Signal::Bool(true)) && chord.contains(pin)
+                {
+                    with_hat(snap, dev, pin, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`owned_pins`] with the patch's own leader chords. While a leader some shortcut leads
+/// with is held, the rest of a patch chord of it is withheld too, so its other button never
+/// reaches the game alone; once the whole chord is held (`patch_held`), all of it goes to
+/// the patch, whose card takes it.
+fn owned_with_patch(
+    snap: &SignalMap,
+    targets: &[Target],
+    prev: &HashSet<(String, String)>,
+    claims: &NavClaims,
+    chords: &[Vec<String>],
+    patch_held: &Keys,
+) -> HashSet<(String, String)> {
+    let mut out = owned_pins(snap, targets, prev, claims);
+    for chord in chords.iter().filter(|c| c.len() >= 2) {
+        let Some(leader) = chord.iter().find(|p| LEADER_PINS.contains(&p.as_str())) else { continue };
+        if !targets.iter().any(|&(s, _)| s.as_ref().is_some_and(|s| s.combo.contains(leader))) {
+            continue; // a leader no shortcut uses isn't withheld at all
+        }
+        let leading: HashSet<&str> = snap.iter()
+            .filter(|((dev, pin), val)| pin == leader && device_eligible(dev, None) && matches!(val, Signal::Bool(true)))
+            .map(|((dev, _), _)| chord_group(dev))
+            .collect();
+        for (dev, pin) in snap.keys() {
+            if leading.contains(chord_group(dev)) && chord.contains(pin) && !claims.claims(dev, pin) {
+                with_hat(snap, dev, pin, &mut out);
+            }
+        }
+    }
+    out.retain(|k| !patch_held.contains(k));
+    out
+}
+
 /// Hold-back/replay state of one leader button on one controller group.
 #[derive(Default)]
 struct LeaderHold {
@@ -451,6 +524,7 @@ struct Leaders {
 impl Leaders {
     /// Advance one poll. `fired[i]` = `targets[i]` fired this poll. Returns the
     /// leader keys the game should see pressed right now.
+    #[cfg(test)]
     fn update(
         &mut self,
         snap: &SignalMap,
@@ -458,6 +532,20 @@ impl Leaders {
         fired: &[bool],
         home_exclusive: bool,
         now: Instant,
+    ) -> Keys {
+        self.update_with(snap, targets, fired, home_exclusive, now, &Keys::new())
+    }
+
+    /// [`Self::update`], where a patch chord held whole (`patch_held`, see
+    /// [`patch_chords_held`]) uses its leader too: the patch's card took it.
+    fn update_with(
+        &mut self,
+        snap: &SignalMap,
+        targets: &[Target],
+        fired: &[bool],
+        home_exclusive: bool,
+        now: Instant,
+        patch_held: &Keys,
     ) -> Keys {
         let mut out = Keys::new();
         for &leader in LEADER_PINS {
@@ -502,7 +590,8 @@ impl Leaders {
                     h.pending = None;
                 }
                 if let Some(keys) = now_pressed { h.keys.extend(keys); }
-                if (held || h.held) && (fired_any || chord_held_on(&group)) {
+                let patch_took = patch_held.iter().any(|(d, p)| p == leader && chord_group(d) == group);
+                if (held || h.held) && (fired_any || chord_held_on(&group) || patch_took) {
                     h.used = true;
                 }
                 if !held && h.held && !h.used && !(leader == "btn_guide" && home_exclusive) {
@@ -637,9 +726,11 @@ pub fn spawn_chord_watcher(
 
                 // The leader stays in `owned` while it's replayed; the engine
                 // lets a replayed key through its shortcut block.
-                let now_replay = leaders.update(&snap, &targets, &fired,
-                    cfg.home_exclusive, Instant::now());
-                let now_owned = owned_pins(&snap, &targets, &owned, &claims);
+                // The patch's own Home / Capture chords held whole go to the patch.
+                let patch_held = patch_chords_held(snap, &cfg.patch_chords, &targets);
+                let now_replay = leaders.update_with(&snap, &targets, &fired,
+                    cfg.home_exclusive, Instant::now(), &patch_held);
+                let now_owned = owned_with_patch(snap, &targets, &owned, &claims, &cfg.patch_chords, &patch_held);
                 if now_replay != replay {
                     if let Ok(mut g) = replay_out.write() {
                         *g = now_replay.clone();
@@ -826,6 +917,40 @@ mod chord_tests {
 
         s.insert(key(pad, "dpad_up"), Signal::Bool(false));
         assert_eq!(owned_pins(&s, &targets, &trailing, &NavClaims::default()), idle);
+    }
+
+    /// A card on Home + B with Home leading a shortcut: while Home is held B is withheld
+    /// with it, so B never reaches the game alone; once both are held they go to the
+    /// patch, whose card takes them, and the Home press isn't replayed on release.
+    #[test]
+    fn a_patch_chord_on_a_leader_reaches_the_patch() {
+        let pin = spec(&["btn_guide", "dpad_up"], "down");
+        let targets: [Target; 1] = [(&pin, None)];
+        let pad = PAD;
+        let chords = vec![combo(&["btn_guide", "btn_south"])];
+        let mut s = snap(&[(pad, "btn_guide", true), (pad, "dpad_up", false), (pad, "btn_south", false)]);
+        let held = patch_chords_held(&s, &chords, &targets);
+        let leading = owned_with_patch(&s, &targets, &HashSet::new(), &NavClaims::default(), &chords, &held);
+        assert!(leading.contains(&key(pad, "btn_guide")) && leading.contains(&key(pad, "btn_south")),
+            "Home held: B withheld with it, so it can't reach the game alone");
+        s.insert(key(pad, "btn_south"), Signal::Bool(true));
+        let held = patch_chords_held(&s, &chords, &targets);
+        assert_eq!(held, HashSet::from([key(pad, "btn_guide"), key(pad, "btn_south")]));
+        let whole = owned_with_patch(&s, &targets, &leading, &NavClaims::default(), &chords, &held);
+        assert!(!whole.contains(&key(pad, "btn_guide")) && !whole.contains(&key(pad, "btn_south")),
+            "the whole chord goes to the patch: {whole:?}");
+        // The shortcut over Home + D-pad held instead wins.
+        let mut both = s.clone();
+        both.insert(key(pad, "btn_south"), Signal::Bool(false));
+        both.insert(key(pad, "dpad_up"), Signal::Bool(true));
+        assert!(patch_chords_held(&both, &chords, &targets).is_empty());
+        // No replay of the Home press the card used.
+        let mut l = Leaders::default();
+        let t0 = Instant::now();
+        l.update_with(&home(true, false), &targets, &[false], false, t0, &Keys::new());
+        l.update_with(&s, &targets, &[false], false, t0 + Duration::from_millis(30), &held);
+        let after = l.update_with(&home(false, false), &targets, &[false], false, t0 + Duration::from_millis(60), &Keys::new());
+        assert!(after.is_empty(), "the card used it");
     }
 
     /// A shortcut with a trigger in it presses where the trigger is calibrated to, not where

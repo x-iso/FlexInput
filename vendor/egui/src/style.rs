@@ -372,6 +372,14 @@ impl Style {
             visuals.bg_fill = self.visuals.selection.bg_fill;
             // visuals.bg_stroke = self.visuals.selection.stroke;
             visuals.fg_stroke = self.visuals.selection.stroke;
+            // FLEXINPUT PATCH: the app's own selection colour for a widget at this place.
+            if let Some((fill, text)) = SELECTION_ACCENT.get()
+                .and_then(|hook| hook(&response.ctx, response.layer_id, response.rect))
+            {
+                visuals.weak_bg_fill = fill;
+                visuals.bg_fill = fill;
+                visuals.fg_stroke.color = text;
+            }
         }
         visuals
     }
@@ -2820,4 +2828,21 @@ impl Widget for &mut FontTweak {
 
         response
     }
+}
+
+/// FLEXINPUT PATCH: a selected widget's fill and text colour where the app wants its own
+/// at that place on screen (`layer`, `rect`), instead of the selection colour: FlexInput
+/// paints a setting a layer changes in that layer's colour. `None` keeps the style's.
+pub type SelectionAccentHook = fn(&crate::Context, crate::LayerId, crate::Rect) -> Option<(Color32, Color32)>;
+
+static SELECTION_ACCENT: std::sync::OnceLock<SelectionAccentHook> = std::sync::OnceLock::new();
+
+/// FLEXINPUT PATCH: the [`SelectionAccentHook`]'s colours for a widget at `rect` on `layer`.
+pub fn selection_accent_at(ctx: &crate::Context, layer: crate::LayerId, rect: crate::Rect) -> Option<(Color32, Color32)> {
+    SELECTION_ACCENT.get().and_then(|hook| hook(ctx, layer, rect))
+}
+
+/// FLEXINPUT PATCH: set the [`SelectionAccentHook`] (once; later calls are ignored).
+pub fn set_selection_accent_hook(hook: SelectionAccentHook) {
+    let _ = SELECTION_ACCENT.set(hook);
 }

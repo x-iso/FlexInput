@@ -522,6 +522,12 @@ pub(crate) fn paint_envelope_curve_graph(
         if live.len() >= 2 {
             painter.add(egui::Shape::line(live, egui::Stroke::new(1.5_f32, main_col)));
         }
+        // A layer on screen changing the envelope: its curve over this one, in its colour.
+        crate::layers::paint_curve_overlays(ui.ctx(), &painter, node_id.0, &[("points", "biases", &new_points, &new_biases)],
+            |p, b| (0..=120).map(|i| {
+                let x = i as f32 / 120.0;
+                c2s(x, flexinput_engine::sample_curve(p, x, b).clamp(0.0, 1.0))
+            }).collect());
         // Hold+Bounce: held horizontal path at the sustain value across the buffer.
         if buffer_mode {
             let hold_y = flexinput_engine::sample_curve(&new_points, sustain_snapped, &new_biases).clamp(0.0, 1.0);

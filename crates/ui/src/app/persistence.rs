@@ -14,7 +14,8 @@ impl FlexInputApp {
             // Attribute sub-patch-sourced overlay pins into their sub-patches so
             // they travel with a preset. Operate on the serialize-time clones —
             // never the live snarl/overlays.
-            let mut snarl = crate::canvas::sanitize_snarl_for_save(&t.canvas.snarl);
+            // The patch's own settings, a layer being edited or not.
+            let mut snarl = crate::canvas::sanitize_snarl_for_save(&t.canvas.base_snarl());
             let mut overlay = t.overlay.clone();
             let mut config = t.config.clone();
             crate::canvas::node::attribute_overlays_into_subpatches(
@@ -32,6 +33,7 @@ impl FlexInputApp {
                 overlay,
                 config,
                 device_memory: t.canvas.device_memory.clone(),
+                layers: t.canvas.saved_layers(),
             }
         }).collect();
         PersistedWorkspace {

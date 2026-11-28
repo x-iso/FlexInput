@@ -477,6 +477,7 @@ pub(crate) fn remapper_render_chip(ui: &mut egui::Ui, pin_id: &str, skin: crate:
     // a struck placeholder.
     if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
         || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+        || flexinput_core::layers::parse_layer_pin(pin_id).is_some()
     {
         match crate::macro_icons::registry_entry(pin_id) {
             Some(entry) => {
@@ -699,6 +700,7 @@ pub(crate) fn paint_chord_chip_tinted(
     // mapping kept) paint a dimmed placeholder pill.
     if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
         || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+        || flexinput_core::layers::parse_layer_pin(pin_id).is_some()
     {
         match crate::macro_icons::registry_entry(pin_id) {
             Some(entry) => {
@@ -1091,6 +1093,7 @@ pub(crate) fn remapper_pin_display(pin_id: &str) -> String {
     // the raw token, which at least marks the mapping as broken.
     if flexinput_core::macros::parse_macro_pin(pin_id).is_some()
         || flexinput_core::menu::parse_target_pin(pin_id).is_some()
+        || flexinput_core::layers::parse_layer_pin(pin_id).is_some()
     {
         if let Some(e) = crate::macro_icons::registry_entry(pin_id) {
             return e.name;

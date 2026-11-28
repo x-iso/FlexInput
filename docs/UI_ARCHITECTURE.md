@@ -331,8 +331,39 @@ Simplified preset-driven workflow:
 - Any patch: Easy mode shows the top-level sub-patches ticked for it (`easy/subpatches.rs`),
   each a section of the tab row above the body holding its own layout tabs; LB / RB walk
   them all. The Devices panel wires only into and out of the **primary** sub-patch, and only
-  its own device nodes (`easy/wiring.rs` `Managed`); wiring made in Advanced mode is kept
+  its own device nodes (`easy/wiring.rs` `Managed`); wiring made in Advanced mode is kept.
+  An AutoMap Selector a sub-patch feeds is the output hub (`wiring::output_hub`): output
+  devices are wired from it instead, so they follow the sub-patch it passes on at run time
 - Preset-based workflow (`.fxsp` files), a preset link per sub-patch
+- Layers (`crate::layers`): chips pinned in the tab bar after File/Auto (the pinned cluster
+  grows with them) for the active patch's own layers, and at the end of each sub-patch's
+  header for its own. Each has a colour (`layer_color`, `PALETTE`) and an optional icon.
+  What the layers on, the hovered chip's and the armed one change is published per frame
+  (`Canvas::layer_tints` → `layers::publish_tints`): `layers::mark_node` frames and badges a
+  changed module from `final_node_rect`, `tint_element` (called by
+  `register_exposable_element`) and `tint_pin` (by `render_pinned_element`) tint the controls
+  whose `element_fields` name a changed param. Paths are from the top canvas: a canvas sets
+  its prefix as it draws (`set_tint_prefix`), a pin draws from inside its sub-patch
+  (`with_pin_tint`; a whole-module pin marks controls inside it). A changed control shows the
+  layer's value: the viewer's `before_node`/`after_node` (egui-snarl patch) and
+  `render_pinned_element` put the layer's scalar values in for the drawing
+  (`show_layer_values`) and take them out (`hide_layer_values`), queuing an edit made there for
+  the layer (`take_layer_edits` → `Canvas::edit_layer_value`). Tinted rects are noted per pass;
+  `layers::accent` and egui's selected buttons (`egui::style::set_selection_accent_hook`, an
+  egui patch, also the slider fill) wear the layer's colour inside them. Graphs draw the
+  layer's curve over theirs (`paint_curve_overlays`: response, two-way, ASTH EQ, reshape,
+  envelope). A control is matched to its params by its gamepad table, else by its own name
+  (`control_keys`, with a few aliases); one registered under no name gets only the module
+  frame. A layer's card list keeps the patch's layer-switching cards
+  (`flexinput_core::layers::merge_cards`, in the engine and when armed). Click turns a
+  layer on/off (`flexinput_engine::request_layer`); right-click › Edit settings arms it
+  (`Canvas::arm_layer`): its settings go into the canvas, what changes is recorded into the
+  layer on Done editing (`disarm_layer`), and the patch's own come back. While armed the
+  canvas keeps its undo history aside and saves use `Canvas::base_snarl`. Cards turn
+  layers on from the Choose picker's Layers tab (`layer:{id}` pins, Hold / Toggle / On / Off;
+  names from `macro_icons::layer_registry`). The graph carries the layers
+  (`ProcessingGraph.layers`, `layers::engine_table`), and the engine switches them while the
+  patch runs (`flexinput_engine::layers`): the layer turned on last wins a setting two change
 - Pinned widgets for parameter access
 - Gamepad navigation optimized
 

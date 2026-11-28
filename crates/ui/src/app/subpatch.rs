@@ -265,8 +265,9 @@ pub(crate) fn show_subpatch_editors(
     // overlay/config items that belong to it baked in.
     if let Some(node_id) = app.tabs[active].canvas.pending_save_subpatch.take() {
         let tab = &app.tabs[active];
+        // The patch's own settings, a layer being edited or not.
         if let Some(sp) = crate::canvas::node::subpatch_with_overlays(
-            &tab.canvas.snarl, node_id.0, &tab.overlay, &tab.config)
+            &tab.canvas.base_snarl(), node_id.0, &tab.overlay, &tab.config)
         {
             let _ = save_subpatch_file(&sp);
         }

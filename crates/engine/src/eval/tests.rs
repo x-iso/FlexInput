@@ -167,6 +167,37 @@ mod trigger_tests {
             "released mapping must drop the port back to false");
     }
 
+    // A card targeting a layer hands its press to the engine thread's layer stack
+    // through the tick's output, and never reaches a sink.
+    #[test]
+    fn a_card_on_a_layer_pin_hands_the_press_on() {
+        let dev = "gilrs:switch_pro:0";
+        let src = source_node(1, dev, 0.0);
+        let mut remap = empty_node(2, "module.remapper");
+        remap.params.insert("_automap_device_id".into(), Value::String(dev.into()));
+        remap.params.insert("mappings".into(), serde_json::json!([
+            { "in": ["btn_south"], "out": ["layer:aa11bb22_toggle"] }
+        ]));
+        remap.input_sources = vec![Some((0, 0))];
+        remap.n_outputs = 1;
+        let sink = sink_node(4, "virtual.xinput:0", "remap:2", true);
+        let graph = ProcessingGraph { nodes: vec![src, remap, sink], ..Default::default() };
+        let mut state = HashMap::new();
+        let mut out = TickOutput::default();
+        let press = |on: bool| {
+            let mut m = HashMap::new();
+            m.insert((dev.to_string(), "btn_south".to_string()), Signal::Bool(on));
+            m
+        };
+        eval_graph_tick(&graph, &mut state, &press(true), 0.016, &mut out);
+        assert_eq!(out.layer_pins, vec![("layer:aa11bb22_toggle".to_string(), 1.0)]);
+        assert!(out.sink_outputs.keys().all(|(_, p)| !p.starts_with("layer:")), "a layer pin never reaches a sink");
+        let south = out.sink_outputs.get(&("virtual.xinput:0".to_string(), "btn_south".to_string())).copied();
+        assert!(!south.is_some_and(|s| s.as_bool()), "the card's button is consumed, not passed on: {south:?}");
+        eval_graph_tick(&graph, &mut state, &press(false), 0.016, &mut out);
+        assert!(out.layer_pins.is_empty(), "let go of");
+    }
+
     // A Virtual Menu placed UPSTREAM of the Remapper that maps a button to its
     // Select target is a feedback cycle: the Remapper is forced to evaluate
     // AFTER the menu, so this tick's `collector_sigs` never carries the Select
@@ -3797,6 +3828,7 @@ mod trigger_tests {
             feedback_sources: game_from.into_iter().map(|v| crate::graph::FeedbackSource {
                 device_id: v.to_string(),
                 rumble_floor: 0.0, rumble_max: 1.0, rumble_exp: 1.0,
+                gates: Vec::new(),
             }).collect(),
             is_self_sink: false,
             digital_trigger_bridge: false,
@@ -4488,6 +4520,44 @@ mod trigger_tests {
         assert_eq!(pad_value(&out, FB_DS, "rumble_strong"), 0.0, "game rumble must be taken over");
         let v = pad_value(&out, FB_DS, "hd_l_amp");
         assert!((v - 0.4).abs() < 0.01, "gate: audio 0.5 × game 0.8, got {v}");
+    }
+
+    // Two pads into an AutoMap Selector, one virtual pad after it: the game's
+    // rumble goes back to the pad the Selector passes on, and moves with it. The
+    // pads run before the Selector, so they follow its choice a tick late.
+    #[test]
+    fn game_rumble_behind_a_selector_follows_its_choice() {
+        const OTHER: &str = "sdl:dualsense:1";
+        let gated = |uid: usize, dev: &str, index: usize| {
+            let mut pad = fb_pad(uid, dev, FB_DS_PINS, Some(FB_VIRT));
+            pad.sink_target.as_mut().unwrap().feedback_sources[0].gates =
+                vec![crate::graph::FeedbackGate { uid: 5, index }];
+            pad
+        };
+        let mut pick = empty_node(10, "module.constant");
+        pick.n_outputs = 1;
+        pick.params.insert("value".into(), Value::from(1.0));
+        let mut sel = empty_node(5, "module.automap_selector");
+        sel.params.insert("_automap_input_devs".into(), serde_json::json!([FB_DS, OTHER]));
+        sel.params.insert("_automap_input_collectors".into(), serde_json::json!(["", ""]));
+        sel.input_sources = vec![Some((2, 0)), Some((0, 0)), Some((1, 0))];
+        sel.n_outputs = 1;
+        let sink = sink_node(4, FB_VIRT, "forksel:5:0", false);
+        let graph = ProcessingGraph {
+            nodes: vec![gated(1, FB_DS, 0), gated(2, OTHER, 1), pick, sel, sink],
+            ..Default::default()
+        };
+        let sigs = game_rumble(0.6);
+        let mut state = HashMap::new();
+        let mut tick = || {
+            let mut out = TickOutput::default();
+            eval_graph_tick(&graph, &mut state, &flexinput_core::SigMap::from(&sigs), 0.016, &mut out);
+            [FB_DS, OTHER].map(|dev| pad_value(&out, dev, "rumble_strong"))
+        };
+        let [first, second] = tick();
+        assert!((first - 0.6).abs() < 1e-6 && second == 0.0, "a Selector starts on its first input: {first}, {second}");
+        let [first, second] = tick();
+        assert!(first == 0.0 && (second - 0.6).abs() < 1e-6, "then the second, as selected: {first}, {second}");
     }
     #[test]
     fn a_dropdown_shift_adds_to_the_option_and_wraps() {

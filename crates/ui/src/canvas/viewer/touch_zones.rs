@@ -867,6 +867,9 @@ pub(crate) fn mapping_curve_editor(
     threshold_is_velocity: bool,
     // That note while it sounds: what drives the dot, and its strike velocity.
     live_note: Option<LiveNote>,
+    // A layer on screen changes this card: the curve the module's own card has, drawn
+    // dashed under this one (which is the layer's, in `accent`, the layer's colour).
+    ghost: Option<&[[f32; 2]]>,
 ) -> bool {
     let mut changed = false;
     let w = ui.available_width().clamp(140.0, 360.0);
@@ -1015,6 +1018,11 @@ pub(crate) fn mapping_curve_editor(
             egui::Stroke::new(1.0_f32, accent.gamma_multiply(0.6)), 4.0, 4.0));
     }
 
+    // The module's own curve under a layer's, dashed.
+    if let Some(own) = ghost.filter(|g| g.len() >= 2) {
+        let line: Vec<egui::Pos2> = own.iter().map(|p| to(p[0], p[1])).collect();
+        painter.add(egui::Shape::dashed_line(&line, egui::Stroke::new(1.2_f32, visuals.weak_text_color()), 4.0, 3.0));
+    }
     // Curve polyline (over the possibly-just-edited points) + handles.
     for wnd in pts.windows(2) {
         painter.line_segment([to(wnd[0][0], wnd[0][1]), to(wnd[1][0], wnd[1][1])],
@@ -1271,11 +1279,17 @@ pub(crate) fn mapping_card_curve_section(
             flexinput_core::midi::parse_pin(p).is_some_and(|m| m.note_companions().is_some())
         })
     });
+    // A layer on screen changes this card: its curve in the layer's colour, over the
+    // module's own card's, dashed.
+    let layered = crate::layers::card_curve_tint(ui.ctx(), node_id.0, scope, working);
+    let curve_accent = layered.as_ref().map_or(accent, |(c, _)| *c);
+    let ghost = layered.as_ref().and_then(|(_, own)| own.clone());
     let mut changed = mapping_curve_editor(
         ui, open_id.with("ed"), &mut pts,
         if show_threshold { Some(&mut thr) } else { None },
-        live_mag, accent, &vis, nav_uid, nav_field, note_input,
+        live_mag, curve_accent, &vis, nav_uid, nav_field, note_input,
         live_note.filter(|_| note_input),
+        ghost.as_deref(),
     );
     if changed {
         if pts == identity_curve() {

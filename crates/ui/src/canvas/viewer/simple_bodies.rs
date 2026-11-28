@@ -1053,7 +1053,7 @@ pub(crate) fn show_dropdown_body(
         // the pin is holding the list at its starting point. With no pin wired there is nothing
         // to outline.
         if i == selected {
-            let fill = ui.visuals().selection.bg_fill;
+            let fill = crate::layers::accent(ui, row);
             child.painter().rect_filled(row, 4.0, fill);
         }
         if i == effective {
@@ -2084,8 +2084,9 @@ pub(crate) fn setting_pill_widest(
         egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + label_w, rect.bottom()));
     let value_cell = pill_value_cell(rect, label_w);
     let visuals = ui.visuals();
-    let label_fill = visuals.selection.bg_fill;
-    let label_text = visuals.strong_text_color();
+    // A layer changing this value wears its colour (`layers::accent`).
+    let label_fill = crate::layers::accent(ui, rect);
+    let label_text = crate::widgets::text_on(label_fill);
     let inactive = visuals.widgets.inactive.bg_fill;
     let hovered_fill = visuals.widgets.active.bg_fill;
     let value_text = visuals.text_color();
@@ -2921,13 +2922,13 @@ pub(crate) fn show_switch_body(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut S
     trace_rect(ui, node_id, "switch_button", rect);
 
     let visuals = if active {
-        ui.style().visuals.selection.bg_fill
+        crate::layers::accent(ui, rect)
     } else {
         ui.style().visuals.widgets.inactive.bg_fill
     };
     let stroke_col = super::kit::toggle_outline(&ui.style().visuals, active, resp.hovered()).color;
     let text_col = if active {
-        ui.style().visuals.strong_text_color()
+        crate::widgets::text_on(visuals)
     } else {
         ui.style().visuals.text_color()
     };

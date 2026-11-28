@@ -469,7 +469,9 @@ pub(crate) fn segmented_icons<T: PartialEq + Clone>(
         }
         let on = value == option;
         let (fill, text_col) = if on {
-            (v.selection.bg_fill, v.strong_text_color())
+            // A layer changing this wears its colour (`layers::accent`).
+            let accent = crate::layers::accent(ui, r);
+            (accent, crate::widgets::text_on(accent))
         } else if resp.hovered() && enabled {
             (v.widgets.hovered.weak_bg_fill, v.text_color())
         } else {
@@ -543,7 +545,8 @@ pub(crate) fn word_toggle(ui: &mut egui::Ui, rect: egui::Rect, on: &mut bool, te
     let v = ui.visuals();
     let enabled = ui.is_enabled();
     let (fill, text_col) = if *on {
-        (v.selection.bg_fill, v.strong_text_color())
+        let accent = crate::layers::accent(ui, rect);
+        (accent, crate::widgets::text_on(accent))
     } else if resp.hovered() && enabled {
         (v.widgets.hovered.weak_bg_fill, v.text_color())
     } else {
@@ -600,12 +603,12 @@ pub(crate) fn pill_combo_glyphs<T: PartialEq + Clone>(
     let shown = options.iter().find(|(o, _)| o == value).map_or("", |(_, t)| *t);
     let widest = options.iter().map(|(_, t)| *t).max_by_key(|t| t.chars().count()).unwrap_or(shown);
     let (label, label_w) = simple_bodies::pill_split(ui, label, pill_label_w(ui, label), widest, rect.width() - z(20.0));
-    let v = ui.visuals().clone();
     let label_cell = egui::Rect::from_min_size(rect.min, egui::vec2(label_w, rect.height()));
     if label_w > 0.0 {
-        ui.painter().rect_filled(label_cell, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, v.selection.bg_fill);
+        let accent = crate::layers::accent(ui, rect);
+        ui.painter().rect_filled(label_cell, egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }, accent);
         let font = simple_bodies::fit_font(ui, label, simple_bodies::pill_font(), label_w - 4.0);
-        ui.painter().text(label_cell.center(), egui::Align2::CENTER_CENTER, label, font, v.strong_text_color());
+        ui.painter().text(label_cell.center(), egui::Align2::CENTER_CENTER, label, font, crate::widgets::text_on(accent));
     }
     let combo = egui::Rect::from_min_max(egui::pos2(rect.left() + label_w, rect.top()), rect.max);
     let mut cell = ui.new_child(
@@ -647,7 +650,7 @@ pub(crate) fn pill_combo_glyphs<T: PartialEq + Clone>(
                 let on = o == value;
                 let vis = ui.visuals();
                 if on {
-                    ui.painter().rect_filled(r, 2.0, vis.selection.bg_fill);
+                    ui.painter().rect_filled(r, 2.0, crate::layers::accent(ui, r));
                 } else if resp.hovered() {
                     ui.painter().rect_filled(r, 2.0, vis.widgets.hovered.weak_bg_fill);
                 }

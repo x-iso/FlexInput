@@ -64,6 +64,7 @@ fn merges_own_cards(label: &str) -> bool {
 fn is_conflict_relevant_pin(pin: &str) -> bool {
     flexinput_core::macros::parse_macro_pin(pin).is_none()
         && flexinput_core::menu::parse_target_pin(pin).is_none()
+        && flexinput_core::layers::parse_layer_pin(pin).is_none()
         && !flexinput_core::flick::is_flick_pin(pin)
 }
 

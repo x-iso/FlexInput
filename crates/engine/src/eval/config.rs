@@ -195,6 +195,9 @@ pub struct TickOutput {
     /// Devices a card started sending Calibrate Gyro to this tick (one entry
     /// per press — see `gyro_cal_edges`), for the UI to calibrate.
     pub gyro_cal_requests: Vec<String>,
+    /// The layer pins cards held this tick (`flexinput_core::layers`), with their
+    /// levels, for the engine thread's layer stack (`crate::layers`).
+    pub layer_pins: Vec<(String, f32)>,
     /// The tick's working maps — the AutoMap bus and the preprocessed device
     /// signals — kept here between ticks, empty, so each tick reuses their
     /// tables and (through `recycle_keys`) their key Strings rather than
@@ -222,6 +225,7 @@ impl TickOutput {
         self.last_inputs.clear();
         self.last_outputs.clear();
         self.gyro_cal_requests.clear();
+        self.layer_pins.clear();
         self.sink_outputs.clear();
     }
 }

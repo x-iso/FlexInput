@@ -845,6 +845,8 @@ pub(crate) fn show_remapper_body(
                     }
                 }
             }
+            // Cards a layer on screen takes away: dimmed and struck through.
+            crate::layers::show_removed_cards(ui, node_id.0, "mappings");
             if let Some((i, obj)) = press_mode_changed {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {
@@ -1381,6 +1383,8 @@ pub(crate) fn show_map_action_body(
                     if let Some(Value::Array(arr)) = node.params.get_mut("mappings") { if idx < arr.len() { arr.remove(idx); } }
                 }
             }
+            // Cards a layer on screen takes away: dimmed and struck through.
+            crate::layers::show_removed_cards(ui, node_id.0, "mappings");
             if let Some((i, obj)) = press_mode_changed {
                 if let Some(node) = snarl.get_node_mut(node_id) {
                     if let Some(Value::Array(arr)) = node.params.get_mut("mappings") {

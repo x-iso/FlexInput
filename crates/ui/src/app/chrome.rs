@@ -104,6 +104,19 @@ pub(crate) struct TabBarActions {
     pub(crate) do_load_workspace: bool,
     pub(crate) do_bind: bool,
     pub(crate) do_close: bool,
+    /// Something done to one of the active tab's layers from its chip.
+    pub(crate) layer_act: Option<crate::layers::LayerAct>,
+}
+
+/// The active tab's layers, for the chips pinned after File/Auto in the tab bar.
+pub(crate) struct LayerBar<'a> {
+    pub(crate) layers: &'a [crate::layers::Layer],
+    /// What each layer changes, for its chip's hover.
+    pub(crate) details: &'a [Vec<String>],
+    /// What the engine has on.
+    pub(crate) active: &'a [String],
+    /// The patch layer being edited.
+    pub(crate) armed: Option<&'a str>,
 }
 
 pub(crate) fn show_tab_bar(
@@ -112,6 +125,7 @@ pub(crate) fn show_tab_bar(
     active_tab: usize,
     effective_bypass: &[bool],
     auto_switch: &mut bool,
+    layer_bar: LayerBar<'_>,
 ) -> TabBarActions {
     let mut switch_to: Option<usize> = None;
     let mut close_idx: Option<usize> = None;
@@ -123,6 +137,7 @@ pub(crate) fn show_tab_bar(
     let mut do_load_workspace = false;
     let mut do_bind = false;
     let mut do_close = false;
+    let mut layer_act = None;
 
     let h = ui.available_height();
     let text_color  = ui.visuals().text_color();
@@ -225,6 +240,11 @@ pub(crate) fn show_tab_bar(
                 *auto_switch = !*auto_switch;
             }
         }
+
+        // The active tab's layers, pinned with File/Auto: the cluster grows
+        // with them and the tabs start after it.
+        ui.add_space(8.0);
+        layer_act = crate::layers::chips(ui, "tab_layers", layer_bar.layers, layer_bar.details, layer_bar.active, layer_bar.armed);
 
         // Divider between the pinned cluster and the scrolling tabs.
         ui.add_space(8.0);
@@ -382,7 +402,7 @@ pub(crate) fn show_tab_bar(
     TabBarActions {
         switch_to, close_idx, new_tab, bypass_toggle,
         do_save, do_load, do_save_workspace, do_load_workspace,
-        do_bind, do_close,
+        do_bind, do_close, layer_act,
     }
 }
 
@@ -1315,5 +1335,53 @@ mod panic_button_tests {
         panic_button_clicked(true, &mut active, &mut learning);
         panic_button_clicked(true, &mut active, &mut learning);
         assert_eq!((active, learning), (false, false));
+    }
+}
+
+/// Pictures of the tab bar with layers at its right end, for checking by eye:
+/// `cargo test -p flexinput-ui --lib shoot_tab_bar_layers -- --ignored --nocapture`.
+#[cfg(test)]
+mod layer_bar_shots {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn shoot_tab_bar_layers() {
+        let layer = |id: &str, name: &str| crate::layers::Layer { id: id.into(), name: name.into(), ..Default::default() };
+        let mut aim = layer("a", "Aim");
+        aim.icon = "generic_letter_a".into();
+        let mut menus = layer("c", "Menus");
+        menus.color = Some([240, 230, 140]); // light: dark text on it
+        let cases: [(&str, Vec<crate::layers::Layer>, Vec<String>, Option<&str>); 3] = [
+            ("tab_bar_no_layers", Vec::new(), Vec::new(), None),
+            ("tab_bar_layers", vec![aim.clone(), layer("b", "Driving"), menus], vec!["b".into(), "c".into()], None),
+            ("tab_bar_layer_editing", vec![aim, layer("b", "Driving")], vec!["a".into()], Some("b")),
+        ];
+        for (name, layers, active, armed) in cases {
+            let ctx = egui::Context::default();
+            crate::app::fonts::setup_fonts(&ctx);
+            let tabs: Vec<PatchTab> = (1..=3).map(PatchTab::new_untitled).collect();
+            let bypass = vec![false; tabs.len()];
+            let mut auto = true;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(760.0, 32.0));
+            let mut shot = crate::canvas::shot::Shot::default();
+            let mut shapes = Vec::new();
+            for i in 0..6 {
+                let raw = egui::RawInput { screen_rect: Some(screen), time: Some(i as f64 / 30.0), ..Default::default() };
+                let out = ctx.run(raw, |ctx| {
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        let bar = LayerBar { layers: &layers, details: &[], active: &active, armed };
+                        let _ = show_tab_bar(ui, &tabs, 0, &bypass, &mut auto, bar);
+                    });
+                });
+                shot.absorb(&out.textures_delta);
+                shapes = out.shapes;
+            }
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/module_shots")
+                .join(format!("{name}.png"));
+            shot.save(&ctx, &shapes, screen, 2.0, &path).expect("the picture saves");
+            println!("{}", path.display());
+        }
     }
 }

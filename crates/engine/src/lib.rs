@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub mod eval;
 pub mod graph;
 pub mod hr_timer;
+pub mod layers;
 pub mod router;
 pub mod state;
 pub mod thread;
@@ -22,7 +23,8 @@ pub use eval::{
     card_allows_analog_mode, osc_sample, pin_allows_analog_mode, pin_is_analog_input, read_scale_t, sample_curve, sig_to_f32,
     vec_reshape_apply, VEC_RESHAPE_BOUNDARY_DEFAULT, VEC_RESHAPE_GAIN_DEFAULT,
 };
-pub use graph::{FeedbackSource, InlineSubgraph, NodeSnap, ProcessingGraph};
+pub use graph::{FeedbackGate, FeedbackSource, InlineSubgraph, LayerOverride, LayerSnap, NodeSnap, ProcessingGraph};
+pub use layers::{active_layers, request_layer};
 pub use router::InputRouter;
 pub use state::NodeState;
 pub use thread::{reset_gyro_modules, ENGINE_TIMINGS, note_scope_taps_read, scope_taps_wanted, spawn_processing_thread, drain_sink_bus, drain_sink_bus_into, EngineSync, is_displacement_pin,current_sample_rate, current_io_rate, set_io_rate, current_output_rate, set_output_rate, engine_counters, new_device_rates, new_scope_taps, new_arc_graph, new_arc_signals, ArcGraph, ArcSignals, DeviceRates, ProcessingOutput, ScopeTaps, ScopeTapRing, SinkBus, UiSourceBlock, new_ui_source_block, DEFAULT_SAMPLE_RATE, SCOPE_TAP_PINS, SCOPE_TAP_RETAIN_MS, SCOPE_TAP_MAX_LEN};

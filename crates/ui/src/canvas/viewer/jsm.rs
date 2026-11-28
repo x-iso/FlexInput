@@ -15,6 +15,9 @@ pub(crate) struct JsmTab {
     pub text: String,
 }
 
+/// The param naming the tab a JSM node runs: what a layer sets to switch it.
+const JSM_ACTIVE_TAB: &str = "jsm_active_tab";
+
 /// Default editor size in a node body — wide enough to read a config in, and
 /// dragged from there by the grip in its bottom-right corner.
 const MIN_W: f32 = TOOLS_MIN_W;
@@ -838,7 +841,7 @@ fn jsm_rows(
         {
             let v = ui.visuals();
             let (fill, text) = if knobs_on {
-                (v.selection.bg_fill, v.strong_text_color())
+                (v.selection.bg_fill, crate::widgets::text_on(v.selection.bg_fill))
             } else if tune.hovered() {
                 (v.widgets.hovered.bg_fill, v.text_color())
             } else {
@@ -1462,6 +1465,15 @@ fn tab_strip(
     let goto = ui.ctx().data_mut(|d| d.remove_temp::<f32>(goto_id));
     let to = goto.or_else(|| (wheel.x + wheel.y != 0.0).then(|| last - wheel.x - wheel.y));
     let (mut switch, mut close, mut add) = (None, None, false);
+    let mut duplicate: Option<usize> = None;
+    // A tab can be what a layer turns on: the layers that reach this node, and its path.
+    let layers = crate::layers::layer_list(ui.ctx());
+    let mut node_path = crate::layers::tint_prefix(ui.ctx());
+    node_path.push(node_id.0);
+    let reaching: Vec<&crate::layers::LayerInfo> = layers.iter().filter(|l| node_path.starts_with(&l.prefix)).collect();
+    let switches_to = |l: &crate::layers::LayerInfo, i: usize| {
+        l.sets(&node_path, JSM_ACTIVE_TAB).and_then(|v| v.as_u64()) == Some(i as u64)
+    };
     let mut front_rect = None;
     // Where each tab is (`None`: the `+`), for a click on the scroll bar over them.
     let mut spots: Vec<(egui::Rect, Option<usize>)> = Vec::new();
@@ -1499,6 +1511,31 @@ fn tab_strip(
                         galley,
                         colour,
                     );
+                    // The layers that switch to it: a dot each, in its colour.
+                    for (k, l) in reaching.iter().filter(|l| switches_to(l, i)).enumerate() {
+                        ui.painter().circle_filled(egui::pos2(r.left() + 4.0 + k as f32 * 5.0, r.top() + 4.0), 2.5, l.color);
+                    }
+                    resp.context_menu(|ui| {
+                        if ui.button("Duplicate tab")
+                            .on_hover_text("A new tab with this one's config, at the end.")
+                            .clicked()
+                        {
+                            duplicate = Some(i);
+                            ui.close();
+                        }
+                        if !reaching.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Switched to while a layer is on").small().weak());
+                            for l in &reaching {
+                                let on = switches_to(l, i);
+                                if ui.selectable_label(on, egui::RichText::new(&l.label).color(l.color)).clicked() {
+                                    let value = if on { Value::Null } else { Value::from(i as u64) };
+                                    crate::layers::queue_layer_setting(ui.ctx(), l, &node_path, JSM_ACTIVE_TAB, value);
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
                     if closable {
                         let x = egui::Rect::from_center_size(egui::pos2(r.right() - 11.0, r.center().y), egui::Vec2::splat(12.0));
                         let xr = ui
@@ -1595,6 +1632,25 @@ fn tab_strip(
     if let Some(i) = close {
         tabs.remove(i);
         *active = (*active).min(tabs.len() - 1);
+        changed = true;
+        // The layers switching to a tab after it: one along; to it: none.
+        for l in &reaching {
+            if let Some(t) = l.sets(&node_path, JSM_ACTIVE_TAB).and_then(|v| v.as_u64()) {
+                let t = t as usize;
+                if t == i {
+                    crate::layers::queue_layer_setting(ui.ctx(), l, &node_path, JSM_ACTIVE_TAB, Value::Null);
+                } else if t > i {
+                    crate::layers::queue_layer_setting(ui.ctx(), l, &node_path, JSM_ACTIVE_TAB, Value::from((t - 1) as u64));
+                }
+            }
+        }
+    }
+    if let Some(i) = duplicate {
+        // At the end, so the tabs layers switch to keep their places.
+        let copy = tabs[i].clone();
+        let name = unique_name(tabs, &format!("{} copy", copy.name));
+        tabs.push(JsmTab { name, text: copy.text });
+        *active = tabs.len() - 1;
         changed = true;
     }
     if add {

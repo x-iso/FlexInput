@@ -4,6 +4,19 @@
 
 pub(crate) mod tex_cache;
 
+/// Text that reads on `fill`: near-black on a light colour, white on a dark one.
+/// For anything drawn on the accent or on a layer's colour, which the user picks.
+pub(crate) fn text_on(fill: egui::Color32) -> egui::Color32 {
+    // Relative luminance (sRGB, linearised), against the 0.18 grey where black and
+    // white text contrast the same.
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let l = 0.2126 * lin(fill.r()) + 0.7152 * lin(fill.g()) + 0.0722 * lin(fill.b());
+    if l > 0.18 { egui::Color32::from_gray(18) } else { egui::Color32::WHITE }
+}
+
 /// Drop-in replacement for the removed-in-spirit `egui::popup_below_widget`
 /// (deprecated in 0.33): a memory-toggled popup anchored under the widget.
 /// Mirrors egui's own `popup_above_or_below_widget` shim over `egui::Popup`.
@@ -87,7 +100,7 @@ pub(crate) fn range_slider(
     let y = rect.center().y;
     let rail_stroke = egui::Stroke::new(4.0_f32, ui.visuals().widgets.inactive.bg_fill);
     painter.line_segment([egui::pos2(rail.left(), y), egui::pos2(rail.right(), y)], rail_stroke);
-    let span = egui::Stroke::new(4.0_f32, ui.visuals().selection.bg_fill);
+    let span = egui::Stroke::new(4.0_f32, crate::layers::accent(ui, rect));
     painter.line_segment([egui::pos2(x_of(*lo), y), egui::pos2(x_of(*hi), y)], span);
     for v in [*lo, *hi] {
         painter.circle(egui::pos2(x_of(v), y), knob, visuals.bg_fill, visuals.fg_stroke);

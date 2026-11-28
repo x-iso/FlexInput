@@ -511,6 +511,8 @@ pub(crate) fn register_exposable_element(
     element_id: &str,
     rect: egui::Rect,
 ) {
+    // A layer on screen changes what this control edits: framed in its colour.
+    crate::layers::tint_element(ui, node_id.0, element_id, rect);
     // Inside a whole-module widget: a part for the pad to walk, with the fields its row
     // published just before (which went out under the widget's own name).
     let collecting: Option<usize> = ui.ctx().data(|d| d.get_temp(egui::Id::new(MODULE_PARTS_COLLECT_KEY)));

@@ -280,7 +280,8 @@ fn eval_subgraph(
         // to `compute_node` which doesn't touch `collector_sigs` at all —
         // upstream Remapper / Collector overrides get dropped on the floor.
         if snap.module_id == "module.automap_fork" {
-            automap_fork_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
+            let sel = automap_fork_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs);
+            state.entry(ns_uid).or_default().automap_select = sel;
             computed[idx] = vec![None; snap.n_outputs];
             if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
@@ -292,7 +293,8 @@ fn eval_subgraph(
             continue;
         }
         if snap.module_id == "module.automap_selector" {
-            automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs, fb_routes);
+            let sel = automap_selector_publish(snap, ns_uid, &computed, dev_sigs, collector_sigs, fb_routes);
+            state.entry(ns_uid).or_default().automap_select = sel;
             computed[idx] = vec![None];
             if display { last_outputs.insert(ns_uid, computed[idx].clone()); }
             continue;
@@ -538,7 +540,7 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
     // What the game asks of each pad / bus this tick (and network peers'
     // feedback), gathered before any node runs so feedback modules read it
     // this tick. See eval/feedback.rs.
-    gather_game_feedback(&graph.nodes, dev_sigs, &mut collector_sigs);
+    gather_game_feedback(&graph.nodes, dev_sigs, &mut collector_sigs, state);
     // Reverse feedback routes: a synthetic AutoMap node's OUTPUT id (e.g.
     // "forksel:5:0" from a Selector) → the SOURCE id it currently gates from
     // (e.g. "collector:3" for a network recv, or "gilrs:…" for a pad). Populated
@@ -704,7 +706,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
 
         // ── module.automap_fork: gate AutoMap bus to selected output ─────────
         if snap.module_id == "module.automap_fork" {
-            automap_fork_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs);
+            let sel = automap_fork_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs);
+            state.entry(snap.node_uid).or_default().automap_select = sel;
             computed[idx] = vec![None; snap.n_outputs];
             continue;
         }
@@ -725,7 +728,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
         }
         // ── module.automap_selector: gate selected AutoMap input to output ────
         if snap.module_id == "module.automap_selector" {
-            automap_selector_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs, &mut fb_routes);
+            let sel = automap_selector_publish(snap, snap.node_uid, &computed, dev_sigs, &mut collector_sigs, &mut fb_routes);
+            state.entry(snap.node_uid).or_default().automap_select = sel;
             computed[idx] = vec![None];
             continue;
         }
@@ -1056,6 +1060,8 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
                     .map(|p| p.as_str())
                     .collect();
                 for fb in &st.feedback_sources {
+                    // Behind a Selector / Fork: only while it passes this pad on.
+                    if !feedback::gates_open(fb, state) { continue; }
                     for (virt_out_pin, _) in flexinput_core::automap::FEEDBACK_PAIRS.iter() {
                         let Some(&sig) = dev_sigs.get_pin(&fb.device_id, &virt_out_pin) else {
                             continue;
@@ -1375,6 +1381,10 @@ pub fn eval_graph_tick<S: std::hash::BuildHasher>(
             if k == SIGS_NS || k == SIGS_NS_VEC2 {
                 for (pin, sig) in collector_sigs.pins_of(k) {
                     carry.macro_prev.insert((k.to_string(), pin.to_string()), *sig);
+                    // A card's layer press, for the engine thread's layer stack.
+                    if k == SIGS_NS && pin.starts_with(flexinput_core::layers::PREFIX) {
+                        out.layer_pins.push((pin.to_string(), sig_magnitude(*sig)));
+                    }
                 }
             } else if let Some(dev) = k.strip_prefix(SRC_BLOCK_PREFIX) {
                 for (pin, _) in collector_sigs.pins_of(k) {

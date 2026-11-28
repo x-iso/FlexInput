@@ -45,7 +45,20 @@ pub(crate) fn render_pinned_element(
     }
 
     let pin_graph = graph_override.clone();
-    super::simple_bodies::with_text_cap(ui, look.text_max, |ui| {
+    // The module is drawn from inside its sub-patch: what layers change is found
+    // by its path there (the tab canvas is the overlay's sentinel outer).
+    let mut tint_path = super::glow::glow_parent_prefix(automap_parent);
+    if outer_id.0 != usize::MAX {
+        tint_path.push(outer_id.0);
+    }
+    let prefix = tint_path.clone();
+    tint_path.push(inner_id.0);
+    let ctx = ui.ctx().clone();
+    // Its controls show what the layers on screen set.
+    let shown = inner_snarl.get_node_mut(inner_id)
+        .and_then(|n| crate::layers::show_layer_values(&ctx, &tint_path, n));
+    let whole = crate::layers::whole_pin(module_id, element_id);
+    crate::layers::with_pin_tint(&ctx, prefix, whole, || super::simple_bodies::with_text_cap(ui, look.text_max, |ui| {
         super::simple_bodies::with_label_size(ui, |ui| {
             super::simple_bodies::with_graph_labels(look.graph_labels, || {
                 super::chrome::with_pin_graph(pin_graph.as_ref(), || {
@@ -58,7 +71,11 @@ pub(crate) fn render_pinned_element(
                 });
             });
         });
-    });
+    }));
+    if let (Some(shown), Some(n)) = (shown, inner_snarl.get_node_mut(inner_id)) {
+        crate::layers::hide_layer_values(&ctx, n, shown);
+    }
+    crate::layers::tint_pin(ui, &tint_path, element_id, ui.min_rect());
 
     // `applied` is only present when the renderer routed through
     // `apply_widget_scale` (row-style widgets). Graphs / whole-module pins

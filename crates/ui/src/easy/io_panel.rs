@@ -291,10 +291,16 @@ fn show_input_section(
         if let Some(p) = super::subpatches::primary(snarl).filter(|_| super::subpatches::easy_list(snarl).len() >= 2) {
             let icon = super::subpatches::icon(snarl, p);
             let name = super::subpatches::name(snarl, p);
-            let into = if icon.is_empty() { name } else { format!("{icon} {name}") };
-            ui.label(egui::RichText::new(format!("for {into}")).small().weak())
-                .on_hover_text("Devices wire into and out of the primary sub-patch; the tab row's \
-                                others keep the wiring Advanced mode gives them.");
+            let into = if icon.is_empty() || crate::macro_icons::is_icon_key(icon) { name } else { format!("{icon} {name}") };
+            let tip = if super::wiring::output_hub(snarl).is_some() {
+                "Input devices wire into the primary sub-patch, and output devices come from the \
+                 AutoMap Selector the sub-patches feed; the tab row's others keep the wiring \
+                 Advanced mode gives them."
+            } else {
+                "Devices wire into and out of the primary sub-patch; the tab row's others keep \
+                 the wiring Advanced mode gives them."
+            };
+            ui.label(egui::RichText::new(format!("for {into}")).small().weak()).on_hover_text(tip);
         }
     });
     ui.add_space(SECTION_GAP * 0.5);
@@ -1339,6 +1345,17 @@ fn show_output_section(
     ui.add_space(8.0);
     ui.vertical_centered(|ui| {
         ui.label(egui::RichText::new("Choose output devices").size(crate::settings::ui_size(15.0)).strong());
+        // Fed from a Selector, the outputs follow whichever sub-patch it passes on.
+        if let Some(hub) = super::wiring::output_hub(&canvas.snarl) {
+            let name = canvas.snarl.get_node(hub)
+                .map(|n| n.display_name.trim())
+                .filter(|n| !n.is_empty())
+                .unwrap_or("AutoMap Selector")
+                .to_string();
+            ui.label(egui::RichText::new(format!("from {name}")).small().weak())
+                .on_hover_text("These are wired from the AutoMap Selector the sub-patches feed, \
+                                so they follow whichever sub-patch it passes on.");
+        }
     });
     ui.add_space(CARD_GAP);
 

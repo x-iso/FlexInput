@@ -681,6 +681,8 @@ pub(crate) fn is_macro_style_target(pin: &str) -> bool {
     flexinput_core::macros::parse_macro_pin(pin).is_some()
         || flexinput_core::menu::parse_target_pin(pin).is_some()
         || flexinput_core::flick::is_flick_pin(pin)
+        // Layers: read at the end of the tick (`crate::layers`).
+        || flexinput_core::layers::parse_layer_pin(pin).is_some()
 }
 
 pub(crate) fn merge_macro_ns(

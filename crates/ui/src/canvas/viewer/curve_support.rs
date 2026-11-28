@@ -825,6 +825,17 @@ pub(crate) fn paint_response_curve_graph(
                 egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200)));
         }
     }
+    // A layer on screen changing the curve: its curve over this one, in its colour.
+    if let Some((lp, lb, color)) = crate::layers::curve_tint(ui.ctx(), node_id.0, &new_points, &new_biases) {
+        let steps = 120usize;
+        let pts: Vec<egui::Pos2> = (0..=steps)
+            .map(|i| {
+                let x = x_lo + x_range * i as f32 / steps as f32;
+                c2s(x, sample_curve(&lp, x, &lb).clamp(y_lo, y_hi))
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, color)));
+    }
 
     let bias_id_tag = if is_vec { "vbias_h_only" } else { "bias_h_only" };
     let pt_id_tag   = if is_vec { "vcpt_only" }    else { "cpt_only" };

@@ -1261,6 +1261,12 @@ pub fn apply_theme_and_contrast(ctx: &egui::Context, settings: &AppSettings) {
     // The accent: what is selected, lit or on.
     let [r, g, b] = settings.accent_color;
     style.visuals.selection.bg_fill = egui::Color32::from_rgb(r, g, b);
+    // Text on a selected widget is drawn in the selection stroke's colour: dark on
+    // a light accent, where the theme's light one couldn't be read.
+    let on = crate::widgets::text_on(style.visuals.selection.bg_fill);
+    if on != egui::Color32::WHITE {
+        style.visuals.selection.stroke.color = on;
+    }
     // The controls' font: the pills read it from `simple_bodies`, and every egui button and
     // dropdown from the Button text style - so none is left in the font it had.
     let size = settings.control_font_size.clamp(CONTROL_FONT_SIZE_MIN, CONTROL_FONT_SIZE_MAX);
@@ -1464,6 +1470,9 @@ pub struct PersistedTab {
     /// The calibration of pads taken off the tab (`canvas::DeviceMemory`).
     #[serde(default, skip_serializing_if = "crate::canvas::DeviceMemory::is_empty")]
     pub device_memory: crate::canvas::DeviceMemory,
+    /// The tab's own layers (`crate::layers`); its sub-patches' are in the snarl.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<crate::layers::Layer>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1537,6 +1546,7 @@ fn blank_tab_from_value(v: &serde_json::Value) -> PersistedTab {
         overlay: crate::canvas::OverlayLayout::default(),
         config: crate::canvas::OverlayLayout::default(),
         device_memory: v.get("device_memory").cloned().and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default(),
+        layers: v.get("layers").cloned().and_then(|x| serde_json::from_value(x).ok()).unwrap_or_default(),
     }
 }
 
@@ -1763,6 +1773,7 @@ mod workspace_resilience_tests {
             overlay: crate::canvas::OverlayLayout::default(),
             config: crate::canvas::OverlayLayout::default(),
             device_memory: crate::canvas::DeviceMemory::default(),
+            layers: Vec::new(),
         }
     }
 

@@ -720,6 +720,8 @@ pub fn spawn_processing_thread(
         let waiter = crate::hr_timer::HrWaiter::new();
         let mut timings = EngineTimingAcc::default();
         let mut gyro_reset_seen = GYRO_RESET_EPOCH.load(Ordering::Relaxed);
+        // Which layers are on, and the graph with their settings in place.
+        let mut layers = crate::layers::LayerRuntime::default();
 
         loop {
             puffin::GlobalProfiler::lock().new_frame();
@@ -831,16 +833,26 @@ pub fn spawn_processing_thread(
                 {
                     puffin::profile_scope!("eval_ticks");
                     let eval_t = Instant::now();
+                    // The patch graph with the layers on written over it.
+                    layers.wake(&graph_snap);
+                    let mut tick_graph = layers.graph(&graph_snap);
+                    let mut graph_swapped = false;
                     for t in 0..ticks {
                         tick_out.skip_display = t + 1 != ticks;
-                        tick_out.same_input = t != 0;
+                        // A layer's pad settings change what preprocessing makes of
+                        // the same input.
+                        tick_out.same_input = t != 0 && !graph_swapped;
                         if !ui_block.is_empty() {
                             let carry = state.entry(crate::eval::MACRO_CARRY_UID).or_default();
                             for k in &ui_block {
                                 carry.source_block.insert(k.clone());
                             }
                         }
-                        eval_graph_tick(&graph_snap, &mut state, &dev_sigs, dt, &mut tick_out);
+                        eval_graph_tick(&tick_graph, &mut state, &dev_sigs, dt, &mut tick_out);
+                        graph_swapped = layers.after_tick(&tick_out.layer_pins, &graph_snap);
+                        if graph_swapped {
+                            tick_graph = layers.graph(&graph_snap);
+                        }
                         // Drain scope samples each tick — eval_graph_tick
                         // clears tick_out on entry, so we must move (not
                         // clone) the samples here before the next call.

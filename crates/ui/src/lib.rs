@@ -9,6 +9,7 @@ mod easy;
 mod gamepad_nav;
 mod hidhide_toggle;
 mod kbm_picker;
+mod layers;
 #[cfg(target_os = "linux")]
 mod kwin;
 mod licenses;

@@ -1089,6 +1089,11 @@ pub struct UiSubPatch {
     /// Config-overlay counterpart to `overlay_items` (the M3 tweak-pins).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_items: Vec<LayoutItem>,
+    /// This sub-patch's layers: settings of the modules inside it that cards turn
+    /// on and off while the patch runs (`crate::layers`). Stored here so they
+    /// travel with the sub-patch into a `.fxsp` preset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<crate::layers::Layer>,
     /// The overlay viewport size (`OverlayLayout::authored_size`) the positions
     /// in `overlay_items` are expressed in. Without it a preset loaded on a tab
     /// with no (or another) authored size can't re-anchor to the screen — its
@@ -1616,6 +1621,7 @@ impl Default for UiSubPatch {
             items: vec![],
             overlay_items: vec![],
             config_items: vec![],
+            layers: Vec::new(),
             overlay_authored_size: None,
             config_authored_size: None,
             exposed_modules: vec![],

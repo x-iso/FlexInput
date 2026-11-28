@@ -85,7 +85,49 @@ All notable changes to FlexInput are documented here. This project adheres to
   preset into the one showing, which keeps its own preset link. The Devices panel touches
   only its own wiring: a pad or module wired elsewhere in Advanced mode stays wired, and an
   input of the primary a module feeds is listed as wired in Advanced mode, where no pad can
-  take it.
+  take it. While a layout is edited, "duplicate" beside the tab picker adds a tab with copies
+  of what's on the one showing, to swap some of it for others. To switch between sub-patches
+  while the patch runs, wire them into an AutoMap
+  Selector: once a sub-patch feeds one, the output devices are wired from the Selector instead
+  of the primary, and follow whichever sub-patch it passes on ("from AutoMap Selector" under
+  the outputs). A sub-patch left out of it, a helper beside them, never takes the outputs.
+  Pads still go into the primary only.
+
+- **Layers: sets of settings a patch switches while it runs.** Like Steam Input's action
+  layers. A layer holds only the module settings it changes (a slower gyro, a different
+  curve, a card's mode), and while it is on they replace the patch's own. The patch's layers
+  sit in the tab bar right after Auto, a sub-patch's at the end of its header; + adds one.
+  Click a layer to turn it on or off; hover it to see what it changes. Right-click › Edit
+  settings to change what it holds: the modules show the layer's settings, every setting you
+  change goes into the layer, and Done editing puts the patch's own back. Each layer has a
+  colour (and can have an icon): while it is on, being edited or hovered, every module it
+  changes is framed in that colour with a badge naming it, and the controls it changes show
+  the layer's value, tinted, with the picked option or value label in the layer's colour (on
+  the canvas, in pinned widgets and in a whole module pinned as a widget). Change such a value
+  there and the layer gets it, not the patch. Buttons and sliders that wear the accent (a
+  switch that's on, a picked option, a slider's fill) wear the layer's colour instead. A graph
+  a layer changes draws the layer's curve over its own in the layer's colour: response curves,
+  two-way curves (either lane), Audio Stream Haptics' EQ, stick reshape and the envelope. A
+  layer changes mapping cards one by one (a Remapper's, Map Action's, Touch Zones' and
+  Lean's): every card has an id now, and a layer keeps only the cards it changes, adds or
+  takes away. With the layer on, the module shows the layer's cards, those it changes or adds
+  framed in its colour, those it takes away struck through below the rest, and a changed
+  card's curve in the layer's colour over the patch's own, dashed. The other cards go on
+  following the patch as it's edited. The cards that turn layers on and off always run as the patch
+  has them. Gamepad navigation edits what a layer shows into the layer, as the mouse does.
+  A JSM Config tab can be what a layer turns on: right-click the tab and pick the layer, and
+  while that layer is on the module runs that tab's config (a dot in the layer's colour marks
+  the tab). The same menu duplicates a tab. Layers and sub-patch tabs take their icons from
+  the icon set the Macro Output module uses, with a new Generic category first (A, B and
+  numbers in squares); an emoji picked before still shows.
+  Saving meanwhile saves the patch's own, and undo doesn't mix the two. A card turns a layer on from the Choose picker's new Layers tab: Hold
+  (on while held), Toggle, On or Off. With two layers on that change the same setting, the
+  one turned on last wins, and turning it off shows the other again. A sub-patch's layers
+  reach only what is inside it, and travel with it in a `.fxsp` preset; two copies of one
+  preset get layers of their own. The engine switches layers itself, so they work while the
+  window sits behind a game. Wiring isn't part of a layer: to switch where signals go (between
+  sub-patches, say), wire a Constant into an AutoMap Selector's select and let a layer change
+  the Constant.
 
 - **Joy-Con 2 rumble.** A Joy-Con 2 half now plays rumble, over the Bluetooth dongle, Windows
   Bluetooth or USB. A game's ordinary rumble arrives on two new pins, Rumble (strong) and
@@ -98,6 +140,30 @@ All notable changes to FlexInput are documented here. This project adheres to
   say the range they really play, 80–500 Hz; the labels promised the Switch Pro's.
 
 ### Fixed
+
+- **The icon picker no longer folds to one row.** A category or a search with few icons kept
+  the picker one row tall; it is at least four rows now.
+
+- **A card on Home + a button.** With Home leading one of FlexInput's gamepad shortcuts, Home
+  was held back from the patch whenever it was pressed, so a mapping card on Home + B never
+  fired and B went to the game. Such a chord now goes to the patch once it's held whole
+  (while Home alone is held, B is held back with it, so it never reaches the game alone), and
+  the Home press it used isn't replayed to the game afterwards. A shortcut over the same
+  buttons still wins. FlexInput's own gamepad navigation leaves the chords of cards that
+  switch layers to them too: with Y + touchpad click turning a layer on, Y no longer opens the
+  Devices panel as well. Such a button still navigates when pressed alone, as it's let go.
+
+- **Text on the accent colour reads on a light accent too.** Selected buttons, pills' labels,
+  layout tabs and the Add to canvas button wrote light text on the accent whatever it was; on
+  a light accent it is dark now.
+
+- **A game's rumble through an AutoMap Selector or Fork.** A virtual pad wired after an AutoMap
+  Selector or Fork gave its game's rumble and light bar to no pad at all: the Selector's
+  output is a bus of its own, and the search for the pad behind it stopped there. It now goes
+  back to the pad the Selector passes on, and moves with it when the Selector switches, so a
+  Selector picking between two pads rumbles only the one in use. Through sub-patches into a
+  Selector, the pad feeding them gets it whichever is selected. A Fork's pad gets the
+  feedback of the virtual pad on the output it sends to.
 
 - **Crashes with a Bluetooth dongle's search running.** The title-bar Bluetooth button looks
   for adapters every two seconds, and the Classic and Joy-Con transports look for theirs

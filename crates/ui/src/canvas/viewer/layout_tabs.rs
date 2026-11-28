@@ -153,7 +153,7 @@ pub(crate) fn tab_row(ui: &mut egui::Ui, rect: egui::Rect, names: &[String], act
             v.widgets.inactive.weak_bg_fill
         };
         painter.rect_filled(*cell, top_round, fill);
-        let text_col = if lit { v.strong_text_color() } else { v.text_color() };
+        let text_col = if lit { crate::widgets::text_on(v.selection.bg_fill) } else { v.text_color() };
         let close = (edit && lit).then(|| {
             let s = 14.0_f32.min(cell.height() - 4.0);
             egui::Rect::from_center_size(egui::pos2(cell.right() - 6.0 - s * 0.5, cell.center().y), egui::vec2(s, s))
@@ -293,7 +293,8 @@ fn section_row_cells(
                 .iter()
                 .enumerate()
                 .map(|(k, n)| {
-                    let w = ui.painter().layout_no_wrap(section_tab_label(sec, n), font.clone(), egui::Color32::PLACEHOLDER).size().x;
+                    let w = ui.painter().layout_no_wrap(section_tab_label(sec, n), font.clone(), egui::Color32::PLACEHOLDER).size().x
+                        + section_icon_w(sec, &font);
                     (w + 2.0 * pad + if edit && (s, k) == active && k > 0 { close_w } else { 0.0 }).max(64.0)
                 })
                 .collect()
@@ -335,7 +336,17 @@ fn section_row_cells(
 
 /// A tab's label in Easy mode's row: its sub-patch's icon, then its name.
 fn section_tab_label(sec: &TabSection, name: &str) -> String {
-    if sec.icon.is_empty() { name.to_string() } else { format!("{} {name}", sec.icon) }
+    if sec.icon.is_empty() || crate::macro_icons::is_icon_key(&sec.icon) {
+        name.to_string()
+    } else {
+        format!("{} {name}", sec.icon)
+    }
+}
+
+/// How wide a section's icon of the set is, drawn before a tab's name (0 for none, or an
+/// emoji, which is part of the name's text).
+fn section_icon_w(sec: &TabSection, font: &egui::FontId) -> f32 {
+    if crate::macro_icons::is_icon_key(&sec.icon) { font.size + 4.0 } else { 0.0 }
 }
 
 /// Easy mode's row of tabs across `rect`: a section per sub-patch it shows, each its own
@@ -388,7 +399,7 @@ pub(crate) fn section_tab_row(
                 v.widgets.inactive.weak_bg_fill
             };
             painter.rect_filled(*cell, top_round, fill);
-            let text_col = if lit { v.strong_text_color() } else { v.text_color() };
+            let text_col = if lit { crate::widgets::text_on(v.selection.bg_fill) } else { v.text_color() };
             // A section's first tab is the sub-patch itself: it has no ×.
             let close = (edit && lit && k > 0).then(|| {
                 let sz = 14.0_f32.min(cell.height() - 4.0);
@@ -419,11 +430,21 @@ pub(crate) fn section_tab_row(
                 }
                 None => {
                     let g = painter.layout_no_wrap(section_tab_label(sec, name), font.clone(), text_col);
+                    let icon_w = section_icon_w(sec, &font);
+                    let total = g.size().x + icon_w;
                     // A label wider than its tab is cut at the tab's edge; one that fits sits in
                     // the middle of it.
-                    let x = if g.size().x <= text_rect.width() { text_rect.center().x - g.size().x * 0.5 } else { text_rect.left() };
-                    painter.with_clip_rect(text_rect.intersect(painter.clip_rect())).galley(
-                        egui::pos2(x, text_rect.center().y - g.size().y * 0.5),
+                    let x = if total <= text_rect.width() { text_rect.center().x - total * 0.5 } else { text_rect.left() };
+                    let clipped = painter.with_clip_rect(text_rect.intersect(painter.clip_rect()));
+                    if icon_w > 0.0 {
+                        let r = egui::Rect::from_center_size(
+                            egui::pos2(x + font.size * 0.5, text_rect.center().y),
+                            egui::Vec2::splat(font.size),
+                        );
+                        crate::macro_icons::paint_icon(ui.ctx(), &clipped, &sec.icon, r, text_col);
+                    }
+                    clipped.galley(
+                        egui::pos2(x + icon_w, text_rect.center().y - g.size().y * 0.5),
                         g,
                         text_col,
                     );
@@ -450,7 +471,8 @@ pub(crate) fn section_tab_row(
                 (false, false) => "Right-click for its icon, to make it primary, or to hide it from Easy mode.",
             };
             let resp = resp.on_hover_text(hover);
-            resp.context_menu(|ui| {
+            // Closed by its buttons or a click outside: a click in the icon search is the menu's.
+            egui::Popup::context_menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 ui.label(egui::RichText::new("Icon").small().weak());
                 if let Some(icon) = crate::easy::subpatches::icon_grid(ui, &sec.icon) {
                     act.icon = Some((s, icon));
@@ -598,6 +620,35 @@ fn tab_picker_options(state: &LayoutStateMut<'_>) -> Vec<(usize, String)> {
     options
 }
 
+/// Add a tab copying the one showing: copies of the objects on it go on the new tab, which
+/// shows. On a layout with one tab, what's on it (on every tab, there being one) is put on the
+/// first tab first, so the copy is what changes. `None` when there's no room for another.
+pub(crate) fn duplicate_layout_tab(state: &mut LayoutStateMut<'_>) -> Option<usize> {
+    let active = if state.layout_tabs.len() >= 2 { (*state.active_tab).min(state.layout_tabs.len() - 1) } else { 0 };
+    let name = state.layout_tabs.get(active).cloned().unwrap_or_else(|| "Tab 1".to_string());
+    if state.layout_tabs.len() < 2 {
+        for it in state.items.iter_mut().filter(|it| it.tab().is_none()) {
+            it.set_tab(Some(0));
+        }
+    }
+    let k = add_layout_tab(state.layout_tabs)?;
+    let mut copy = format!("{name} copy");
+    let mut n = 2;
+    while state.layout_tabs.iter().any(|t| *t == copy) {
+        copy = format!("{name} copy {n}");
+        n += 1;
+    }
+    state.layout_tabs[k] = copy;
+    let copies: Vec<LayoutItem> = state.items.iter()
+        .filter(|it| it.tab() == Some(active as u8))
+        .cloned()
+        .map(|mut it| { it.set_tab(Some(k as u8)); it })
+        .collect();
+    state.items.extend(copies);
+    state.show_tab(k);
+    Some(k)
+}
+
 /// The tab picker's option that adds a tab.
 const NEW_TAB: usize = usize::MAX;
 
@@ -637,6 +688,22 @@ mod tests {
         let mut it = LayoutItem::Deco(make_default_decoration("rect"));
         it.set_tab(tab);
         it
+    }
+
+    /// Duplicating a tab copies what's on it onto a new tab that shows; what's on every tab
+    /// of a layout with one is put on its first tab first, so the copy can differ.
+    #[test]
+    fn a_duplicated_tab_has_copies_of_whats_on_it() {
+        let mut sp = crate::canvas::node::UiSubPatch::default();
+        sp.items = vec![rect_on(None), rect_on(None)];
+        let mut state = LayoutStateMut::of_subpatch(&mut sp);
+        assert_eq!(duplicate_layout_tab(&mut state), Some(1));
+        drop(state);
+        assert_eq!(sp.layout_tabs, ["Tab 1", "Tab 1 copy"]);
+        assert_eq!(sp.items.len(), 4);
+        assert_eq!(sp.items.iter().filter(|it| it.tab() == Some(1)).count(), 2);
+        assert_eq!(sp.items.iter().filter(|it| it.tab() == Some(0)).count(), 2);
+        assert_eq!(sp.active_tab, 1);
     }
 
     /// The first tab added makes two, with what was there on the first.

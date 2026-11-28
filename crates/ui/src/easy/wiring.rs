@@ -4,6 +4,12 @@
 //! PRIMARY sub-patch's AutoMap inlets, and that sub-patch's first AutoMap
 //! outlet → each of Easy mode's `device.sink`s (`subpatches::primary`).
 //!
+//! **Switching sub-patches.** When an AutoMap Selector on the canvas is fed by a
+//! sub-patch, the output devices hang off the Selector instead ([`output_hub`]):
+//! whichever sub-patch it passes on drives them, so the patch can switch between
+//! the sub-patches wired into it while it runs. One left out of it - a helper
+//! beside them - never takes the outputs.
+//!
 //! **Only Easy mode's own wires.** A device node is Easy mode's when the primary
 //! is what its AutoMap pin is wired to (a source) or from (a sink), or when
 //! nothing at all is wired to it yet - one the panel just added. Every other
@@ -71,15 +77,48 @@ pub fn managed_sources(snarl: &Snarl<NodeData>, primary: Option<NodeId>) -> Vec<
         .collect()
 }
 
-/// Easy mode's output devices: sinks whose AutoMap input `primary` feeds, and
-/// sinks nothing is wired to.
+/// Easy mode's output devices: sinks whose AutoMap input `primary` or the
+/// [`output_hub`] feeds, and sinks nothing is wired to.
 pub fn managed_sinks(snarl: &Snarl<NodeData>, primary: Option<NodeId>) -> Vec<NodeId> {
+    let feeders: Vec<NodeId> = primary.into_iter().chain(output_hub(snarl)).collect();
     snarl
         .nodes_ids_data()
         .filter(|(_, n)| n.value.module_id == "device.sink")
         .map(|(id, _)| id)
-        .filter(|&id| primary.is_some_and(|p| sink_fed_by(snarl, id, p)) || !has_any_wire(snarl, id))
+        .filter(|&id| feeders.iter().any(|&f| sink_fed_by(snarl, id, f)) || !has_any_wire(snarl, id))
         .collect()
+}
+
+/// The AutoMap Selector Easy mode's output devices are wired from instead of the
+/// primary: one on the canvas that a sub-patch feeds. Whichever sub-patch it
+/// passes on drives the outputs, so the sub-patches wired into it can take them
+/// over while the patch runs - and one that isn't (a helper beside them) never
+/// does. With several, the one the primary feeds, then the oldest.
+pub fn output_hub(snarl: &Snarl<NodeData>) -> Option<NodeId> {
+    let primary = subpatches::primary(snarl);
+    snarl
+        .nodes_ids_data()
+        .filter(|(_, n)| n.value.module_id == "module.automap_selector")
+        .filter_map(|(id, n)| {
+            let feeders: Vec<NodeId> = automap_input_indices(Some(&n.value))
+                .into_iter()
+                .flat_map(|pin| snarl.in_pin(InPinId { node: id, input: pin }).remotes)
+                .map(|r| r.node)
+                .collect();
+            let by_subpatch = feeders
+                .iter()
+                .any(|&f| snarl.get_node(f).is_some_and(|n| n.module_id == "subpatch"));
+            by_subpatch.then(|| (!primary.is_some_and(|p| feeders.contains(&p)), id.0, id))
+        })
+        .min_by_key(|&(not_primary, n, _)| (not_primary, n))
+        .map(|(_, _, id)| id)
+}
+
+/// Where Easy mode's output devices are wired from: the [`output_hub`]'s AutoMap
+/// output, else `primary`'s first AutoMap outlet.
+fn output_feed(snarl: &Snarl<NodeData>, primary: NodeId) -> Option<OutPinId> {
+    let node = output_hub(snarl).unwrap_or(primary);
+    first_automap_output_idx(snarl.get_node(node)).map(|output| OutPinId { node, output })
 }
 
 /// Recompute Easy-mode wiring on the canvas.
@@ -127,15 +166,17 @@ pub fn move_primary(snarl: &mut Snarl<NodeData>, id: NodeId) {
 }
 
 /// Easy mode's wires into and out of sub-patch `p`: each managed source's AutoMap
-/// output into it, and its outlet into each managed sink's AutoMap input.
+/// output into it, and its outlet - or the [`output_hub`]'s - into each managed
+/// sink's AutoMap input.
 fn easy_wires(snarl: &Snarl<NodeData>, p: NodeId, m: &Managed) -> Vec<(OutPinId, InPinId)> {
+    let hub = output_hub(snarl);
     snarl
         .wires()
         .filter(|(o, i)| {
             (i.node == p
                 && m.sources.contains(&o.node)
                 && first_automap_output_idx(snarl.get_node(o.node)) == Some(o.output))
-                || (o.node == p
+                || ((o.node == p || Some(o.node) == hub)
                     && m.sinks.contains(&i.node)
                     && first_automap_input_idx(snarl.get_node(i.node)) == Some(i.input))
         })
@@ -193,13 +234,13 @@ fn rewire_into(snarl: &mut Snarl<NodeData>, sp_id: NodeId, m: &Managed) {
         );
     }
 
-    if let Some(sp_out_pin) = first_automap_output_idx(snarl.get_node(sp_id)) {
+    if let Some(feed) = output_feed(snarl, sp_id) {
         for sink_id in &m.sinks {
             let Some(sink_in_pin) = first_automap_input_idx(snarl.get_node(*sink_id)) else { continue };
             let to = InPinId { node: *sink_id, input: sink_in_pin };
             // Never a second wire into an input another one already feeds.
             if snarl.in_pin(to).remotes.is_empty() {
-                snarl.connect(OutPinId { node: sp_id, output: sp_out_pin }, to);
+                snarl.connect(feed, to);
             }
         }
     }
@@ -531,6 +572,52 @@ mod tests {
         c.snarl.disconnect(OutPinId { node: pad, output: 0 }, InPinId { node: curve, input: 0 });
         release_source(&mut c, pad);
         assert!(c.snarl.get_node(pad).is_none());
+    }
+
+    /// A Selector two sub-patches feed: the output devices are wired from it, one
+    /// the primary fed before moving over on the next rewire. The pads stay on the
+    /// primary.
+    #[test]
+    fn outputs_hang_off_a_selector_the_sub_patches_feed() {
+        let mut c = Canvas::default();
+        let one = at(&mut c, am_node("subpatch", 1, 1));
+        let two = at(&mut c, am_node("subpatch", 1, 1));
+        let pad = at(&mut c, am_node("device.source", 0, 1));
+        let old = at(&mut c, am_node("device.sink", 1, 0));
+        rewire(&mut c);
+        assert!(wired(&c, one, old), "no Selector yet: from the primary");
+        let mut sel = am_node("module.automap_selector", 3, 1);
+        sel.inputs[0] = PinDescriptor::new("select", SignalType::Float);
+        let sel = at(&mut c, sel);
+        c.snarl.connect(OutPinId { node: one, output: 0 }, InPinId { node: sel, input: 1 });
+        c.snarl.connect(OutPinId { node: two, output: 0 }, InPinId { node: sel, input: 2 });
+        assert_eq!(output_hub(&c.snarl), Some(sel));
+        let new = at(&mut c, am_node("device.sink", 1, 0));
+        rewire(&mut c);
+        assert!(wired(&c, pad, one), "the pad stays on the primary");
+        assert!(wired(&c, sel, old) && !wired(&c, one, old), "the old output moves to the Selector");
+        assert!(wired(&c, sel, new) && !wired(&c, one, new));
+        assert_eq!(Managed::of(&c.snarl, Some(one)).sinks, vec![old, new]);
+        release_sink(&mut c, new);
+        assert!(c.snarl.get_node(new).is_none(), "let go of from the Selector too");
+        // A new primary keeps the outputs on the Selector.
+        move_primary(&mut c.snarl, two);
+        assert!(wired(&c, sel, old) && !wired(&c, two, old));
+    }
+
+    /// A Selector no sub-patch feeds - picking between two pads, say - is Advanced
+    /// mode's, and the outputs stay on the primary.
+    #[test]
+    fn a_selector_of_pads_is_no_hub() {
+        let mut c = Canvas::default();
+        let sp = at(&mut c, am_node("subpatch", 1, 1));
+        let pad = at(&mut c, am_node("device.source", 0, 1));
+        let sel = at(&mut c, am_node("module.automap_selector", 3, 1));
+        c.snarl.connect(OutPinId { node: pad, output: 0 }, InPinId { node: sel, input: 1 });
+        let out = at(&mut c, am_node("device.sink", 1, 0));
+        rewire(&mut c);
+        assert_eq!(output_hub(&c.snarl), None);
+        assert!(wired(&c, sp, out) && !wired(&c, sel, out));
     }
 
     /// A preset with fewer pins leaves no wire on a pin that's gone.

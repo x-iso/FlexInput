@@ -605,7 +605,8 @@ pub(crate) fn header_toggle_pair(
             .on_hover_text(hover);
         let v = ui.visuals();
         let (fill, text) = if on {
-            (v.selection.bg_fill, v.strong_text_color())
+            let accent = crate::layers::accent(ui, half);
+            (accent, crate::widgets::text_on(accent))
         } else if resp.hovered() {
             (v.widgets.hovered.weak_bg_fill, v.text_color())
         } else {

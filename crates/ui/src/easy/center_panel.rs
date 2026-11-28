@@ -507,8 +507,9 @@ fn show_preset_picker(
                 // and their decorations) into the saved copy — the tab overlays
                 // are the live source of truth — so the preset ships its
                 // overlays. The live tab overlays are untouched.
+                // The patch's own settings, a layer being edited or not.
                 if let Some(sp) = crate::canvas::node::subpatch_with_overlays(
-                    &canvas.snarl, oid.0, tab_overlay, tab_config)
+                    &canvas.base_snarl(), oid.0, tab_overlay, tab_config)
                 {
                     if let Some(path) = crate::app::save_subpatch_file(&sp) {
                         super::presets::invalidate_index();
@@ -1944,7 +1945,10 @@ fn restore_preset_link(canvas: &Canvas, easy_state: &mut EasyState, presets: &[P
 }
 
 fn hash_subpatch(sp: &UiSubPatch) -> u64 {
-    let bytes = serde_json::to_vec(sp).unwrap_or_default();
+    // Without card ids: cards get them after a preset saved before them is loaded.
+    let mut v = serde_json::to_value(sp).unwrap_or_default();
+    crate::layers::strip_card_ids(&mut v);
+    let bytes = serde_json::to_vec(&v).unwrap_or_default();
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in &bytes {
         h ^= b as u64;

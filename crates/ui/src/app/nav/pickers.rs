@@ -1014,6 +1014,13 @@ impl FlexInputApp {
                         "No macros yet — create macros via the Macro Output module or a JSM @ binding.",
                         crate::settings::ui_font(11.0 * SCALE), crate::settings::tinted_gray(140));
                 }
+                if tab == PickerTab::Layers && cells.is_empty() {
+                    ui.painter_at(board).text(
+                        board.left_top() + egui::vec2(4.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        "No layers yet — add one with + at the right of the tab bar, or in a sub-patch's header.",
+                        crate::settings::ui_font(11.0 * SCALE), crate::settings::tinted_gray(140));
+                }
                 for (i, cell) in cells.iter().enumerate() {
                     let min = board.min + egui::vec2(
                         cell.x * (UNIT + GAP), cell.y * (UNIT + GAP));
@@ -1057,6 +1064,36 @@ impl FlexInputApp {
                     // Macro cells: the port's icon (custom patch-embedded SVG
                     // or embedded set) or the port name + full-name tooltip.
                     // KBM cells: skin icon or text fallback.
+                    // A layer's cell: its name over what the press does to it.
+                    if let (Some(entry), Some((_, action))) = (
+                        cell.macro_meta.as_ref(),
+                        flexinput_core::layers::parse_layer_pin(&cell.pin),
+                    ) {
+                        let name = entry.name.rsplit_once(" — ").map_or(entry.name.as_str(), |(n, _)| n);
+                        let name = name.rsplit_once(" › ").map_or(name, |(_, n)| n);
+                        let short: String = name.chars().take(12).collect();
+                        let text = if disabled { crate::settings::tinted_gray(110) } else { ui.visuals().text_color() };
+                        // Its icon, at the cell's top left.
+                        if !entry.icon.is_empty() {
+                            let s = 12.0 * SCALE;
+                            let r = egui::Rect::from_min_size(rect.min + egui::vec2(6.0 * SCALE, 3.0 * SCALE), egui::Vec2::splat(s));
+                            crate::macro_icons::paint_icon(ctx, &painter, &entry.icon, r, text);
+                        }
+                        // The layer's colour, down the cell's left edge.
+                        if let Some([r, g, b]) = entry.tint {
+                            let bar = egui::Rect::from_min_size(rect.min, egui::vec2(4.0 * SCALE, rect.height()));
+                            painter.rect_filled(bar, egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }, egui::Color32::from_rgb(r, g, b));
+                        }
+                        painter.text(rect.center() - egui::vec2(0.0, 6.0 * SCALE), egui::Align2::CENTER_CENTER,
+                            short, crate::settings::ui_font(10.0 * SCALE), text);
+                        painter.text(rect.center() + egui::vec2(0.0, 7.0 * SCALE), egui::Align2::CENTER_CENTER,
+                            action.verb(), crate::settings::ui_font(9.0 * SCALE), crate::settings::tinted_gray(150));
+                        if focused && nav_skin.is_some() {
+                            focus_tip = Some((rect, entry.name.clone()));
+                        }
+                        resp.on_hover_text(entry.name.clone());
+                        continue;
+                    }
                     if let Some(entry) = cell.macro_meta.as_ref() {
                         // A menu's four targets share its icon (or its name's
                         // first letters): the corner badge tells them apart.

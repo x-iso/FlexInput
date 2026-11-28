@@ -84,6 +84,28 @@ self.proc_graph.store(Arc::new(graph_snap));  // ArcSwap publish
 - ArcSwap provides lock-free reads with refcount bump only
 - RwLock would cause contention at high processing rates
 
+### Layers (`crates/engine/src/layers.rs`)
+
+A layer is a set of param overrides (`ProcessingGraph.layers`: `LayerSnap { id, overrides }`,
+each override a node-uid path from the top, a key and a value). Switching one can't wait for
+the UI, which republishes only on change and slowly while frozen behind a game, so the
+processing thread does it:
+
+- Cards target `layer:{id}` (held), `layer:{id}_toggle`, `_on`, `_off`
+  (`flexinput_core::layers`). They publish them into the macro namespace like a Macro Output
+  port (`is_macro_style_target`), and the end-of-tick carry block copies them into
+  `TickOutput.layer_pins`.
+- `LayerRuntime` keeps a `LayerStack` (Steam's stacking: the layer on last is at the end and
+  wins) and, while any layer with overrides is on, an *effective* graph: the published graph
+  cloned with the layers' overrides written in order (`layers::apply`), with fresh caches, so
+  pad settings such as gyro speed follow. `NodeState` is keyed by uid, so swapping it restarts
+  nothing.
+- `wake()` at each wakeup takes the UI's requests (`request_layer`, a chip clicked) and
+  rebuilds the effective graph when the published one changed; `after_tick()` reads the tick's
+  pins and rebuilds when the stack changed. The tick after a swap runs with
+  `same_input = false`, since the pad preprocessing depends on the graph.
+- `active_layers()` publishes the stack for the UI's chips.
+
 ### I/O Thread (Device Polling)
 
 **Responsibilities:**

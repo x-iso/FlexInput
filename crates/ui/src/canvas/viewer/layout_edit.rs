@@ -110,7 +110,7 @@ pub(crate) fn layout_tool_word(ui: &mut egui::Ui, word: &str, hover: &str, accen
     let v = ui.visuals();
     let mut text = egui::RichText::new(word).font(simple_bodies::control_font());
     if accent {
-        text = text.color(v.strong_text_color());
+        text = text.color(crate::widgets::text_on(v.selection.bg_fill));
     }
     let mut button = egui::Button::new(text).min_size(egui::vec2(w, TOOL_H));
     if accent {
@@ -237,6 +237,12 @@ pub(crate) fn layout_toolbar_controls_core(
     if ui.available_width() >= layout_tab_picker_w(ui, state) + 12.0 {
         ui.separator();
         layout_tab_picker(ui, state, TOOL_H);
+        if layout_tool_word(ui, "duplicate",
+            "A new tab with copies of what's on this one - to swap some of it for others on the \
+             copy, for a layer, say. What's on every tab stays on every tab.", false)
+        {
+            duplicate_layout_tab(state);
+        }
     }
     if let Some(kind) = add_kind {
         let mut deco = make_default_decoration(kind);

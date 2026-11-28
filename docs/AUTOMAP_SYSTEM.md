@@ -330,7 +330,13 @@ haptic pin resolves by precedence, highest first:
    Writers: Audio Stream Haptics (always, rumble), Feedback Control with
    `fb_override`.
 3. **Game** — local virtual pads (main-loop auto-feedback via `feedback_sources`)
-   and network peers (`feedback_net:{target}`).
+   and network peers (`feedback_net:{target}`). Behind an AutoMap Selector or Fork,
+   a feedback source carries `gates` (`FeedbackGate { uid, index }`): the UI's
+   `feedback_upstreams` walks every Selector input (and a Fork's input), so each pad
+   behind one gets an entry, and the engine applies it only while that node's
+   `NodeState::automap_select` (the port a Selector passes on, the output a Fork
+   sends to, recorded each tick) equals `index`. The pad reads last tick's choice,
+   since it runs before the Selectors after it.
 
 **Additive** injections (`feedback_inject:{target}`, Feedback Control default)
 combine on top of whatever 2 and 3 left.
@@ -428,6 +434,10 @@ Duplicates an AutoMap bus to multiple outputs:
 Selects one of N AutoMap buses based on a selector input:
 - Routes feedback signals backward along the gate chain
 - Records `fb_routes` for post-pass reverse-feedback resolution
+- Records the port it passes on in `NodeState::automap_select`, which gates the
+  game feedback of the virtual pads after it (see feedback layers above)
+- In Easy mode, one a sub-patch feeds is the **output hub**: the Devices panel wires
+  output devices from it instead of from the primary (`easy::wiring::output_hub`)
 
 ### AutoMap Combiner (`module.automap_combiner`)
 

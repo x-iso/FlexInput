@@ -467,7 +467,8 @@ pub(crate) fn canvas_status_button_sized(
             .sense(egui::Sense::hover());
         ui.add(btn);
     } else {
-        let btn = egui::Button::new(RichText::new("Add to canvas").strong())
+        let fill = ui.visuals().selection.bg_fill;
+        let btn = egui::Button::new(RichText::new("Add to canvas").strong().color(crate::widgets::text_on(fill)))
             .corner_radius(13.0)
             .min_size(size)
             .fill(ui.visuals().selection.bg_fill);

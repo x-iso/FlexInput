@@ -1291,6 +1291,96 @@ fn find_automap_rec_inner(
     None
 }
 
+/// Where the game's feedback on a virtual pad fed from `src` goes back to: each
+/// device behind the chain, with the Selector / Fork choices that have to hold
+/// for it to be the one feeding the pad (`FeedbackGate`). [`find_automap_rec_inner`]
+/// stops at a Selector or Fork - its output is a bus of its own, with no device
+/// behind it - and the rumble went nowhere; this walks on through every input of
+/// a Selector, and through a Fork's input, noting the choice each one makes. A
+/// chain with neither gives the one device the resolver names, ungated, as before.
+fn feedback_upstreams(
+    snarl: &Snarl<NodeData>,
+    src: OutPinId,
+    parents: Option<&AutomapParent<'_>>,
+    gates: &mut Vec<flexinput_engine::FeedbackGate>,
+    out: &mut Vec<(String, Vec<flexinput_engine::FeedbackGate>)>,
+    depth: u32,
+) {
+    if depth > 64 { return; }
+    let Some(node) = snarl.get_node(src.node) else { return };
+    let uid = match parents {
+        None => src.node.0,
+        Some(p) => flexinput_engine::namespaced_uid(fold_outer_uid(p), src.node.0),
+    };
+    let follow = |input: usize| snarl.in_pin(InPinId { node: src.node, input }).remotes.first().copied();
+    let first_automap_in = || node.inputs.iter().position(|p| p.signal_type == SignalType::AutoMap);
+    // On up from `up`, with `gate` held for the way there.
+    fn through(
+        snarl: &Snarl<NodeData>,
+        up: OutPinId,
+        parents: Option<&AutomapParent<'_>>,
+        gate: Option<flexinput_engine::FeedbackGate>,
+        gates: &mut Vec<flexinput_engine::FeedbackGate>,
+        out: &mut Vec<(String, Vec<flexinput_engine::FeedbackGate>)>,
+        depth: u32,
+    ) {
+        let pushed = gate.map(|g| gates.push(g)).is_some();
+        feedback_upstreams(snarl, up, parents, gates, out, depth + 1);
+        if pushed { gates.pop(); }
+    }
+    match node.module_id.as_str() {
+        // Input 0 is `select`; port k is input k + 1, as the engine counts them.
+        "module.automap_selector" => {
+            for input in 1..node.inputs.len() {
+                if let Some(up) = follow(input) {
+                    let gate = flexinput_engine::FeedbackGate { uid, index: input - 1 };
+                    through(snarl, up, parents, Some(gate), gates, out, depth);
+                }
+            }
+        }
+        "module.automap_fork" => {
+            if let Some(up) = first_automap_in().and_then(follow) {
+                let gate = flexinput_engine::FeedbackGate { uid, index: src.output };
+                through(snarl, up, parents, Some(gate), gates, out, depth);
+            }
+        }
+        // Into a sub-patch through the outlet the wire leaves by, and back out
+        // through an inlet - as the resolver crosses them.
+        "subpatch" => {
+            let Some(sp) = node.subpatch.as_ref() else { return };
+            let Some(outlet) = sp.snarl.nodes_ids_data()
+                .find(|(_, n)| n.value.module_id == "subpatch.outlet"
+                    && n.value.params.get("pin_index").and_then(|v| v.as_u64()) == Some(src.output as u64))
+                .map(|(id, _)| id)
+            else { return };
+            let Some(&inner) = sp.snarl.in_pin(InPinId { node: outlet, input: 0 }).remotes.first() else { return };
+            let frame = AutomapParent { snarl, subpatch_id: src.node, prev: parents };
+            through(&sp.snarl, inner, Some(&frame), None, gates, out, depth);
+        }
+        "subpatch.inlet" => {
+            let (Some(parent), Some(pin)) =
+                (parents, node.params.get("pin_index").and_then(|v| v.as_u64()))
+            else { return };
+            let outer = parent.snarl.in_pin(InPinId { node: parent.subpatch_id, input: pin as usize });
+            if let Some(&up) = outer.remotes.first() {
+                through(parent.snarl, up, parent.prev, None, gates, out, depth);
+            }
+        }
+        _ => {
+            let Some((d, _, fallback)) = find_automap_rec_inner(snarl, src, parents, false) else { return };
+            let id = if is_real_device_id(&d) { d } else { fallback.unwrap_or(d) };
+            if id.starts_with("forksel:") {
+                // A Selector or Fork further up, behind this module: on up its bus.
+                if let Some(up) = first_automap_in().and_then(follow) {
+                    through(snarl, up, parents, None, gates, out, depth);
+                }
+            } else if !out.iter().any(|(d, g)| *d == id && g == gates) {
+                out.push((id, gates.clone()));
+            }
+        }
+    }
+}
+
 /// Downstream sibling of [`find_automap_device_rec`]: follow an AutoMap bus
 /// FORWARD from an output pin to the destination `device.sink`'s device_id,
 /// crossing sub-patch boundaries (out through outlets, in through inlets).
@@ -1523,17 +1613,19 @@ pub(crate) fn build_processing_graph_rec(
         // map must be keyed by the physical id — fall back to it whenever the
         // resolved id isn't itself a real device id. Without this, routing a pad
         // through a sub-patch full of AutoMap modules silently drops rumble.
-        let automap_src_dev = (0..node.inputs.len()).find_map(|i| {
+        // Behind an AutoMap Selector there are several, each gated on the
+        // Selector passing it on (`feedback_upstreams`).
+        let upstreams = (0..node.inputs.len()).find_map(|i| {
             if node.inputs.get(i).map(|p| p.signal_type) != Some(SignalType::AutoMap) {
                 return None;
             }
             let pin = snarl.in_pin(InPinId { node: *node_id, input: i });
             let &src = pin.remotes.first()?;
-            find_automap_rec_inner(snarl, src, parents, false).map(|(d, _, fallback)| {
-                if is_real_device_id(&d) { d } else { fallback.unwrap_or(d) }
-            })
+            let mut found = Vec::new();
+            feedback_upstreams(snarl, src, parents, &mut Vec::new(), &mut found, 0);
+            (!found.is_empty()).then_some(found)
         });
-        let Some(src_dev) = automap_src_dev else { continue; };
+        let Some(upstreams) = upstreams else { continue; };
         let sink_dev = node.params.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
         // Only track virtual sinks (their feedback flows back to physical sources).
         if sink_dev.starts_with("virtual.") {
@@ -1544,12 +1636,15 @@ pub(crate) fn build_processing_graph_rec(
             let p = |k: &str, d: f32| {
                 node.params.get(k).and_then(|v| v.as_f64()).map(|f| f as f32).unwrap_or(d)
             };
-            feedback_map.entry(src_dev).or_default().push(flexinput_engine::FeedbackSource {
-                device_id: sink_dev.to_string(),
-                rumble_floor: p("rumble_floor", defaults.rumble_floor).clamp(0.0, 1.0),
-                rumble_max:   p("rumble_max", defaults.rumble_max).clamp(0.0, 1.0),
-                rumble_exp:   p("rumble_exp", defaults.rumble_exp).max(0.01),
-            });
+            for (src_dev, gates) in upstreams {
+                feedback_map.entry(src_dev).or_default().push(flexinput_engine::FeedbackSource {
+                    device_id: sink_dev.to_string(),
+                    rumble_floor: p("rumble_floor", defaults.rumble_floor).clamp(0.0, 1.0),
+                    rumble_max:   p("rumble_max", defaults.rumble_max).clamp(0.0, 1.0),
+                    rumble_exp:   p("rumble_exp", defaults.rumble_exp).max(0.01),
+                    gates,
+                });
+            }
         }
     }
 
@@ -3513,5 +3608,165 @@ mod subpatch_bus_tests {
             assert!(pins.contains(&"gyro_x".to_string()), "{pins:?}");
             assert_eq!(config_passthrough_device(&s, &[], n.0).as_deref(), Some("gilrs:pad:0"));
         }
+    }
+
+    // ── Game rumble back through an AutoMap Selector ─────────────────────────
+
+    /// A pad whose haptic input makes it a feedback target.
+    fn rumble_pad(id: &str) -> NodeData {
+        let mut n = node("device.source", &[SignalType::Float], &[SignalType::AutoMap]);
+        n.params.insert("device_id".into(), json!(id));
+        n.params.insert("output_pin_ids".into(), json!(["automap_pass"]));
+        n.params.insert("input_pin_ids".into(), json!(["rumble_strong"]));
+        n
+    }
+
+    fn virtual_pad(id: &str) -> NodeData {
+        let mut n = node("device.sink", &[SignalType::AutoMap], &[]);
+        n.params.insert("device_id".into(), json!(id));
+        n
+    }
+
+    fn selector() -> NodeData {
+        use SignalType::{AutoMap, Float};
+        node("module.automap_selector", &[Float, AutoMap, AutoMap], &[AutoMap])
+    }
+
+    fn sub_patch(inner: Snarl<NodeData>, ins: &[SignalType]) -> NodeData {
+        let mut n = node("subpatch", ins, &[SignalType::AutoMap]);
+        n.subpatch = Some(Box::new(crate::canvas::node::UiSubPatch {
+            snarl: Box::new(inner),
+            ..Default::default()
+        }));
+        n
+    }
+
+    fn inlet(i: u64) -> NodeData {
+        let mut n = node("subpatch.inlet", &[], &[SignalType::AutoMap]);
+        n.params.insert("pin_index".into(), json!(i));
+        n
+    }
+
+    fn outlet() -> NodeData {
+        let mut n = node("subpatch.outlet", &[SignalType::AutoMap], &[]);
+        n.params.insert("pin_index".into(), json!(0));
+        n
+    }
+
+    /// A sub-patch with a Remapper between its inlet and its outlet.
+    fn remap_subpatch() -> NodeData {
+        let p = egui::Pos2::ZERO;
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let i = inner.insert_node(p, inlet(0));
+        let remap = inner.insert_node(p, node("module.remapper", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        let o = inner.insert_node(p, outlet());
+        wire(&mut inner, i, 0, remap, 0);
+        wire(&mut inner, remap, 0, o, 0);
+        sub_patch(inner, &[SignalType::AutoMap])
+    }
+
+    /// The virtual pads whose game feedback pad `dev` gets, each with the
+    /// (Selector uid, port) choices it waits on.
+    fn feedback_of(graph: &flexinput_engine::ProcessingGraph, dev: &str) -> Vec<(String, Vec<(usize, usize)>)> {
+        graph.nodes.iter()
+            .filter_map(|n| n.sink_target.as_ref())
+            .find(|st| st.device_id == dev)
+            .map(|st| st.feedback_sources.iter()
+                .map(|f| (f.device_id.clone(), f.gates.iter().map(|g| (g.uid, g.index)).collect()))
+                .collect())
+            .unwrap_or_default()
+    }
+
+    const VIRT: &str = "virtual.x360.0";
+
+    /// Straight from the pad, nothing in the way: one entry and no gate, as before.
+    #[test]
+    fn rumble_straight_back_to_the_pad_is_ungated() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, rumble_pad("gilrs:a:0"));
+        let virt = s.insert_node(p, virtual_pad(VIRT));
+        wire(&mut s, pad, 0, virt, 0);
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        assert_eq!(feedback_of(&graph, "gilrs:a:0"), vec![(VIRT.to_string(), vec![])]);
+    }
+
+    /// Two pads into a Selector, a virtual pad after it: each pad gets the game's
+    /// rumble while the Selector passes it on. Neither got any: the Selector's
+    /// output resolved to a bus with no pad behind it.
+    #[test]
+    fn rumble_through_a_selector_goes_back_to_the_pad_it_passes_on() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let a = s.insert_node(p, rumble_pad("gilrs:a:0"));
+        let b = s.insert_node(p, rumble_pad("gilrs:b:0"));
+        let sel = s.insert_node(p, selector());
+        let virt = s.insert_node(p, virtual_pad(VIRT));
+        wire(&mut s, a, 0, sel, 1);
+        wire(&mut s, b, 0, sel, 2);
+        wire(&mut s, sel, 0, virt, 0);
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        assert_eq!(feedback_of(&graph, "gilrs:a:0"), vec![(VIRT.to_string(), vec![(sel.0, 0)])]);
+        assert_eq!(feedback_of(&graph, "gilrs:b:0"), vec![(VIRT.to_string(), vec![(sel.0, 1)])]);
+    }
+
+    /// Easy mode's switch: one pad into two sub-patches, both into a Selector, the
+    /// virtual pad after it. The pad gets the rumble whichever one is selected,
+    /// from behind the Remapper in each.
+    #[test]
+    fn rumble_through_sub_patches_into_a_selector_reaches_the_pad_either_way() {
+        let p = egui::Pos2::ZERO;
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let pad = s.insert_node(p, rumble_pad("gilrs:a:0"));
+        let one = s.insert_node(p, remap_subpatch());
+        let two = s.insert_node(p, remap_subpatch());
+        let sel = s.insert_node(p, selector());
+        let virt = s.insert_node(p, virtual_pad(VIRT));
+        wire(&mut s, pad, 0, one, 0);
+        wire(&mut s, pad, 0, two, 0);
+        wire(&mut s, one, 0, sel, 1);
+        wire(&mut s, two, 0, sel, 2);
+        wire(&mut s, sel, 0, virt, 0);
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        assert_eq!(
+            feedback_of(&graph, "gilrs:a:0"),
+            vec![(VIRT.to_string(), vec![(sel.0, 0)]), (VIRT.to_string(), vec![(sel.0, 1)])]
+        );
+    }
+
+    /// A Selector inside a sub-patch, behind a Remapper on the parent canvas: the
+    /// walk goes up the Remapper, into the sub-patch, and the gate names the
+    /// Selector by its namespaced uid - the one the engine keeps its choice under,
+    /// and the one its bus key carries.
+    #[test]
+    fn a_selector_in_a_sub_patch_is_named_as_the_engine_knows_it() {
+        let p = egui::Pos2::ZERO;
+        let mut inner: Snarl<NodeData> = Snarl::new();
+        let in0 = inner.insert_node(p, inlet(0));
+        let in1 = inner.insert_node(p, inlet(1));
+        let sel = inner.insert_node(p, selector());
+        let o = inner.insert_node(p, outlet());
+        wire(&mut inner, in0, 0, sel, 1);
+        wire(&mut inner, in1, 0, sel, 2);
+        wire(&mut inner, sel, 0, o, 0);
+
+        let mut s: Snarl<NodeData> = Snarl::new();
+        let a = s.insert_node(p, rumble_pad("gilrs:a:0"));
+        let b = s.insert_node(p, rumble_pad("gilrs:b:0"));
+        let sp = s.insert_node(p, sub_patch(inner, &[SignalType::AutoMap, SignalType::AutoMap]));
+        let remap = s.insert_node(p, node("module.remapper", &[SignalType::AutoMap], &[SignalType::AutoMap]));
+        let virt = s.insert_node(p, virtual_pad(VIRT));
+        wire(&mut s, a, 0, sp, 0);
+        wire(&mut s, b, 0, sp, 1);
+        wire(&mut s, sp, 0, remap, 0);
+        wire(&mut s, remap, 0, virt, 0);
+        let (graph, _) = build_processing_graph(&s, Default::default());
+        let ns = flexinput_engine::namespaced_uid(sp.0, sel.0);
+        assert_eq!(feedback_of(&graph, "gilrs:a:0"), vec![(VIRT.to_string(), vec![(ns, 0)])]);
+        assert_eq!(feedback_of(&graph, "gilrs:b:0"), vec![(VIRT.to_string(), vec![(ns, 1)])]);
+        let frame = AutomapParent { snarl: &s, subpatch_id: sp, prev: None };
+        let inner = &s.get_node(sp).unwrap().subpatch.as_ref().unwrap().snarl;
+        let (key, _, _) = find_automap_device_rec(inner, OutPinId { node: sel, output: 0 }, Some(&frame)).unwrap();
+        assert_eq!(key, format!("forksel:{ns}:0"));
     }
 }

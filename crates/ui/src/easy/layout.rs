@@ -27,6 +27,8 @@ const STACK_GAP: f32 = 15.0;
 const FALLBACK_DEVICE_W: f32 = 420.0;
 const FALLBACK_SINK_W: f32 = 280.0;
 const FALLBACK_SUBPATCH_W: f32 = 360.0;
+// An AutoMap Selector's width, for the outputs wired from one.
+const FALLBACK_SELECTOR_W: f32 = 200.0;
 // Fallback node HEIGHTS for vertical stacking (the layout runs right
 // after a node is added, before it renders, so live heights aren't
 // available — mirrors the width fallbacks). These are the COLLAPSED-ish
@@ -58,8 +60,10 @@ pub fn place_beside_primary(canvas: &mut Canvas, id: NodeId) {
     }
     let snarl = &canvas.snarl;
     let Some(p) = super::subpatches::primary(snarl) else { return };
-    let Some(p_pos) = snarl.get_node_info(p).map(|i| i.pos) else { return };
     let is_source = snarl.get_node(id).is_some_and(|n| n.module_id == "device.source");
+    // A sink wired from the output hub goes beside the hub.
+    let hub = if is_source { None } else { super::wiring::output_hub(snarl) };
+    let Some(p_pos) = snarl.get_node_info(hub.unwrap_or(p)).map(|i| i.pos) else { return };
     let column = if is_source {
         super::wiring::managed_sources(snarl, Some(p))
     } else {
@@ -68,7 +72,8 @@ pub fn place_beside_primary(canvas: &mut Canvas, id: NodeId) {
     let (fb_h, x) = if is_source {
         (FALLBACK_DEVICE_H, p_pos.x - EDGE_GAP - FALLBACK_DEVICE_W)
     } else {
-        (FALLBACK_SINK_H, p_pos.x + FALLBACK_SUBPATCH_W + EDGE_GAP)
+        let w = if hub.is_some() { FALLBACK_SELECTOR_W } else { FALLBACK_SUBPATCH_W };
+        (FALLBACK_SINK_H, p_pos.x + w + EDGE_GAP)
     };
     let y = column
         .iter()

@@ -808,11 +808,10 @@ impl Slider<'_> {
                     }
                 }
 
-                ui.painter().rect_filled(
-                    trailing_rail_rect,
-                    corner_radius,
-                    ui.visuals().selection.bg_fill,
-                );
+                // FLEXINPUT PATCH: the app's own selection colour here, where it has one.
+                let fill = crate::style::selection_accent_at(ui.ctx(), ui.layer_id(), trailing_rail_rect)
+                    .map_or(ui.visuals().selection.bg_fill, |(f, _)| f);
+                ui.painter().rect_filled(trailing_rail_rect, corner_radius, fill);
             }
 
             let radius = self.handle_radius(rect);

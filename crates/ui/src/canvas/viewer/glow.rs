@@ -259,6 +259,19 @@ pub struct AutomapGlowParent<'a> {
     pub prev: Option<&'a AutomapGlowParent<'a>>,
 }
 
+/// The sub-patch node ids a parent chain goes down through, from the top canvas:
+/// the path to the canvas it is the parent of.
+pub fn glow_parent_prefix(parent: Option<&AutomapGlowParent<'_>>) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut at = parent;
+    while let Some(p) = at {
+        out.push(p.subpatch_node_id.0);
+        at = p.prev;
+    }
+    out.reverse();
+    out
+}
+
 /// Compute glow intensity for an AutoMap output bus by walking the chain back
 /// to the originating device.source and max-pooling its live signals. Returns
 /// `None` when the walk can't resolve a real device (e.g. dangling chain).

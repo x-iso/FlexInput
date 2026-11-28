@@ -341,12 +341,25 @@ impl FlexInputApp {
 
         // ── Tab bar ───────────────────────────────────────────────────────────────
         let tab_bar_frame = egui::Frame::NONE.fill(ctx.style().visuals.widgets.noninteractive.bg_fill);
-        let tab_actions = egui::TopBottomPanel::top("tab_bar")
-            .exact_height(32.0)
-            .frame(tab_bar_frame)
-            .show_separator_line(false)
-            .show(ctx, |ui| show_tab_bar(ui, &self.tabs, self.active_tab, &effective_bypass, &mut self.auto_switch))
-            .inner;
+        let active_layers = flexinput_engine::active_layers();
+        let tab_actions = {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            let details = canvas.layer_details(&crate::layers::LayerScope::Patch);
+            let layer_bar = crate::app::chrome::LayerBar {
+                layers: &canvas.layers,
+                details: &details,
+                active: &active_layers,
+                armed: canvas.armed_layer()
+                    .filter(|(s, _)| **s == crate::layers::LayerScope::Patch)
+                    .map(|(_, id)| id),
+            };
+            egui::TopBottomPanel::top("tab_bar")
+                .exact_height(32.0)
+                .frame(tab_bar_frame)
+                .show_separator_line(false)
+                .show(ctx, |ui| show_tab_bar(ui, &self.tabs, self.active_tab, &effective_bypass, &mut self.auto_switch, layer_bar))
+                .inner
+        };
         let TabBarActions {
             switch_to: tab_switch,
             close_idx: tab_close_idx,
@@ -358,7 +371,11 @@ impl FlexInputApp {
             do_load_workspace: tab_load_ws,
             do_bind: tab_bind,
             do_close: tab_close,
+            layer_act: tab_layer_act,
         } = tab_actions;
+        if let Some(act) = tab_layer_act {
+            self.tabs[self.active_tab].canvas.layer_act(crate::layers::LayerScope::Patch, act);
+        }
         do_new   = do_new   || tab_new;
         do_save  = do_save  || tab_save;
         do_load  = do_load  || tab_load;
@@ -705,6 +722,7 @@ impl FlexInputApp {
                         let mut canvas = Canvas::new();
                         canvas.snarl = pt.snarl;
                         canvas.device_memory = pt.device_memory;
+                        canvas.layers = pt.layers;
                         crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
                         clear_canvas_capture_state(&mut canvas);
                         canvas.pending_view_action = on_load_view;

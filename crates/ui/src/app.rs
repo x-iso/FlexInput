@@ -90,7 +90,46 @@ fn chord_watch_config_from(s: &AppSettings) -> ChordWatchConfig {
         phase:      shortcut_spec_from(&s.phase_overlay_chord, &s.phase_overlay_chord_mode, s.phase_overlay_chord_gap_ms),
         tab_prev:   shortcut_spec_from(&s.tab_prev_chord, &s.tab_prev_chord_mode, s.tab_prev_chord_gap_ms),
         tab_next:   shortcut_spec_from(&s.tab_next_chord, &s.tab_next_chord_mode, s.tab_next_chord_gap_ms),
+        patch_chords: Vec::new(),
     }
+}
+
+/// The active patch's mapping cards whose chord has Home or Capture in it with
+/// something else (sorted, each once), its layers' cards among them: the shortcut
+/// watcher lets such a chord through to the patch rather than withholding Home for
+/// a shortcut (`guide_watcher::patch_chords_held`).
+pub(crate) fn patch_leader_chords(canvas: &Canvas) -> Vec<Vec<String>> {
+    const LEADERS: [&str; 2] = ["btn_guide", "btn_capture"];
+    fn cards(mappings: Option<&serde_json::Value>, out: &mut Vec<Vec<String>>) {
+        for card in mappings.and_then(|v| v.as_array()).into_iter().flatten() {
+            let mut chord: Vec<String> = card.get("in").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if chord.len() < 2 || !chord.iter().any(|p| LEADERS.contains(&p.as_str())) { continue; }
+            chord.sort();
+            chord.dedup();
+            if !out.contains(&chord) { out.push(chord); }
+        }
+    }
+    fn walk(snarl: &Snarl<NodeData>, out: &mut Vec<Vec<String>>) {
+        for (_, n) in snarl.nodes_ids_data() {
+            if matches!(n.value.module_id.as_str(), "module.remapper" | "module.map_action") {
+                cards(n.value.params.get("mappings"), out);
+            }
+            if let Some(sp) = n.value.subpatch.as_ref() {
+                walk(&sp.snarl, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&canvas.snarl, &mut out);
+    for (_, _, _, layer) in crate::layers::all_layers(&canvas.layers, &canvas.snarl) {
+        for s in layer.settings.iter().filter(|s| s.key == "mappings") {
+            cards(Some(&s.value), &mut out);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// When set, internal `request_repaint_throttled()` callers (scope
@@ -942,6 +981,7 @@ impl FlexInputApp {
             let mut canvas = Canvas::new();
             canvas.snarl = pt.snarl;
             canvas.device_memory = pt.device_memory;
+            canvas.layers = pt.layers;
             crate::canvas::migrate_loaded_snarl(&mut canvas.snarl);
             // Wipe any stale in-progress capture/learn state from saved
             // remapper-family nodes so a restored patch starts clean.
@@ -1449,6 +1489,24 @@ impl eframe::App for FlexInputApp {
         self.sync_jsm_macro_ports(ctx);
         crate::macro_icons::publish_registry(
             std::sync::Arc::new(self.macro_display_entries()));
+        {
+            let canvas = &self.tabs[self.active_tab].canvas;
+            crate::macro_icons::publish_layer_registry(std::sync::Arc::new(
+                crate::layers::display_entries(&canvas.layers, &canvas.snarl)));
+            // Values layers showed that were edited where they showed: the layers'.
+            let edits = crate::layers::take_layer_edits(ctx);
+            let canvas = &mut self.tabs[self.active_tab].canvas;
+            for (layer, prefix, path, key, value) in edits {
+                canvas.edit_layer_value(&layer, &prefix, &path, &key, value);
+            }
+            let canvas = &self.tabs[self.active_tab].canvas;
+            // What the layers on, the one a chip previews and the one being edited
+            // change, for the canvas and the pins to tint in their colours.
+            let active = flexinput_engine::active_layers();
+            let preview = crate::layers::previewed(ctx);
+            crate::layers::publish_tints(ctx, canvas.layer_tints(&active, preview.as_deref()));
+            crate::layers::publish_layer_list(ctx, crate::layers::layer_infos(&canvas.layers, &canvas.snarl));
+        }
         // The layout grid: take what the zoom toolbar's grid menu changed last
         // frame, then publish the settings for it and the grid for every canvas.
         if let Some(edited) = crate::canvas::canvas_grid_settings(ctx) {
@@ -1892,7 +1950,14 @@ impl eframe::App for FlexInputApp {
         // show this frame. Also publishes the `ui_nav_suppress` flag.
         {
             puffin::profile_scope!("gamepad_nav");
+            // Nav reads and edits what the layers on screen show, and an edit of it goes to
+            // the layer, as with the mouse.
+            let tab = self.active_tab;
+            let shown = crate::layers::show_all_layer_values(ctx, &mut self.tabs[tab].canvas.snarl);
             self.run_gamepad_nav(ctx);
+            if let Some(t) = self.tabs.get_mut(tab) {
+                crate::layers::hide_all_layer_values(ctx, &mut t.canvas.snarl, shown);
+            }
         }
 
         // Desktop Settings window shortcut-chord capture: when a learn is in
@@ -2166,7 +2231,9 @@ impl eframe::App for FlexInputApp {
         // OR the nav-only toggle). Only writes when something differs — bindings
         // change rarely, so this is a cheap compare most frames.
         {
-            let want = chord_watch_config_from(&self.settings);
+            let mut want = chord_watch_config_from(&self.settings);
+            // The patch's own Home / Capture chords: let through to it.
+            want.patch_chords = patch_leader_chords(&self.tabs[self.active_tab].canvas);
             let stale = self.config_chord_cfg.read().map(|c| *c != want).unwrap_or(true);
             if stale {
                 if let Ok(mut c) = self.config_chord_cfg.write() { *c = want; }
@@ -2256,11 +2323,26 @@ impl eframe::App for FlexInputApp {
             // Which curves a motion sensor feeds — read by the graph builder
             // (they run on the whole sensor) and by the curve bodies (units).
             crate::canvas::viewer::refresh_motion_units(&mut self.tabs[self.active_tab].canvas.snarl);
+            // Two copies of one preset carry the same layer ids: the second gets
+            // its own, its cards with it (only ever right after a paste or load).
+            {
+                let canvas = &mut self.tabs[self.active_tab].canvas;
+                if crate::layers::give_layers_own_ids(&canvas.layers, &mut canvas.snarl) {
+                    canvas.mutation_gen = canvas.mutation_gen.wrapping_add(1);
+                }
+                // Every card an id of its own: layers name cards by it.
+                canvas.give_cards_ids();
+            }
             let (graph_snap, dirty_uids) = {
                 puffin::profile_scope!("build_processing_graph");
                 let defaults = self.nav_device_defaults();
-                let snarl = &self.tabs[self.active_tab].canvas.snarl;
-                build_processing_graph(snarl, defaults)
+                let canvas = &self.tabs[self.active_tab].canvas;
+                let (mut graph, dirty) = build_processing_graph(&canvas.snarl, defaults);
+                // The layers, for the engine to switch while the patch runs. The
+                // one being edited is in the graph already.
+                let armed = canvas.armed_layer().map(|(_, id)| id);
+                graph.layers = crate::layers::engine_table(&canvas.layers, &canvas.snarl, armed);
+                (graph, dirty)
             };
             {
                 puffin::profile_scope!("write_proc_graph");
@@ -3145,6 +3227,19 @@ impl FlexInputApp {
             }
         };
         self.publish_nav_claims(&nav_devs);
+        // A button in a chord of the patch's layer cards (Y + touchpad click) acts on
+        // release, and not when the chord came down: that press was the card's.
+        {
+            let chords = crate::layers::switch_chords(&self.tabs[self.active_tab].canvas);
+            if !chords.is_empty() {
+                let signals = &self.last_signals;
+                let devs = &nav_devs;
+                let held = |chord: &[String]| devs.iter().any(|d| chord.iter().all(|p| {
+                    signals.get(&(d.clone(), p.clone())).is_some_and(|s| s.as_bool())
+                }));
+                self.gamepad_nav.chord_defer.apply(&mut nav, &chords, held);
+            }
+        }
         // When nav STARTS (no pad drove it last frame), suppress this frame's
         // rising edges so buttons already held — e.g. the press that focused the
         // window — don't fire an action; the user must release+repress to act.

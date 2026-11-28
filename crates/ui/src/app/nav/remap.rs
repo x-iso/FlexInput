@@ -854,6 +854,7 @@ impl FlexInputApp {
                             icon: p.icon,
                             icon_svg: p.icon_svg,
                             signal_type: p.signal_type,
+                            tint: None,
                         });
                     }
                 }
@@ -873,6 +874,7 @@ impl FlexInputApp {
                                 icon: icon.to_string(),
                                 icon_svg: icon_svg.to_string(),
                                 signal_type: flexinput_core::SignalType::Bool,
+                                tint: None,
                             });
                         }
                     }
@@ -1246,6 +1248,7 @@ impl FlexInputApp {
             tabs.push(PickerTab::Gamepad);
         }
         tabs.push(PickerTab::Macros);
+        tabs.push(PickerTab::Layers);
         if self.picker_takes_midi() {
             tabs.push(PickerTab::Midi);
         }
@@ -1291,7 +1294,10 @@ impl FlexInputApp {
         tab: crate::kbm_picker::PickerTab,
         macros: &[crate::macro_icons::MacroDisplayEntry],
     ) -> Vec<crate::kbm_picker::PickerCell> {
-        crate::kbm_picker::tab_cells(crate::kbm_picker::picker_cells(self.picker_layout(), macros), tab)
+        // The layers' pins ride with the macros (`macro_icons::layer_registry`).
+        let mut all = macros.to_vec();
+        all.extend(crate::macro_icons::layer_registry().iter().cloned());
+        crate::kbm_picker::tab_cells(crate::kbm_picker::picker_cells(self.picker_layout(), &all), tab)
     }
 
     /// The draft param the picker is filling right now.

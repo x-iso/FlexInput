@@ -383,13 +383,13 @@ pub(crate) fn render_rws_cal_widget(
     let v = ui.visuals();
     let running = session == "choose" || session == "guided";
     let fill = if running {
-        v.selection.bg_fill
+        crate::layers::accent(ui, rect)
     } else if resp.hovered() && pad_on {
         v.widgets.hovered.bg_fill
     } else {
         v.widgets.inactive.bg_fill
     };
-    let text_col = if pad_on || running { v.strong_text_color() } else { v.weak_text_color() };
+    let text_col = if running { crate::widgets::text_on(fill) } else if pad_on { v.strong_text_color() } else { v.weak_text_color() };
     ui.painter().rect_filled(rect, 8.0, fill);
     let h = rect.height();
     let title = if running { "Calibrating…" } else { "Real World Calibration" };

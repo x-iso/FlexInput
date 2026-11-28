@@ -1005,6 +1005,12 @@ pub(crate) fn draw_asth_spectrum_eq_sized(node_id: NodeId, uid: usize, ui: &mut 
     for w in poly.windows(2) {
         painter.line_segment([w[0], w[1]], egui::Stroke::new(1.2_f32, curve_col));
     }
+    // A layer on screen changing the EQ: its curve over this one, in its colour.
+    crate::layers::paint_curve_overlays(ui.ctx(), &painter, node_id.0, &[("asth_eq_wide", "", &eq_points, &[])],
+        |p, b| (0..=40).map(|k| {
+            let t = k as f32 / 40.0;
+            egui::pos2(x_of(t), y_of(crate::canvas::curve::sample_curve(p, t, b)))
+        }).collect());
 
     // ── Editable control points. ──────────────────────────────────────────────
     let ptr = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos()));

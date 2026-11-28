@@ -177,6 +177,15 @@ pub struct FlexViewer<'a> {
     /// app writes the `.fxsp` so it can bake in the tab's overlay/config items,
     /// which this viewer can't reach.
     pub save_subpatch_request: Option<NodeId>,
+    /// The layer being edited on this canvas, if one is (`Canvas::armed_layer`):
+    /// a sub-patch header's chips mark it.
+    pub armed_layer: Option<(crate::layers::LayerScope, String)>,
+    /// Set when a sub-patch header's layer chip asks for something:
+    /// `Canvas::show()` does it (`Canvas::layer_act`).
+    pub layer_request: Option<(crate::layers::LayerScope, crate::layers::LayerAct)>,
+    /// The values layers on screen show in the node being drawn
+    /// (`layers::show_layer_values`), taken out again after it.
+    pub layer_shown: Option<(NodeId, crate::layers::Shown)>,
     /// True when rendering the inner canvas of a sub-patch editor.
     /// When false, the "SubPatch" module category (Inlet/Outlet) is hidden.
     pub is_inner_canvas: bool,
@@ -1172,6 +1181,27 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
                                     .collect();
                                 n.subpatch = Some(Box::new(loaded));
                             }
+                        }
+                    }
+                    // Its layers, at the right: settings of what's inside it that
+                    // cards turn on while the patch runs. On the tab's own canvas,
+                    // where the layer being edited is kept.
+                    if !self.is_inner_canvas {
+                        let layers = snarl.get_node(node)
+                            .and_then(|n| n.subpatch.as_ref())
+                            .map(|sp| sp.layers.clone())
+                            .unwrap_or_default();
+                        let scope = crate::layers::LayerScope::SubPatch(vec![node.0]);
+                        let armed = self.armed_layer.as_ref()
+                            .filter(|(s, _)| *s == scope)
+                            .map(|(_, id)| id.as_str());
+                        ui.separator();
+                        let active = flexinput_engine::active_layers();
+                        let details: Vec<Vec<String>> = layers.iter()
+                            .map(|l| crate::layers::describe(l, scope.prefix(), snarl))
+                            .collect();
+                        if let Some(act) = crate::layers::chips(ui, ("sp_layers", node.0), &layers, &details, &active, armed) {
+                            self.layer_request = Some((scope, act));
                         }
                     }
                 }
@@ -2606,6 +2636,24 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
     /// the rect's size as-is (NO zoom division), letting `easy::layout` position
     /// the I/O nodes against the sub-patch's real size (and reflow after the
     /// Layout editor resizes it) instead of guessing.
+    fn before_node(&mut self, node: NodeId, snarl: &mut Snarl<NodeData>) {
+        // Its controls show what the layers on screen set.
+        let mut path = glow_parent_prefix(self.automap_parent.as_ref());
+        path.push(node.0);
+        if let Some(n) = snarl.get_node_mut(node) {
+            self.layer_shown = crate::layers::show_layer_values(&self.ctx, &path, n).map(|s| (node, s));
+        }
+    }
+
+    fn after_node(&mut self, node: NodeId, snarl: &mut Snarl<NodeData>) {
+        if let Some((id, shown)) = self.layer_shown.take() {
+            if let Some(n) = snarl.get_node_mut(id) {
+                crate::layers::hide_layer_values(&self.ctx, n, shown);
+            }
+        }
+        let _ = node;
+    }
+
     fn final_node_rect(
         &mut self,
         node: NodeId,
@@ -2618,6 +2666,10 @@ impl<'a> SnarlViewer<NodeData> for FlexViewer<'a> {
             let map = d.get_temp_mut_or_default::<NodeRectMap>(node_rects_id(salt));
             map.insert(node.0, [rect.min.x, rect.min.y, rect.width(), rect.height()]);
         });
+        // A layer on screen changes it: framed and badged in the layer's colour.
+        let mut path = glow_parent_prefix(self.automap_parent.as_ref());
+        path.push(node.0);
+        crate::layers::mark_node(ui, &path, rect);
     }
 
     // ── Graph context menu ───────────────────────────────────────────────────
@@ -2932,16 +2984,9 @@ fn subpatch_easy_controls(ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>, node: 
         crate::easy::wiring::move_primary(snarl, node);
     }
     let icon = sps::icon(snarl, node).to_string();
-    let label = if icon.is_empty() { "Icon".to_string() } else { icon.clone() };
-    let picked = crate::touch::menu_button(ui, egui::RichText::new(label).small(), |ui| {
-        let pick = sps::icon_grid(ui, &icon);
-        if pick.is_some() {
-            ui.close();
-        }
-        pick
-    })
-    .inner
-    .flatten();
+    let picked = crate::canvas::menu_body::icon_picker_button(
+        ui, egui::Id::new(("subpatch_icon", node.0)), &icon, "")
+        .map(|(key, _)| key);
     if let Some(p) = picked {
         sps::set_icon(snarl, node, p);
     }

@@ -194,6 +194,20 @@ pub trait SnarlViewer<T> {
         let _ = (node, rect, ui, snarl);
     }
 
+    /// FLEXINPUT PATCH: called just before a node is drawn, with the whole snarl: what the
+    /// node shows can be put in its value for the drawing, and taken out again in
+    /// [`Self::after_node`].
+    #[inline]
+    fn before_node(&mut self, node: NodeId, snarl: &mut Snarl<T>) {
+        let _ = (node, snarl);
+    }
+
+    /// FLEXINPUT PATCH: called just after a node is drawn (see [`Self::before_node`]).
+    #[inline]
+    fn after_node(&mut self, node: NodeId, snarl: &mut Snarl<T>) {
+        let _ = (node, snarl);
+    }
+
     /// Checks if node has something to show in on-hover popup.
     #[inline]
     fn has_on_hover_popup(&mut self, node: &T) -> bool {

@@ -55,6 +55,8 @@ pub struct UiPatch {
     pub overlay: OverlayLayout,       // info-overlay pinned elements
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")]
     pub config: OverlayLayout,        // config-overlay tweak-pins
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<Layer>,           // the patch's own layers (see Layers below)
 }
 ```
 
@@ -216,6 +218,8 @@ pub struct UiSubPatch {
     pub overlay_items: Vec<LayoutItem>,  // info-overlay pins that travel with the preset
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_items: Vec<LayoutItem>,   // config-overlay tweak-pins that travel with it
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<Layer>,              // the sub-patch's layers (see Layers below)
 }
 ```
 
@@ -232,6 +236,44 @@ pub enum LayoutItem {
 tab-level overlay pins sourced from a sub-patch are *attributed* into that sub-patch
 (`attribute_overlays_into_subpatches`); on load they are *materialized* back onto the tab
 (`materialize_subpatch_overlays`). First-level sub-patches only.
+
+### Layers
+
+A patch's layers (`UiPatch.layers`, `PersistedTab.layers`) and a sub-patch's
+(`UiSubPatch.layers`, so they travel in a `.fxsp`) share one shape
+(`crates/ui/src/layers.rs`):
+
+```rust
+pub struct Layer {
+    pub id: String,                // 8 hex chars; cards target `layer:{id}` and its _toggle/_on/_off
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<LayerSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,    // unset: PALETTE by its place in its list
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,              // an emoji from the sub-patch icon set
+}
+pub struct LayerSetting {
+    pub path: Vec<usize>,          // node ids from the layer's own canvas down through sub-patches
+    pub key: String,               // the param it sets
+    pub value: serde_json::Value,
+}
+```
+
+A layer's value for a module's card list (`mappings`, `zone_maps`, `lean_left`,
+`lean_right` - `flexinput_core::layers::CARD_LISTS`) is a diff by card id - `{"$cards":
+[changed or added cards, whole], "$removed": [ids]}` (`flexinput_core::layers::card_diff`,
+`merge_cards`); every card carries an `"id"` (8 hex characters, given on load or creation,
+`give_cards_ids`). A whole array is what layers made before card ids kept, and still loads.
+Cards that turn layers on and off are always the patch's, never a layer's.
+
+Only the settings a layer changes are stored, never wiring, and never the engine's own
+(`_…`) or structural params (`device_id`, pin lists, `macro_ports`, … — `layers::STRUCTURAL`).
+A sub-patch layer's paths start inside the sub-patch, so it reaches only what is in it.
+Saves always write the patch's own params, a layer being edited or not
+(`Canvas::base_snarl`). Two sub-patches loaded from one preset carry the same layer ids;
+the later one gets new ids and the cards inside it follow (`layers::give_layers_own_ids`).
 
 ### Loading a `.fxsp`
 
@@ -349,6 +391,7 @@ pub struct PersistedTab {
     #[serde(default)] pub view_salt: u64,      // stable pan/zoom key for this tab
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")] pub overlay: OverlayLayout,
     #[serde(default, skip_serializing_if = "OverlayLayout::is_empty")] pub config: OverlayLayout,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub layers: Vec<Layer>,
 }
 ```
 

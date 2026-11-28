@@ -1024,7 +1024,9 @@ pub(crate) const TOGGLE: egui::Vec2 = egui::Vec2::new(52.0, 20.0);
 /// header adds it to its own row.
 pub(crate) fn toggle_button(ui: &mut egui::Ui, on: bool, label: &str, size: egui::Vec2) -> egui::Response {
     let (fill, text) = if on {
-        (ui.style().visuals.selection.bg_fill, ui.style().visuals.strong_text_color())
+        // A layer changing this wears its colour (`layers::accent`), where it will sit.
+        let accent = crate::layers::accent(ui, egui::Rect::from_min_size(ui.cursor().min, size));
+        (accent, crate::widgets::text_on(accent))
     } else {
         (ui.style().visuals.widgets.inactive.bg_fill, ui.style().visuals.text_color())
     };

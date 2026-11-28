@@ -6,6 +6,9 @@ use serde_json::Value;
 #[derive(Clone, Default)]
 pub struct ProcessingGraph {
     pub nodes: Vec<NodeSnap>,
+    /// The patch's layers, its sub-patches' among them: the settings each one
+    /// changes while it is on (see `crate::layers`). Top level only.
+    pub layers: Vec<LayerSnap>,
     /// What a tick needs of `nodes` that doesn't change while this snapshot lives,
     /// worked out on first use. `nodes` must not change after a tick has seen it.
     pub(crate) device_params: std::sync::OnceLock<crate::eval::DeviceParams>,
@@ -14,8 +17,25 @@ pub struct ProcessingGraph {
 /// By content: the caches are worked out from it.
 impl PartialEq for ProcessingGraph {
     fn eq(&self, other: &Self) -> bool {
-        self.nodes == other.nodes
+        self.nodes == other.nodes && self.layers == other.layers
     }
+}
+
+/// A layer as the engine runs it: the settings it puts in place while it is on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LayerSnap {
+    /// What its pins carry (`flexinput_core::layers`).
+    pub id: String,
+    pub overrides: Vec<LayerOverride>,
+}
+
+/// One setting a layer changes: param `key` of the node `path` leads to - a
+/// top-level node's uid, then a uid inside each sub-patch on the way down.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerOverride {
+    pub path: Vec<usize>,
+    pub key: String,
+    pub value: Value,
 }
 
 impl ProcessingGraph {
@@ -47,6 +67,21 @@ pub struct FeedbackSource {
     pub rumble_max: f32,
     /// Low-end boost exponent for the floor..max remap (`v^exp`); <1 boosts.
     pub rumble_exp: f32,
+    /// The AutoMap Selector / Fork choices between this pad and the virtual one.
+    /// The feedback flows back only while every one of them holds, so a Selector
+    /// switching between pads (or between sub-patches) rumbles only the one it
+    /// passes on. Empty when no Selector or Fork is in the way.
+    pub gates: Vec<FeedbackGate>,
+}
+
+/// One AutoMap Selector / Fork choice a [`FeedbackSource`] depends on: node `uid`
+/// (its effective uid, namespaced inside a sub-patch) has `index` selected - the
+/// input port a Selector passes on, the output a Fork sends to. Read from
+/// `NodeState::automap_select`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedbackGate {
+    pub uid: usize,
+    pub index: usize,
 }
 
 /// Routing metadata for device.sink nodes: how to dispatch computed signals to a device.

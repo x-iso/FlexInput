@@ -2811,7 +2811,7 @@ fn border_settings(node_id: NodeId, ui: &mut egui::Ui, snarl: &mut Snarl<NodeDat
             let mut pts = if g.curve.is_empty() { identity_curve() } else { g.curve.clone() };
             if mapping_curve_editor(
                 ui, egui::Id::new((node_id, "area_grad_curve")), &mut pts, None, None,
-                colors.accent, &ui.visuals().clone(), None, None, false, None,
+                colors.accent, &ui.visuals().clone(), None, None, false, None, None,
             ) {
                 g.curve = if curve_preset_of(&pts) == "linear" { Vec::new() } else { pts };
                 changed = true;

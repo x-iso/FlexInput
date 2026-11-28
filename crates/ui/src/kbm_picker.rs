@@ -211,7 +211,8 @@ pub fn stage_allows(stage: PickStage, pin: &str) -> bool {
             // The smooth-scroll channel: a rate sent, never a state read.
             | "trackpad_scroll_x" | "trackpad_scroll_y")
         || flexinput_core::macros::parse_macro_pin(pin).is_some()
-        || flexinput_core::menu::parse_target_pin(pin).is_some();
+        || flexinput_core::menu::parse_target_pin(pin).is_some()
+        || flexinput_core::layers::parse_layer_pin(pin).is_some();
     match stage {
         PickStage::Input => !output_only,
         PickStage::Output => !input_only,
@@ -531,6 +532,11 @@ fn imu_cells() -> Vec<KbmCell> {
 pub const MACRO_Y: f32 = PAD_ROW_Y + 7.6;
 /// Macro cells per row before wrapping.
 const MACRO_PER_ROW: usize = 14;
+/// Grid Y where the layers start: a band of their own, far below any macros
+/// (a tab shows only its own cells, so the gap is never seen).
+pub const LAYER_Y: f32 = MACRO_Y + 100.0;
+/// A layer's cells (Hold, Toggle, On, Off) are this wide, to fit its name.
+const LAYER_CELL_W: f32 = 2.0;
 
 /// The cell set actually shown (and navigated) for the current picker mode.
 ///
@@ -608,6 +614,8 @@ pub fn picker_cells(
             }
         }
     }
+    let (layers, macros): (Vec<_>, Vec<_>) = macros.iter()
+        .partition(|e| flexinput_core::layers::parse_layer_pin(&e.pin).is_some());
     for (i, entry) in macros.iter().enumerate() {
         cells.push(PickerCell {
             pin: entry.pin.clone(),
@@ -615,7 +623,19 @@ pub fn picker_cells(
             y: MACRO_Y + (i / MACRO_PER_ROW) as f32 * 1.1,
             width: 1.0,
             analog_only: false,
-            macro_meta: Some(entry.clone()),
+            macro_meta: Some((*entry).clone()),
+        });
+    }
+    // A row per layer: its Hold, Toggle, On and Off, in that order.
+    let per_row = flexinput_core::layers::LayerAction::ALL.len();
+    for (i, entry) in layers.iter().enumerate() {
+        cells.push(PickerCell {
+            pin: entry.pin.clone(),
+            x: (i % per_row) as f32 * (LAYER_CELL_W + 0.1),
+            y: LAYER_Y + (i / per_row) as f32 * 1.1,
+            width: LAYER_CELL_W,
+            analog_only: false,
+            macro_meta: Some((*entry).clone()),
         });
     }
     cells
@@ -632,6 +652,9 @@ pub enum PickerTab {
     Gamepad,
     /// The patch's Macro Output ports, JSM `@` macros and menu targets.
     Macros,
+    /// The patch's layers and its sub-patches', each to hold, toggle, turn on or
+    /// turn off.
+    Layers,
     /// A MIDI message, built from its type, channel and number rather than picked
     /// from cells (it has none).
     Midi,
@@ -643,6 +666,7 @@ impl PickerTab {
             PickerTab::Kbm => "Keyboard & Mouse",
             PickerTab::Gamepad => "Gamepad",
             PickerTab::Macros => "Macros",
+            PickerTab::Layers => "Layers",
             PickerTab::Midi => "MIDI",
         }
     }
@@ -650,7 +674,9 @@ impl PickerTab {
 
 /// Which tab a cell of the full board belongs to — by the band it sits in.
 fn cell_tab(cell: &PickerCell) -> PickerTab {
-    if cell.macro_meta.is_some() {
+    if cell.macro_meta.is_some() && flexinput_core::layers::parse_layer_pin(&cell.pin).is_some() {
+        PickerTab::Layers
+    } else if cell.macro_meta.is_some() {
         PickerTab::Macros
     } else if cell.y >= PAD_ROW_Y {
         PickerTab::Gamepad
@@ -666,6 +692,7 @@ fn tab_shift(tab: PickerTab) -> f32 {
         PickerTab::Kbm => 0.0,
         PickerTab::Gamepad => PAD_ROW_Y - 0.5,
         PickerTab::Macros => MACRO_Y,
+        PickerTab::Layers => LAYER_Y,
         PickerTab::Midi => 0.0,
     }
 }
@@ -1270,6 +1297,7 @@ mod tab_tests {
             icon: String::new(),
             icon_svg: String::new(),
             signal_type: flexinput_core::SignalType::Bool,
+            tint: None,
         }];
         let layout = PickerLayout { pad: true, sticks: true, inputs: true, ..Default::default() };
         let all = picker_cells(layout, &macros);

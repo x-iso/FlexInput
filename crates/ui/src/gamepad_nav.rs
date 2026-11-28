@@ -377,6 +377,8 @@ pub struct GamepadNav {
     /// device_id → nav-mode enabled. Seeded lazily from
     /// `settings.gamepad_ui_nav_default` when a device is first seen.
     pub mode: HashMap<String, bool>,
+    /// Presses of buttons the patch's layer chords use, waiting for release ([`ChordDefer`]).
+    pub chord_defer: ChordDefer,
     /// Canonical bool-pin set asserted on the previous frame (edge detection).
     pub prev_pressed: HashSet<String>,
     /// Left-stick directional auto-repeat accumulator (in "steps").
@@ -778,6 +780,7 @@ impl Default for GamepadNav {
     fn default() -> Self {
         Self {
             mode: HashMap::new(),
+            chord_defer: ChordDefer::default(),
             prev_pressed: HashSet::new(),
             repeat_accum: 0.0,
             repeat_dir: None,
@@ -1124,6 +1127,42 @@ pub fn merge_nav_input(into: &mut NavInput, other: &NavInput) {
 /// by `guide_watcher`), so e.g. the D-pad half of a Home+D-pad chord doesn't
 /// also step the selection. An owned button stays owned until it's released,
 /// so it can't produce a stray rising edge when the mask lifts.
+/// Nav buttons a chord of the patch's layer cards uses (Y + touchpad click turning a layer
+/// on): such a press acts on release, as a tap, and not at all if the rest of a chord of it
+/// came down meanwhile - the press was the card's. Nav acted on Y the moment it went down,
+/// before the touchpad click that made it a chord, and the Devices panel opened with every
+/// layer switch. Kept between frames.
+#[derive(Debug, Default, Clone)]
+pub struct ChordDefer {
+    /// Each nav button held back, and whether a chord took it.
+    held: HashMap<String, bool>,
+}
+
+impl ChordDefer {
+    /// Hold back this frame's presses of buttons in `chords` and give the released ones
+    /// back as taps. `chord_held` says whether all of a chord's buttons are down.
+    pub fn apply(&mut self, nav: &mut NavInput, chords: &[Vec<String>], chord_held: impl Fn(&[String]) -> bool) {
+        let in_chord = |p: &str| chords.iter().any(|c| c.len() >= 2 && c.iter().any(|x| x == p));
+        for p in nav.rising.clone() {
+            if in_chord(&p) {
+                nav.rising.remove(&p);
+                self.held.insert(p, false);
+            }
+        }
+        for (p, taken) in self.held.iter_mut() {
+            if chords.iter().any(|c| c.len() >= 2 && c.contains(p) && chord_held(c)) {
+                *taken = true;
+            }
+        }
+        let released: Vec<String> = self.held.keys().filter(|p| !nav.pressed.contains(*p)).cloned().collect();
+        for p in released {
+            if self.held.remove(&p) == Some(false) {
+                nav.rising.insert(p);
+            }
+        }
+    }
+}
+
 pub fn mask_owned(nav: &mut NavInput, dev_id: &str, owned: &HashSet<(String, String)>) {
     if owned.is_empty() { return; }
     let is_owned = |p: &String| owned.contains(&(dev_id.to_string(), p.clone()));
@@ -2226,5 +2265,38 @@ mod combo_rising_tests {
         let d = crate::settings::AppSettings::default();
         assert_eq!(d.chord(T::LayoutTabNext), &Some(vec!["btn_rb".to_string()]));
         assert_eq!(d.chord(T::PrevTab), &Some(vec!["btn_guide".to_string(), "btn_lb".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod chord_defer_tests {
+    use super::*;
+
+    fn frame(d: &mut ChordDefer, pressed: &[&str], prev: &mut HashSet<String>, chord_down: bool) -> HashSet<String> {
+        let pressed: HashSet<String> = pressed.iter().map(|s| s.to_string()).collect();
+        let mut nav = NavInput {
+            rising: pressed.difference(prev).cloned().collect(),
+            pressed: pressed.clone(),
+            ..Default::default()
+        };
+        *prev = pressed;
+        let chords = vec![vec!["btn_north".to_string(), "btn_touchpad".to_string()]];
+        d.apply(&mut nav, &chords, |_| chord_down);
+        nav.rising
+    }
+
+    /// Y alone still drives nav, on release; Y + touchpad click (a layer card's chord)
+    /// never does.
+    #[test]
+    fn a_layer_chords_press_is_the_cards() {
+        let mut d = ChordDefer::default();
+        let mut prev = HashSet::new();
+        assert!(frame(&mut d, &["btn_north"], &mut prev, false).is_empty(), "held back while it may be a chord");
+        assert!(frame(&mut d, &[], &mut prev, false).contains("btn_north"), "a tap on release");
+        assert!(frame(&mut d, &["btn_north"], &mut prev, false).is_empty());
+        assert!(frame(&mut d, &["btn_north"], &mut prev, true).is_empty(), "the chord came down");
+        assert!(frame(&mut d, &[], &mut prev, false).is_empty(), "the card's, not nav's");
+        // Other buttons are untouched.
+        assert!(frame(&mut d, &["btn_south"], &mut prev, false).contains("btn_south"));
     }
 }

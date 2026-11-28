@@ -23,7 +23,8 @@ use std::collections::{HashMap, HashSet};
 use flexinput_core::automap::{self, ClickActuator, FeedbackGroup, PitchScale};
 use flexinput_core::{BusMap, PinMapExt, Signal};
 
-use crate::graph::{NodeSnap, SinkTarget};
+use crate::graph::{FeedbackSource, NodeSnap, SinkTarget};
+use crate::state::NodeState;
 
 use super::{
     collect_sink_sources, combine_signals, namespaced_uid, shape_hd_feedback,
@@ -70,6 +71,7 @@ pub(crate) fn gather_game_feedback(
     nodes: &[NodeSnap],
     dev_sigs: &BusMap,
     collector_sigs: &mut BusMap,
+    state: &HashMap<usize, NodeState>,
 ) {
     if !needs_game_feedback(nodes) { return; }
     // Main-loop auto-feedback only runs for top-level pads, so only those.
@@ -78,6 +80,7 @@ pub(crate) fn gather_game_feedback(
         if st.device_id.starts_with("virtual.") || st.feedback_sources.is_empty() { continue; }
         let key = format!("{FEEDBACK_GAME}{}", st.device_id);
         for src in &st.feedback_sources {
+            if !gates_open(src, state) { continue; }
             read_virtual_feedback(dev_sigs, &src.device_id, &key, collector_sigs);
         }
     }
@@ -90,6 +93,17 @@ pub(crate) fn gather_game_feedback(
         }
     }
     gather_net_send_feedback(nodes, 0, false, collector_sigs);
+}
+
+/// Whether the pad behind `fb` is the one its Selectors / Forks pass on right
+/// now: each gate's node has the gate's index selected. Read from the choice the
+/// node made on its last tick, since a pad's feedback is applied before the
+/// Selectors downstream of it run - at most one tick late. A node that hasn't run
+/// yet counts as selecting 0, which is where it starts.
+pub(crate) fn gates_open(fb: &FeedbackSource, state: &HashMap<usize, NodeState>) -> bool {
+    fb.gates
+        .iter()
+        .all(|g| state.get(&g.uid).map_or(0, |s| s.automap_select) == g.index)
 }
 
 fn read_virtual_feedback(

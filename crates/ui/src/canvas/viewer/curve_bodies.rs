@@ -262,6 +262,18 @@ pub(crate) fn show_response_curve_body(
                             egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200)));
                     }
                 }
+                // A layer on screen changing the curve: its curve over this one, in its
+                // colour, so the difference shows.
+                if let Some((lp, lb, color)) = crate::layers::curve_tint(ui.ctx(), node_id.0, &new_points, &new_biases) {
+                    let steps = 120usize;
+                    let pts: Vec<egui::Pos2> = (0..=steps)
+                        .map(|i| {
+                            let x = x_lo + x_range * i as f32 / steps as f32;
+                            c2s(x, sample_curve(&lp, x, &lb).clamp(y_lo, y_hi))
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, color)));
+                }
 
                 // Bias handles show on mouse Alt OR when the gamepad driver is in
                 // bias mode this frame (hold-North in CurveDot level).
@@ -768,6 +780,18 @@ pub(crate) fn show_vec_response_curve_body(
                         painter.line_segment([w[0], w[1]],
                             egui::Stroke::new(1.5_f32, crate::settings::tinted_gray(200)));
                     }
+                }
+                // A layer on screen changing the curve: its curve over this one, in its
+                // colour, so the difference shows.
+                if let Some((lp, lb, color)) = crate::layers::curve_tint(ui.ctx(), node_id.0, &new_points, &new_biases) {
+                    let steps = 120usize;
+                    let pts: Vec<egui::Pos2> = (0..=steps)
+                        .map(|i| {
+                            let x = x_lo + x_range * i as f32 / steps as f32;
+                            c2s(x, sample_curve(&lp, x, &lb).clamp(y_lo, y_hi))
+                        })
+                        .collect();
+                    painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, color)));
                 }
 
                 // Bias handles show on mouse Alt OR when the gamepad driver is in bias mode
@@ -1316,6 +1340,10 @@ pub(crate) fn show_twoway_response_curve_body(
                 } else if !hyst_lane {
                     paint_twoway_lane(&painter, new_edit_pts, new_edit_biases, twoway_lane_color(signal, lane_up), true, &c2s, (x_lo, x_hi, y_lo, y_hi));
                 }
+                // A layer on screen changing either lane: its lane over this one, in its colour.
+                crate::layers::paint_curve_overlays(ui.ctx(), &painter, node_id.0,
+                    &[("points", "biases", &pts_up, &biases_up), ("points_dn", "biases_dn", &pts_dn, &biases_dn)],
+                    |p, b| (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(p, x, b).clamp(y_lo, y_hi)) }).collect());
 
                 // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
                 let nav_bias = ui.ctx().data(|d|
@@ -1840,6 +1868,10 @@ pub(crate) fn paint_twoway_curve_graph(
     } else if !hyst_lane {
         paint_twoway_lane(&painter, &new_edit_pts, &new_edit_biases, twoway_lane_color(signal, lane_up), true, &c2s, (x_lo, x_hi, y_lo, y_hi));
     }
+    // A layer on screen changing either lane: its lane over this one, in its colour.
+    crate::layers::paint_curve_overlays(ui.ctx(), &painter, node_id.0,
+        &[("points", "biases", &pts_up, &biases_up), ("points_dn", "biases_dn", &pts_dn, &biases_dn)],
+        |p, b| (0..=120).map(|i| { let x = x_lo + x_range * i as f32 / 120.0; c2s(x, sample_curve(p, x, b).clamp(y_lo, y_hi)) }).collect());
 
     // Alt-drag bias handles (mouse Alt OR gamepad bias mode).
     let alt_held = ui.input(|i| i.modifiers.alt) || nav_bias;
